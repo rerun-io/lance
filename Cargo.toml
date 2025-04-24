@@ -61,17 +61,17 @@ lance-test-macros = { version = "=0.25.2", path = "./rust/lance-test-macros" }
 lance-testing = { version = "=0.25.2", path = "./rust/lance-testing" }
 approx = "0.5.1"
 # Note that this one does not include pyarrow
-arrow = { version = "54.1", optional = false, features = ["prettyprint"] }
-arrow-arith = "54.1"
-arrow-array = "54.1"
-arrow-buffer = "54.1"
-arrow-cast = "54.1"
-arrow-data = "54.1"
-arrow-ipc = { version = "54.1", features = ["zstd"] }
-arrow-ord = "54.1"
-arrow-row = "54.1"
-arrow-schema = "54.1"
-arrow-select = "54.1"
+arrow = { git = "https://github.com/timsaucer/arrow-rs.git", branch = "feat/deterministic-metadata-encoding", optional = false, features = ["prettyprint"] }
+arrow-arith = { git = "https://github.com/timsaucer/arrow-rs.git", branch = "feat/deterministic-metadata-encoding" }
+arrow-array = { git = "https://github.com/timsaucer/arrow-rs.git", branch = "feat/deterministic-metadata-encoding" }
+arrow-buffer = { git = "https://github.com/timsaucer/arrow-rs.git", branch = "feat/deterministic-metadata-encoding" }
+arrow-cast = { git = "https://github.com/timsaucer/arrow-rs.git", branch = "feat/deterministic-metadata-encoding" }
+arrow-data = { git = "https://github.com/timsaucer/arrow-rs.git", branch = "feat/deterministic-metadata-encoding" }
+arrow-ipc = { git = "https://github.com/timsaucer/arrow-rs.git", branch = "feat/deterministic-metadata-encoding", features = ["zstd"] }
+arrow-ord = { git = "https://github.com/timsaucer/arrow-rs.git", branch = "feat/deterministic-metadata-encoding" }
+arrow-row = { git = "https://github.com/timsaucer/arrow-rs.git", branch = "feat/deterministic-metadata-encoding" }
+arrow-schema = { git = "https://github.com/timsaucer/arrow-rs.git", branch = "feat/deterministic-metadata-encoding" }
+arrow-select = { git = "https://github.com/timsaucer/arrow-rs.git", branch = "feat/deterministic-metadata-encoding" }
 async-recursion = "1.0"
 async-trait = "0.1"
 aws-config = "1.2.0"
@@ -193,15 +193,3 @@ print_stderr = "deny"
 # not too much we can do to avoid multiple crate versions
 multiple-crate-versions = "allow"
 
-[patch.crates-io]
-arrow = { git = "https://github.com/timsaucer/arrow-rs.git", branch = "feat/deterministic-metadata-encoding", optional = false, features = ["prettyprint"] }
-arrow-arith = { git = "https://github.com/timsaucer/arrow-rs.git", branch = "feat/deterministic-metadata-encoding" }
-arrow-array = { git = "https://github.com/timsaucer/arrow-rs.git", branch = "feat/deterministic-metadata-encoding" }
-arrow-buffer = { git = "https://github.com/timsaucer/arrow-rs.git", branch = "feat/deterministic-metadata-encoding" }
-arrow-cast = { git = "https://github.com/timsaucer/arrow-rs.git", branch = "feat/deterministic-metadata-encoding" }
-arrow-data = { git = "https://github.com/timsaucer/arrow-rs.git", branch = "feat/deterministic-metadata-encoding" }
-arrow-ipc = { git = "https://github.com/timsaucer/arrow-rs.git", branch = "feat/deterministic-metadata-encoding", features = ["zstd"] }
-arrow-ord = { git = "https://github.com/timsaucer/arrow-rs.git", branch = "feat/deterministic-metadata-encoding" }
-arrow-row = { git = "https://github.com/timsaucer/arrow-rs.git", branch = "feat/deterministic-metadata-encoding" }
-arrow-schema = { git = "https://github.com/timsaucer/arrow-rs.git", branch = "feat/deterministic-metadata-encoding" }
-arrow-select = { git = "https://github.com/timsaucer/arrow-rs.git", branch = "feat/deterministic-metadata-encoding" }
