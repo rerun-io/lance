@@ -194,7 +194,6 @@ print_stderr = "deny"
 multiple-crate-versions = "allow"
 
 [patch.crates-io]
-arrow = { git = "https://github.com/timsaucer/arrow-rs.git", branch = "feat/deterministic-metadata-encoding" }
 arrow = { git = "https://github.com/timsaucer/arrow-rs.git", branch = "feat/deterministic-metadata-encoding", optional = false, features = ["prettyprint"] }
 arrow-arith = { git = "https://github.com/timsaucer/arrow-rs.git", branch = "feat/deterministic-metadata-encoding" }
 arrow-array = { git = "https://github.com/timsaucer/arrow-rs.git", branch = "feat/deterministic-metadata-encoding" }
