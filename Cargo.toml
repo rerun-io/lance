@@ -192,3 +192,6 @@ print_stdout = "deny"
 print_stderr = "deny"
 # not too much we can do to avoid multiple crate versions
 multiple-crate-versions = "allow"
+
+[patch.crates-io]
+arrow = { git = "https://github.com/timsaucer/arrow-rs.git", branch = "feat/deterministic-metadata-encoding" }
