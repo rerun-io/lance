@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import (
     TYPE_CHECKING,
     Any,
+    Callable,
     Dict,
     Iterable,
     Iterator,
@@ -51,6 +52,7 @@ from .lance import (
     Compaction,
     CompactionMetrics,
     LanceSchema,
+    ScanStatistics,
     _Dataset,
     _MergeInsertBuilder,
     _Scanner,
@@ -348,6 +350,7 @@ class LanceDataset(pa.dataset.Dataset):
         late_materialization: Optional[bool | List[str]] = None,
         use_scalar_index: Optional[bool] = None,
         include_deleted_rows: Optional[bool] = None,
+        scan_stats_callback: Optional[Callable[[ScanStatistics], None]] = None,
     ) -> LanceScanner:
         """Return a Scanner that can support various pushdowns.
 
@@ -440,6 +443,10 @@ class LanceDataset(pa.dataset.Dataset):
         fast_search:  bool, default False
             If True, then the search will only be performed on the indexed data, which
             yields faster search time.
+        scan_stats_callback: Callable[[ScanStatistics], None], default None
+            A callback function that will be called with the scan statistics after the
+            scan is complete.  Errors raised by the callback will be logged but not
+            re-raised.
         include_deleted_rows: bool, default False
             If True, then rows that have been deleted, but are still present in the
             fragment, will be returned.  These rows will have the _rowid column set
@@ -500,7 +507,7 @@ class LanceDataset(pa.dataset.Dataset):
         setopt(builder.use_scalar_index, use_scalar_index)
         setopt(builder.fast_search, fast_search)
         setopt(builder.include_deleted_rows, include_deleted_rows)
-
+        setopt(builder.scan_stats_callback, scan_stats_callback)
         # columns=None has a special meaning. we can't treat it as "user didn't specify"
         if self._default_scan_options is None:
             # No defaults, use user-provided, if any
@@ -1752,11 +1759,15 @@ class LanceDataset(pa.dataset.Dataset):
             if not pa.types.is_string(field_type):
                 raise TypeError(f"NGRAM index column {column} must be a string")
         elif index_type in ["INVERTED", "FTS"]:
-            if not pa.types.is_string(field_type) and not pa.types.is_large_string(
-                field_type
+            value_type = field_type
+            if pa.types.is_list(field_type) or pa.types.is_large_list(field_type):
+                value_type = field_type.value_type
+            if not pa.types.is_string(value_type) and not pa.types.is_large_string(
+                value_type
             ):
                 raise TypeError(
-                    f"INVERTED index column {column} must be string or large string"
+                    f"INVERTED index column {column} must be string, large string"
+                    " or list of strings, but got {value_type}"
                 )
 
         if pa.types.is_duration(field_type):
@@ -2310,6 +2321,21 @@ class LanceDataset(pa.dataset.Dataset):
         the indices.
         """
         return self._ds.drop_index(name)
+
+    def prewarm_index(self, name: str):
+        """
+        Prewarm an index
+
+        This will load the entire index into memory.  This can help avoid cold start
+        issues with index queries.  If the index does not fit in the index cache, then
+        this will result in wasted I/O.
+
+        Parameters
+        ----------
+        name: str
+            The name of the index to prewarm.
+        """
+        return self._ds.prewarm_index(name)
 
     def session(self) -> Session:
         """
@@ -3094,6 +3120,7 @@ class ScannerBuilder:
         self._full_text_query = None
         self._use_scalar_index = None
         self._include_deleted_rows = None
+        self._scan_stats_callback: Optional[Callable[[ScanStatistics], None]] = None
 
     def apply_defaults(self, default_opts: Dict[str, Any]) -> ScannerBuilder:
         for key, value in default_opts.items():
@@ -3401,14 +3428,23 @@ class ScannerBuilder:
             The columns to search in. If None, search in all indexed columns.
         """
         if isinstance(query, FullTextQuery):
-            self._full_text_query = {
-                "query": query.to_dict(),
-            }
+            self._full_text_query = query.inner
         else:
             self._full_text_query = {
                 "query": query,
                 "columns": columns,
             }
+        return self
+
+    def scan_stats_callback(
+        self, callback: Callable[[ScanStatistics], None]
+    ) -> ScannerBuilder:
+        """
+        Set a callback function that will be called with the scan statistics after the
+        scan is complete.  Errors raised by the callback will be logged but not
+        re-raised.
+        """
+        self._scan_stats_callback = callback
         return self
 
     def to_scanner(self) -> LanceScanner:
@@ -3435,6 +3471,7 @@ class ScannerBuilder:
             self._late_materialization,
             self._use_scalar_index,
             self._include_deleted_rows,
+            self._scan_stats_callback,
         )
         return LanceScanner(scanner, self.ds)
 

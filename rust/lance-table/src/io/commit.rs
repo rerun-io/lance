@@ -51,7 +51,7 @@ use {
     self::external_manifest::{ExternalManifestCommitHandler, ExternalManifestStore},
     aws_credential_types::provider::error::CredentialsError,
     aws_credential_types::provider::ProvideCredentials,
-    lance_io::object_store::{build_aws_credential, StorageOptions},
+    lance_io::object_store::{providers::aws::build_aws_credential, StorageOptions},
     object_store::aws::AmazonS3ConfigKey,
     object_store::aws::AwsCredentialProvider,
     std::borrow::Cow,
@@ -236,7 +236,7 @@ async fn current_manifest_path(
         }
     }
 
-    let manifest_files = object_store.inner.list(Some(&base.child(VERSIONS_DIR)));
+    let manifest_files = object_store.list(Some(base.child(VERSIONS_DIR)));
 
     let mut valid_manifests = manifest_files.try_filter_map(|res| {
         if let Some(scheme) = ManifestNamingScheme::detect_scheme(res.location.filename().unwrap())

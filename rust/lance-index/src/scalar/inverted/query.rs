@@ -4,6 +4,8 @@
 use std::collections::HashSet;
 
 use lance_core::{Error, Result};
+use serde::ser::SerializeMap;
+use serde::{Deserialize, Serialize};
 use snafu::location;
 
 #[derive(Debug, Clone)]
@@ -37,11 +39,38 @@ impl Default for FtsSearchParams {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub enum Operator {
+    And,
+    Or,
+}
+
+impl Default for Operator {
+    fn default() -> Self {
+        Self::Or
+    }
+}
+
+impl TryFrom<&str> for Operator {
+    type Error = Error;
+    fn try_from(value: &str) -> Result<Self> {
+        match value.to_ascii_uppercase().as_str() {
+            "AND" => Ok(Self::And),
+            "OR" => Ok(Self::Or),
+            _ => Err(Error::invalid_input(
+                format!("Invalid operator: {}", value),
+                location!(),
+            )),
+        }
+    }
+}
+
 pub trait FtsQueryNode {
     fn columns(&self) -> HashSet<String>;
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum FtsQuery {
     // leaf queries
     Match(MatchQuery),
@@ -89,12 +118,12 @@ impl FtsQueryNode for FtsQuery {
 }
 
 impl FtsQuery {
-    pub fn query(&self) -> &str {
+    pub fn query(&self) -> String {
         match self {
-            Self::Match(query) => &query.terms,
-            Self::Phrase(query) => &query.terms,
+            Self::Match(query) => query.terms.clone(),
+            Self::Phrase(query) => format!("\"{}\"", query.terms), // Phrase queries are quoted
             Self::Boost(query) => query.positive.query(),
-            Self::MultiMatch(query) => &query.match_queries[0].terms,
+            Self::MultiMatch(query) => query.match_queries[0].terms.clone(),
         }
     }
 
@@ -158,12 +187,15 @@ impl From<MultiMatchQuery> for FtsQuery {
     }
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct MatchQuery {
     // The column to search in.
     // If None, it will be determined at query time.
     pub column: Option<String>,
     pub terms: String,
+
+    // literal default is not supported so we set it by function
+    #[serde(default = "MatchQuery::default_boost")]
     pub boost: f32,
 
     // The max edit distance for fuzzy matching.
@@ -176,7 +208,15 @@ pub struct MatchQuery {
 
     /// The maximum number of terms to expand for fuzzy matching.
     /// Default to 50.
+    #[serde(default = "MatchQuery::default_max_expansions")]
     pub max_expansions: usize,
+
+    /// The operator to use for combining terms.
+    /// This can be either `And` or `Or`, it's 'Or' by default.
+    /// - `And`: All terms must match.
+    /// - `Or`: At least one term must match.
+    #[serde(default)]
+    pub operator: Operator,
 }
 
 impl MatchQuery {
@@ -187,7 +227,16 @@ impl MatchQuery {
             boost: 1.0,
             fuzziness: Some(0),
             max_expansions: 50,
+            operator: Operator::Or,
         }
+    }
+
+    fn default_boost() -> f32 {
+        1.0
+    }
+
+    fn default_max_expansions() -> usize {
+        50
     }
 
     pub fn with_column(mut self, column: Option<String>) -> Self {
@@ -210,6 +259,11 @@ impl MatchQuery {
         self
     }
 
+    pub fn with_operator(mut self, operator: Operator) -> Self {
+        self.operator = operator;
+        self
+    }
+
     pub fn auto_fuzziness(token: &str) -> u32 {
         match token.len() {
             0..=2 => 0,
@@ -229,7 +283,7 @@ impl FtsQueryNode for MatchQuery {
     }
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PhraseQuery {
     // The column to search in.
     // If None, it will be determined at query time.
@@ -261,10 +315,11 @@ impl FtsQueryNode for PhraseQuery {
     }
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct BoostQuery {
     pub positive: Box<FtsQuery>,
     pub negative: Box<FtsQuery>,
+    #[serde(default = "BoostQuery::default_negative_boost")]
     pub negative_boost: f32,
 }
 
@@ -275,6 +330,10 @@ impl BoostQuery {
             negative: Box::new(negative),
             negative_boost: negative_boost.unwrap_or(0.5),
         }
+    }
+
+    fn default_negative_boost() -> f32 {
+        0.5
     }
 }
 
@@ -292,26 +351,90 @@ pub struct MultiMatchQuery {
     pub match_queries: Vec<MatchQuery>,
 }
 
+impl Serialize for MultiMatchQuery {
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        let mut map = serializer.serialize_map(Some(3))?;
+
+        let query = self.match_queries.first().ok_or(serde::ser::Error::custom(
+            "MultiMatchQuery must have at least one MatchQuery".to_string(),
+        ))?;
+        map.serialize_entry("query", &query.terms)?;
+        let columns = self
+            .match_queries
+            .iter()
+            .map(|q| q.column.as_ref().unwrap().clone())
+            .collect::<Vec<String>>();
+        map.serialize_entry("columns", &columns)?;
+        let boosts = self
+            .match_queries
+            .iter()
+            .map(|q| q.boost)
+            .collect::<Vec<f32>>();
+        map.serialize_entry("boost", &boosts)?;
+        map.end()
+    }
+}
+
+impl<'de> Deserialize<'de> for MultiMatchQuery {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        struct MultiMatchQueryData {
+            query: String,
+            columns: Vec<String>,
+            boost: Option<Vec<f32>>,
+        }
+
+        let data = MultiMatchQueryData::deserialize(deserializer)?;
+        let boosts = data.boost.unwrap_or(vec![1.0; data.columns.len()]);
+
+        Self::try_new(data.query, data.columns)
+            .map_err(serde::de::Error::custom)?
+            .try_with_boosts(boosts)
+            .map_err(serde::de::Error::custom)
+    }
+}
+
 impl MultiMatchQuery {
-    pub fn new(query: String, columns: Vec<String>) -> Self {
+    pub fn try_new(query: String, columns: Vec<String>) -> Result<Self> {
+        if columns.is_empty() {
+            return Err(Error::invalid_input(
+                "Cannot create MultiMatchQuery with no columns".to_string(),
+                location!(),
+            ));
+        }
+
         let match_queries = columns
             .into_iter()
             .map(|column| MatchQuery::new(query.clone()).with_column(Some(column)))
             .collect();
-        Self { match_queries }
+        Ok(Self { match_queries })
     }
 
-    pub fn with_boosts(query: String, columns: Vec<String>, boosts: Vec<f32>) -> Self {
-        let match_queries = columns
-            .into_iter()
-            .zip(boosts)
-            .map(|(column, boost)| {
-                MatchQuery::new(query.clone())
-                    .with_column(Some(column))
-                    .with_boost(boost)
-            })
-            .collect();
-        Self { match_queries }
+    pub fn try_with_boosts(mut self, boosts: Vec<f32>) -> Result<Self> {
+        if boosts.len() != self.match_queries.len() {
+            return Err(Error::invalid_input(
+                "The number of boosts must match the number of queries".to_string(),
+                location!(),
+            ));
+        }
+
+        for (query, boost) in self.match_queries.iter_mut().zip(boosts) {
+            query.boost = boost;
+        }
+        Ok(self)
+    }
+
+    pub fn with_operator(mut self, operator: Operator) -> Self {
+        for query in &mut self.match_queries {
+            query.operator = operator;
+        }
+        self
     }
 }
 
@@ -368,7 +491,7 @@ pub fn fill_fts_query_column(
                 _ => {
                     // if there are multiple columns, we need to create a MultiMatch query
                     let multi_match_query =
-                        MultiMatchQuery::new(match_query.terms.clone(), columns.to_vec());
+                        MultiMatchQuery::try_new(match_query.terms.clone(), columns.to_vec())?;
                     Ok(FtsQuery::MultiMatch(multi_match_query))
                 }
             }
@@ -420,5 +543,45 @@ pub fn fill_fts_query_column(
                 .collect::<Result<Vec<_>>>()?;
             Ok(FtsQuery::MultiMatch(MultiMatchQuery { match_queries }))
        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn test_match_query_serde() {
+        use super::*;
+        use serde_json::json;
+
+        let query = MatchQuery::new("hello world".to_string())
+            .with_column(Some("text".to_string()))
+            .with_boost(2.0)
+            .with_fuzziness(Some(1))
+            .with_max_expansions(10)
+            .with_operator(Operator::And);
+
+        let serialized = serde_json::to_value(&query).unwrap();
+        let expected = json!({
+            "column": "text",
+            "terms": "hello world",
+            "boost": 2.0,
+            "fuzziness": 1,
+            "max_expansions": 10,
+            "operator": "And"
+        });
+        assert_eq!(serialized, expected);
+
+        let expected = json!({
+            "column": "text",
+            "terms": "hello world",
+            "fuzziness": 0,
+        });
+        let query = serde_json::from_str::<MatchQuery>(&expected.to_string()).unwrap();
+        assert_eq!(query.column, Some("text".to_owned()));
+        assert_eq!(query.terms, "hello world");
+        assert_eq!(query.boost, 1.0);
+        assert_eq!(query.fuzziness, Some(0));
+        assert_eq!(query.max_expansions, 50);
+        assert_eq!(query.operator, Operator::Or);
     }
 }

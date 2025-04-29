@@ -1578,6 +1578,19 @@ def test_flat_vector_search_with_delete(tmp_path: Path):
     )
 
 
+def test_null_reader_with_deletes(tmp_path: Path):
+    full_schema = pa.schema(
+        [
+            pa.field("id", pa.int64()),
+            pa.field("other", pa.int64()),
+        ]
+    )
+    ds = lance.write_dataset([], tmp_path, schema=full_schema, mode="create")
+    ds.insert(pa.table({"id": [1, 2, 3, 4, 5]}))
+    ds.delete("id in (1, 2)")
+    ds.to_table()
+
+
 def test_merge_insert_conditional_upsert_example(tmp_path: Path):
     table = pa.Table.from_pydict(
         {
@@ -1788,6 +1801,18 @@ def test_merge_insert_large():
         .when_not_matched_insert_all()
         .execute(other_columns)
     )
+
+
+def test_merge_insert_empty_index():
+    # Reported in https://github.com/lancedb/lancedb/issues/2285
+    empty_table = pa.table({"id": pa.array([], type=pa.float64())})
+    empty_ds = lance.write_dataset(empty_table, "memory://")
+
+    empty_ds.create_scalar_index("id", "BTREE")
+
+    df = pa.table({"id": [1.0, 2.0, 3.0]})
+
+    empty_ds.merge_insert("id").when_not_matched_insert_all().execute(df)
 
 
 def test_add_null_columns(tmp_path: Path):
