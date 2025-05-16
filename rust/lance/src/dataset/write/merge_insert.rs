@@ -209,6 +209,7 @@ impl WhenMatched {
 /// Describes how rows should be handled when there is no matching row in the target table
 ///
 /// These are new rows which do not match any old data
+#[derive(Debug, Clone, PartialEq)]
 pub enum WhenNotMatched {
     /// The new row is inserted into the target table
     ///
