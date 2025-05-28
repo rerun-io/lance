@@ -55,8 +55,8 @@ const UNSORTED_BUFFER: &str = "unsorted.lance";
 const SHUFFLE_BATCH_SIZE: usize = 1024;
 
 fn get_temp_dir() -> Result<Path> {
-    // Note: using into_path here means we will not delete this TempDir automatically
-    let dir = TempDir::new()?.into_path();
+    // Note: using keep here means we will not delete this TempDir automatically
+    let dir = TempDir::new()?.keep();
     let tmp_dir_path = Path::from_filesystem_path(dir).map_err(|e| Error::IO {
         source: Box::new(e),
         location: location!(),
