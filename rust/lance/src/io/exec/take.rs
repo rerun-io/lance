@@ -305,7 +305,7 @@ impl DisplayAs for TakeExec {
             .map(|f| f.name.clone())
             .collect::<HashSet<_>>();
         match t {
-            DisplayFormatType::Default | DisplayFormatType::Verbose => {
+            DisplayFormatType::Default | DisplayFormatType::Verbose | DisplayFormatType::TreeRender => {
                 let columns = self
                     .output_schema
                     .fields

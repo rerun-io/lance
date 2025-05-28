@@ -92,7 +92,7 @@ pub struct KNNVectorDistanceExec {
 impl DisplayAs for KNNVectorDistanceExec {
     fn fmt_as(&self, t: DisplayFormatType, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         match t {
-            DisplayFormatType::Default | DisplayFormatType::Verbose => {
+            DisplayFormatType::Default | DisplayFormatType::Verbose | DisplayFormatType::TreeRender => {
                 write!(f, "KNNVectorDistance: metric={}", self.distance_type,)
             }
         }
@@ -342,7 +342,7 @@ impl ANNIvfPartitionExec {
 impl DisplayAs for ANNIvfPartitionExec {
     fn fmt_as(&self, t: DisplayFormatType, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         match t {
-            DisplayFormatType::Default | DisplayFormatType::Verbose => {
+            DisplayFormatType::Default | DisplayFormatType::Verbose | DisplayFormatType::TreeRender=> {
                 write!(
                     f,
                     "ANNIvfPartition: uuid={}, nprobes={}, deltas={}",
@@ -515,7 +515,7 @@ impl ANNIvfSubIndexExec {
 impl DisplayAs for ANNIvfSubIndexExec {
     fn fmt_as(&self, t: DisplayFormatType, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         match t {
-            DisplayFormatType::Default | DisplayFormatType::Verbose => {
+            DisplayFormatType::Default | DisplayFormatType::Verbose | DisplayFormatType::TreeRender => {
                 write!(
                     f,
                     "ANNSubIndex: name={}, k={}, deltas={}",
@@ -761,7 +761,7 @@ impl MultivectorScoringExec {
 impl DisplayAs for MultivectorScoringExec {
     fn fmt_as(&self, t: DisplayFormatType, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         match t {
-            DisplayFormatType::Default | DisplayFormatType::Verbose => {
+            DisplayFormatType::Default | DisplayFormatType::Verbose | DisplayFormatType::TreeRender => {
                 write!(f, "MultivectorScoring: k={}", self.query.k)
             }
         }

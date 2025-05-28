@@ -254,6 +254,10 @@ fn remap_expr_references(expr: &mut Expression, mapping: &HashMap<usize, usize>)
                 )),
             }
         }
+        RexType::DynamicParameter(_) => Err(Error::invalid_input(
+            "Dynamic parameters not yet supported in filter expressions",
+            location!(),
+        ))
     }
 }
 
@@ -324,6 +328,7 @@ pub async fn parse_substrait(expr: &[u8], input_schema: Arc<ArrowSchema>) -> Res
         advanced_extensions: envelope.advanced_extensions.clone(),
         expected_type_urls: vec![],
         extension_uris: vec![],
+        parameter_bindings: vec![],
         relations: vec![PlanRel {
             rel_type: Some(RelType::Root(RelRoot {
                 input: Some(Rel {

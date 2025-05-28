@@ -244,7 +244,7 @@ impl ExecutionPlan for LancePushdownScanExec {
 impl DisplayAs for LancePushdownScanExec {
     fn fmt_as(&self, t: DisplayFormatType, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         match t {
-            DisplayFormatType::Default | DisplayFormatType::Verbose => {
+            DisplayFormatType::Default | DisplayFormatType::Verbose | DisplayFormatType::TreeRender => {
                 let columns = self
                     .projection
                     .fields

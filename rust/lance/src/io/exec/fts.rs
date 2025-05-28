@@ -49,7 +49,7 @@ pub struct MatchQueryExec {
 impl DisplayAs for MatchQueryExec {
     fn fmt_as(&self, t: DisplayFormatType, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         match t {
-            DisplayFormatType::Default | DisplayFormatType::Verbose => {
+            DisplayFormatType::Default | DisplayFormatType::Verbose | DisplayFormatType::TreeRender => {
                 write!(f, "MatchQuery: query={}", self.query.terms)
             }
         }
@@ -282,7 +282,7 @@ pub struct FlatMatchQueryExec {
 impl DisplayAs for FlatMatchQueryExec {
     fn fmt_as(&self, t: DisplayFormatType, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         match t {
-            DisplayFormatType::Default | DisplayFormatType::Verbose => {
+            DisplayFormatType::Default | DisplayFormatType::Verbose | DisplayFormatType::TreeRender=> {
                 write!(f, "FlatMatchQuery: query={}", self.query.terms)
             }
         }
@@ -429,7 +429,7 @@ pub struct PhraseQueryExec {
 impl DisplayAs for PhraseQueryExec {
     fn fmt_as(&self, t: DisplayFormatType, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         match t {
-            DisplayFormatType::Default | DisplayFormatType::Verbose => {
+            DisplayFormatType::Default | DisplayFormatType::Verbose | DisplayFormatType::TreeRender => {
                 write!(f, "PhraseQuery: query={}", self.query.terms)
             }
         }
@@ -639,7 +639,7 @@ pub struct BoostQueryExec {
 impl DisplayAs for BoostQueryExec {
     fn fmt_as(&self, t: DisplayFormatType, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         match t {
-            DisplayFormatType::Default | DisplayFormatType::Verbose => {
+            DisplayFormatType::Default | DisplayFormatType::Verbose | DisplayFormatType::TreeRender=> {
                 write!(
                     f,
                     "BoostQuery: negative_boost={}",

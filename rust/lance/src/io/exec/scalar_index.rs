@@ -89,7 +89,7 @@ pub struct ScalarIndexExec {
 impl DisplayAs for ScalarIndexExec {
     fn fmt_as(&self, t: DisplayFormatType, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         match t {
-            DisplayFormatType::Default | DisplayFormatType::Verbose => {
+            DisplayFormatType::Default | DisplayFormatType::Verbose | DisplayFormatType::TreeRender => {
                 write!(f, "ScalarIndexQuery: query={}", self.expr)
             }
         }
@@ -214,7 +214,7 @@ pub struct MapIndexExec {
 impl DisplayAs for MapIndexExec {
     fn fmt_as(&self, t: DisplayFormatType, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         match t {
-            DisplayFormatType::Default | DisplayFormatType::Verbose => {
+            DisplayFormatType::Default | DisplayFormatType::Verbose | DisplayFormatType::TreeRender=> {
                 write!(f, "IndexedLookup")
             }
         }
@@ -420,7 +420,7 @@ pub struct MaterializeIndexExec {
 impl DisplayAs for MaterializeIndexExec {
     fn fmt_as(&self, t: DisplayFormatType, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         match t {
-            DisplayFormatType::Default | DisplayFormatType::Verbose => {
+            DisplayFormatType::Default | DisplayFormatType::Verbose | DisplayFormatType::TreeRender => {
                 write!(f, "MaterializeIndex: query={}", self.expr)
             }
         }

@@ -106,7 +106,7 @@ impl DisplayAs for OneShotExec {
     ) -> std::fmt::Result {
         let stream = self.stream.lock().unwrap();
         match t {
-            DisplayFormatType::Default | DisplayFormatType::Verbose => {
+            DisplayFormatType::Default | DisplayFormatType::Verbose | DisplayFormatType::TreeRender => {
                 let exhausted = if stream.is_some() { "" } else { "EXHAUSTED" };
                 let columns = self
                     .schema
