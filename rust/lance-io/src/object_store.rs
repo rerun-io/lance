@@ -1152,7 +1152,7 @@ lazy_static::lazy_static! {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use parquet::data_type::AsBytes;
+    use object_store::memory::InMemory;
     use rstest::rstest;
     use std::env::set_current_dir;
     use std::fs::{create_dir_all, write};
@@ -1465,7 +1465,7 @@ mod tests {
 
         let reader = ObjectStore::open_local(file_path.as_path()).await.unwrap();
         let buf = reader.get_range(0..5).await.unwrap();
-        assert_eq!(buf.as_bytes(), b"LOCAL");
+        assert_eq!(buf.as_ref(), b"LOCAL");
     }
 
     #[tokio::test]
@@ -1482,10 +1482,10 @@ mod tests {
         let file_path_os = object_store::path::Path::parse(file_path.to_str().unwrap()).unwrap();
         let obj_store = ObjectStore::local();
         let buf = obj_store.read_one_all(&file_path_os).await.unwrap();
-        assert_eq!(buf.as_bytes(), b"LOCAL");
+        assert_eq!(buf.as_ref(), b"LOCAL");
 
         let buf = obj_store.read_one_range(&file_path_os, 0..5).await.unwrap();
-        assert_eq!(buf.as_bytes(), b"LOCAL");
+        assert_eq!(buf.as_ref(), b"LOCAL");
     }
 
     #[tokio::test]
