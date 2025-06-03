@@ -44,6 +44,7 @@ use lance_core::{
 };
 use log::{debug, info, warn};
 use snafu::location;
+use tracing::instrument;
 
 use crate::utils::{
     MetricsExt, BYTES_READ_METRIC, INDEX_COMPARISONS_METRIC, INDICES_LOADED_METRIC, IOPS_METRIC,
@@ -368,6 +369,7 @@ fn report_plan_summary_metrics(plan: &dyn ExecutionPlan, options: &LanceExecutio
 /// Executes a plan using default session & runtime configuration
 ///
 /// Only executes a single partition.  Panics if the plan has more than one partition.
+#[instrument(level = "debug", skip_all)]
 pub fn execute_plan(
     plan: Arc<dyn ExecutionPlan>,
     options: LanceExecutionOptions,
@@ -391,6 +393,7 @@ pub fn execute_plan(
     Ok(Box::pin(RecordBatchStreamAdapter::new(schema, stream)))
 }
 
+#[instrument(level = "debug", skip_all)]
 pub async fn analyze_plan(
     plan: Arc<dyn ExecutionPlan>,
     options: LanceExecutionOptions,
