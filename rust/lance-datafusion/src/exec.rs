@@ -49,7 +49,7 @@ use lance_core::{
     },
 };
 use log::{debug, info, warn};
-use tracing::Span;
+use tracing::{Span, instrument};
 
 use crate::udf::register_functions;
 use crate::{
@@ -594,6 +594,7 @@ fn display_plan_one_liner_impl(plan: &dyn ExecutionPlan, output: &mut String) {
 /// Executes a plan using default session & runtime configuration
 ///
 /// Only executes a single partition.  Panics if the plan has more than one partition.
+#[instrument(level = "debug", skip_all)]
 pub fn execute_plan(
     plan: Arc<dyn ExecutionPlan>,
     options: LanceExecutionOptions,
@@ -627,6 +628,7 @@ pub fn execute_plan(
     Ok(Box::pin(RecordBatchStreamAdapter::new(schema, stream)))
 }
 
+#[instrument(level = "debug", skip_all)]
 pub async fn analyze_plan(
     plan: Arc<dyn ExecutionPlan>,
     options: LanceExecutionOptions,
