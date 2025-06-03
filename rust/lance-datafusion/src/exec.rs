@@ -52,7 +52,7 @@ use lance_core::{
     },
 };
 use log::{debug, info, warn};
-use tracing::Span;
+use tracing::{Span, instrument};
 
 use crate::udf::register_functions;
 use crate::{
@@ -680,6 +680,7 @@ fn display_plan_one_liner_impl(plan: &dyn ExecutionPlan, output: &mut String) {
 /// Executes a plan using default session & runtime configuration
 ///
 /// Only executes a single partition.  Panics if the plan has more than one partition.
+#[instrument(level = "debug", skip_all)]
 pub fn execute_plan(
     plan: Arc<dyn ExecutionPlan>,
     options: LanceExecutionOptions,
@@ -737,6 +738,7 @@ pub async fn analyze_plan(
 /// the context carrying those extensions; otherwise the nodes error during
 /// `execute` and `AnalyzeExec` reports an empty, unexecuted plan tree instead
 /// of surfacing the error.
+#[instrument(level = "debug", name = "analyze_plan", skip_all)]
 pub async fn analyze_plan_with_context(
     plan: Arc<dyn ExecutionPlan>,
     options: LanceExecutionOptions,
