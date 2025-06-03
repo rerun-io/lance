@@ -51,6 +51,7 @@ use lance_arrow::cast::cast_with_options;
 use lance_core::datatypes::Schema;
 use lance_core::error::LanceOptionExt;
 use snafu::location;
+use tracing::instrument;
 
 use lance_core::{Error, Result};
 
@@ -904,6 +905,7 @@ impl Planner {
     }
 
     /// Optimize the filter expression and coerce data types.
+    #[instrument(level = "trace", name = "filter_optimize", skip_all)]
     pub fn optimize_expr(&self, expr: Expr) -> Result<Expr> {
         let df_schema = Arc::new(DFSchema::try_from(self.schema.as_ref().clone())?);
 
