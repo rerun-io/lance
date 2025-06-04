@@ -22,6 +22,7 @@ datafusion-common.workspace = true
 datafusion-functions.workspace = true
 datafusion-physical-expr.workspace = true
 datafusion-substrait = { workspace = true, optional = true }
+datafusion-tracing.workspace = true
 futures.workspace = true
 lance-arrow.workspace = true
 lance-core = { workspace = true, features = ["datafusion"] }

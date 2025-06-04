@@ -162,11 +162,32 @@ struct LanceContextProvider {
 
 impl Default for LanceContextProvider {
     fn default() -> Self {
+        use datafusion::{
+            arrow::{array::RecordBatch, util::pretty::pretty_format_batches},
+            error::Result,
+            execution::SessionStateBuilder,
+            prelude::*,
+        };
+        use datafusion_tracing::{
+            instrument_with_info_spans, pretty_format_compact_batch, InstrumentationOptions,
+        };
+        use std::sync::Arc;
+        use tracing::field;
+
+        let options = InstrumentationOptions::builder().build();
+
+        let instrument_rule = instrument_with_info_spans!(
+            options: options,
+        );
+
         let config = SessionConfig::new();
         let runtime = RuntimeEnvBuilder::new().build_arc().unwrap();
         let mut state_builder = SessionStateBuilder::new()
             .with_config(config)
             .with_runtime_env(runtime)
+            // .with_analyzer_rule(instrument_rule)
+            // .with_optimizer_rule(instrument_rule)
+            .with_physical_optimizer_rule(instrument_rule)
             .with_default_features();
 
         // SessionState does not expose expr_planners, so we need to get the default ones from

@@ -115,6 +115,7 @@ datafusion-optimizer = "47.0"
 datafusion-physical-expr = { version = "47.0" }
 datafusion-physical-plan = { version = "47.0" }
 datafusion-substrait = { version = "47.0" }
+datafusion-tracing = "47.0.1"
 deepsize = "0.2.0"
 dirs = "5.0.0"
 either = "1.0"

@@ -224,6 +224,24 @@ impl LanceExecutionOptions {
 }
 
 pub fn new_session_context(options: &LanceExecutionOptions) -> SessionContext {
+    use datafusion::{
+        arrow::{array::RecordBatch, util::pretty::pretty_format_batches},
+        error::Result,
+        execution::SessionStateBuilder,
+        prelude::*,
+    };
+    use datafusion_tracing::{
+        instrument_with_info_spans, pretty_format_compact_batch, InstrumentationOptions,
+    };
+    use std::sync::Arc;
+    use tracing::field;
+
+    let toptions = InstrumentationOptions::builder().build();
+
+    let instrument_rule = instrument_with_info_spans!(
+        options: toptions,
+    );
+
     let mut session_config = SessionConfig::new();
     let mut runtime_env_builder = RuntimeEnvBuilder::new();
     if let Some(target_partition) = options.target_partition {
@@ -237,7 +255,12 @@ pub fn new_session_context(options: &LanceExecutionOptions) -> SessionContext {
             )));
     }
     let runtime_env = runtime_env_builder.build_arc().unwrap();
-    SessionContext::new_with_config_rt(session_config, runtime_env)
+    let s = SessionContext::new_with_config_rt(session_config, runtime_env);
+    SessionContext::new_with_state(
+        s.into_state_builder()
+            .with_physical_optimizer_rule(instrument_rule)
+            .build(),
+    )
 }
 
 lazy_static! {
