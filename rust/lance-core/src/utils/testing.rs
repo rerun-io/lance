@@ -106,8 +106,8 @@ impl ProxyObjectStore {
         Ok(())
     }
 
-    fn transform_meta(&self, method: &str, meta: ObjectMeta) -> OSResult<ObjectMeta> {
-        let policy = self.policy.lock().unwrap();
+    fn transform_meta(policy: Arc<Mutex<ProxyObjectStorePolicy>>, method: &str, meta: ObjectMeta) -> OSResult<ObjectMeta> {
+        let policy = policy.lock().unwrap();
         let mut meta = meta;
         for policy in policy.object_meta_policies.values() {
             meta = policy(method, meta).map_err(OSError::from)?;
@@ -148,12 +148,12 @@ impl ObjectStore for ProxyObjectStore {
         self.target.get_opts(location, options).await
     }
 
-    async fn get_range(&self, location: &Path, range: Range<usize>) -> OSResult<Bytes> {
+    async fn get_range(&self, location: &Path, range: Range<u64>) -> OSResult<Bytes> {
         self.before_method("get_range", location)?;
         self.target.get_range(location, range).await
     }
 
-    async fn get_ranges(&self, location: &Path, ranges: &[Range<usize>]) -> OSResult<Vec<Bytes>> {
+    async fn get_ranges(&self, location: &Path, ranges: &[Range<u64>]) -> OSResult<Vec<Bytes>> {
         self.before_method("get_ranges", location)?;
         self.target.get_ranges(location, ranges).await
     }
@@ -161,7 +161,7 @@ impl ObjectStore for ProxyObjectStore {
     async fn head(&self, location: &Path) -> OSResult<ObjectMeta> {
         self.before_method("head", location)?;
         let meta = self.target.head(location).await?;
-        self.transform_meta("head", meta)
+        Self::transform_meta(Arc::clone(&self.policy), "head", meta)
     }
 
     async fn delete(&self, location: &Path) -> OSResult<()> {
@@ -169,11 +169,16 @@ impl ObjectStore for ProxyObjectStore {
         self.target.delete(location).await
     }
 
-    fn list(&self, prefix: Option<&Path>) -> BoxStream<'_, OSResult<ObjectMeta>> {
+    // fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, object_store::Result<ObjectMeta>>;
+    fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, OSResult<ObjectMeta>> {
+        let policy = Arc::clone(&self.policy);
         self.target
             .list(prefix)
-            .and_then(|meta| future::ready(self.transform_meta("list", meta)))
+            .and_then(move |meta| {
+                future::ready(Self::transform_meta(Arc::clone(&policy), "list", meta))
+            })
             .boxed()
+
     }
 
     async fn list_with_delimiter(&self, prefix: Option<&Path>) -> OSResult<ListResult> {
