@@ -557,7 +557,7 @@ impl ObjectStore {
 
     /// Get file size.
     pub async fn size(&self, path: &Path) -> Result<usize> {
-        Ok(self.inner.head(path).await?.size)
+        Ok(self.inner.head(path).await?.size as usize)
     }
 
     /// Convenience function to open a reader and read all the bytes
