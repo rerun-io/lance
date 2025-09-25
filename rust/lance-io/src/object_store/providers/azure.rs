@@ -13,6 +13,7 @@ use object_store_opendal::OpendalStore;
 use opendal::{Operator, services::Azblob};
 
 use object_store::{
+    path::Path,
     RetryConfig,
     azure::{AzureConfigKey, MicrosoftAzureBuilder},
 };
@@ -87,6 +88,20 @@ impl AzureBlobStoreProvider {
 
 #[async_trait::async_trait]
 impl ObjectStoreProvider for AzureBlobStoreProvider {
+    fn extract_path(&self, url: &Url) -> Result<Path> {
+        // Azure https paths in ObjectSore encode the container name as the first path segment.
+        // The actual object path starts from the second segment.
+        if url.scheme() == "https" {
+            url.path_segments()
+                .map(|s| Path::from_iter(s.skip(1)))
+                .ok_or_else(|| {
+                    Error::invalid_input(format!("Invalid Azure URL: {url}"), location!())
+                })
+        } else {
+            Ok(Path::from(url.path()))
+        }
+    }
+
     async fn new_store(&self, base_path: Url, params: &ObjectStoreParams) -> Result<ObjectStore> {
         let block_size = params.block_size.unwrap_or(DEFAULT_CLOUD_BLOCK_SIZE);
         let mut storage_options =
@@ -218,6 +233,16 @@ mod tests {
 
         let url = Url::parse("az://bucket/path/to/file").unwrap();
         let path = provider.extract_path(&url).unwrap();
+        let expected_path = object_store::path::Path::from("path/to/file");
+        assert_eq!(path, expected_path);
+    }
+
+    #[test]
+    fn test_azure_store_https_path() {
+        let provider = AzureBlobStoreProvider;
+
+        let url = Url::parse("https://account.blob.core.windows.net/bucket/path/to/file").unwrap();
+        let path = provider.extract_path(&url).expect("Failed to extract path");
         let expected_path = object_store::path::Path::from("path/to/file");
         assert_eq!(path, expected_path);
     }
