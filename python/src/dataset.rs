@@ -2553,6 +2553,7 @@ fn prepare_vector_index_params(
     let mut pq_params = PQBuildParams::default();
     let mut sq_params = SQBuildParams::default();
     let mut index_file_version = IndexFileVersion::V3;
+    let mut metadata_only = false;
 
     if let Some(kwargs) = kwargs {
         // Parse metric type
@@ -2679,6 +2680,11 @@ fn prepare_vector_index_params(
             index_file_version = IndexFileVersion::try_from(&version)
                 .map_err(|e| PyValueError::new_err(format!("Invalid index_file_version: {e}")))?;
         }
+
+        if let Some(flag) = kwargs.get_item("metadata_only")? {
+            metadata_only = flag.extract()?;
+        }
+
     }
 
     let mut params = match index_type {
@@ -2719,6 +2725,7 @@ fn prepare_vector_index_params(
         ))),
     }?;
     params.version(index_file_version);
+    params.metadata_only(metadata_only);
     Ok(params)
 }
 

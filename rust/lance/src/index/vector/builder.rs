@@ -99,6 +99,7 @@ pub struct IvfIndexBuilder<S: IvfSubIndex, Q: Quantization> {
     existing_indices: Vec<Arc<dyn VectorIndex>>,
 
     frag_reuse_index: Option<Arc<FragReuseIndex>>,
+    metadata_only: bool,
 }
 
 type BuildStream<S, Q> =
@@ -138,6 +139,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
             shuffle_reader: None,
             existing_indices: Vec::new(),
             frag_reuse_index,
+            metadata_only: false,
         })
     }
 
@@ -198,6 +200,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
             shuffle_reader: None,
             existing_indices: vec![index],
             frag_reuse_index: None,
+            metadata_only: false,
         })
     }
 
@@ -214,7 +217,9 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
         self.with_quantizer(self.load_or_build_quantizer().await?);
 
         // step 2. shuffle the dataset
-        if self.shuffle_reader.is_none() {
+        if self.metadata_only {
+            self.shuffle_reader = Some(Arc::new(EmptyReader));
+        } else if self.shuffle_reader.is_none() {
             self.shuffle_dataset().await?;
         }
 
@@ -284,6 +289,11 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
 
     pub fn with_existing_indices(&mut self, indices: Vec<Arc<dyn VectorIndex>>) -> &mut Self {
         self.existing_indices = indices;
+        self
+    }
+
+    pub fn metadata_only(&mut self, metadata_only: bool) -> &mut Self {
+        self.metadata_only = metadata_only;
         self
     }
 

@@ -2301,6 +2301,10 @@ class LanceDataset(pa.dataset.Dataset):
                 Only 4, 8 are supported.
             - index_file_version
                 The version of the index file. Default is "V3".
+            - metadata_only
+                If True, train the index metadata (IVF/PQ) but skip building
+                partitions. This requires ``train=True`` and is only supported
+                for the V3 index file format.
 
         Optional parameters for `IVF_HNSW_*`:
             max_level

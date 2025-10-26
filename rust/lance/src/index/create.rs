@@ -246,6 +246,13 @@ impl<'a> CreateIndexBuilder<'a> {
                         location: location!(),
                     })?;
 
+                if vec_params.metadata_only && !train {
+                    return Err(Error::Index {
+                        message: "metadata_only requires train=true".to_string(),
+                        location: location!(),
+                    });
+                }
+
                 if train {
                     // this is a large future so move it to heap
                     Box::pin(build_vector_index(
@@ -282,6 +289,16 @@ impl<'a> CreateIndexBuilder<'a> {
                     .index_extensions
                     .contains_key(&(IndexType::Vector, name.to_string())) =>
             {
+                // Vector index params.
+                let vec_params = self
+                    .params
+                    .as_any()
+                    .downcast_ref::<VectorIndexParams>()
+                    .ok_or_else(|| Error::Index {
+                        message: "Vector index type must take a VectorIndexParams".to_string(),
+                        location: location!(),
+                    })?;
+
                 let ext = self
                     .dataset
                     .session
@@ -296,6 +313,14 @@ impl<'a> CreateIndexBuilder<'a> {
                         message: "unable to cast index extension to vector".to_string(),
                         location: location!(),
                     })?;
+
+                if vec_params.metadata_only {
+                    return Err(Error::NotSupported {
+                        source: "metadata_only is not supported for custom vector index extensions"
+                            .into(),
+                        location: location!(),
+                    });
+                }
 
                 if train {
                     ext.create_index(self.dataset, column, &index_id.to_string(), self.params)

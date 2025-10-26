@@ -101,11 +101,19 @@ pub struct VectorIndexParams {
 
     /// The version of the index file.
     pub version: IndexFileVersion,
+
+    /// If true, only train the index metadata (IVF / quantizer) without building partitions.
+    pub metadata_only: bool,
 }
 
 impl VectorIndexParams {
     pub fn version(&mut self, version: IndexFileVersion) -> &mut Self {
         self.version = version;
+        self
+    }
+
+    pub fn metadata_only(&mut self, metadata_only: bool) -> &mut Self {
+        self.metadata_only = metadata_only;
         self
     }
 
@@ -116,6 +124,7 @@ impl VectorIndexParams {
             stages,
             metric_type,
             version: IndexFileVersion::V3,
+            metadata_only: false,
         }
     }
 
@@ -125,6 +134,7 @@ impl VectorIndexParams {
             stages,
             metric_type,
             version: IndexFileVersion::V3,
+            metadata_only: false,
         }
     }
 
@@ -158,6 +168,7 @@ impl VectorIndexParams {
             stages,
             metric_type,
             version: IndexFileVersion::V3,
+            metadata_only: false,
         }
     }
 
@@ -172,6 +183,7 @@ impl VectorIndexParams {
             stages,
             metric_type,
             version: IndexFileVersion::V3,
+            metadata_only: false,
         }
     }
 
@@ -185,6 +197,7 @@ impl VectorIndexParams {
             stages,
             metric_type,
             version: IndexFileVersion::V3,
+            metadata_only: false,
         }
     }
 
@@ -198,6 +211,7 @@ impl VectorIndexParams {
             stages,
             metric_type: distance_type,
             version: IndexFileVersion::V3,
+            metadata_only: false,
         }
     }
 
@@ -218,6 +232,7 @@ impl VectorIndexParams {
             stages,
             metric_type,
             version: IndexFileVersion::V3,
+            metadata_only: false,
         }
     }
 
@@ -238,6 +253,7 @@ impl VectorIndexParams {
             stages,
             metric_type,
             version: IndexFileVersion::V3,
+            metadata_only: false,
         }
     }
 
@@ -322,34 +338,38 @@ pub(crate) async fn build_vector_index(
     match index_type {
         IndexType::IvfFlat => match element_type {
             DataType::Float16 | DataType::Float32 | DataType::Float64 => {
-                IvfIndexBuilder::<FlatIndex, FlatQuantizer>::new(
+                let mut builder = IvfIndexBuilder::<FlatIndex, FlatQuantizer>::new(
                     dataset.clone(),
                     column.to_owned(),
                     dataset.indices_dir().child(uuid),
                     params.metric_type,
                     Box::new(shuffler),
-                    Some(ivf_params),
+                    Some(ivf_params.clone()),
                     Some(()),
                     (),
                     frag_reuse_index,
-                )?
-                .build()
-                .await?;
+                )?;
+                if params.metadata_only {
+                    builder.metadata_only(true);
+                }
+                builder.build().await?;
             }
             DataType::UInt8 => {
-                IvfIndexBuilder::<FlatIndex, FlatBinQuantizer>::new(
+                let mut builder = IvfIndexBuilder::<FlatIndex, FlatBinQuantizer>::new(
                     dataset.clone(),
                     column.to_owned(),
                     dataset.indices_dir().child(uuid),
                     params.metric_type,
                     Box::new(shuffler),
-                    Some(ivf_params),
+                    Some(ivf_params.clone()),
                     Some(()),
                     (),
                     frag_reuse_index,
-                )?
-                .build()
-                .await?;
+                )?;
+                if params.metadata_only {
+                    builder.metadata_only(true);
+                }
+                builder.build().await?;
             }
             _ => {
                 return Err(Error::Index {
@@ -369,6 +389,12 @@ pub(crate) async fn build_vector_index(
 
             match params.version {
                 IndexFileVersion::Legacy => {
+                    if params.metadata_only {
+                        return Err(Error::NotSupported {
+                            source: "Metadata-only vector index creation is not supported for legacy index version".into(),
+                            location: location!(),
+                        });
+                    }
                     build_ivf_pq_index(
                         dataset,
                         column,
@@ -381,19 +407,21 @@ pub(crate) async fn build_vector_index(
                     .await?;
                 }
                 IndexFileVersion::V3 => {
-                    IvfIndexBuilder::<FlatIndex, ProductQuantizer>::new(
+                    let mut builder = IvfIndexBuilder::<FlatIndex, ProductQuantizer>::new(
                         dataset.clone(),
                         column.to_owned(),
                         dataset.indices_dir().child(uuid),
                         params.metric_type,
                         Box::new(shuffler),
-                        Some(ivf_params),
+                        Some(ivf_params.clone()),
                         Some(pq_params.clone()),
                         (),
                         frag_reuse_index,
-                    )?
-                    .build()
-                    .await?;
+                    )?;
+                    if params.metadata_only {
+                        builder.metadata_only(true);
+                    }
+                    builder.build().await?;
                 }
             }
         }
@@ -405,19 +433,21 @@ pub(crate) async fn build_vector_index(
                 });
             };
 
-            IvfIndexBuilder::<FlatIndex, ScalarQuantizer>::new(
+            let mut builder = IvfIndexBuilder::<FlatIndex, ScalarQuantizer>::new(
                 dataset.clone(),
                 column.to_owned(),
                 dataset.indices_dir().child(uuid),
                 params.metric_type,
                 Box::new(shuffler),
-                Some(ivf_params),
+                Some(ivf_params.clone()),
                 Some(sq_params.clone()),
                 (),
                 frag_reuse_index,
-            )?
-            .build()
-            .await?;
+            )?;
+            if params.metadata_only {
+                builder.metadata_only(true);
+            }
+            builder.build().await?;
         }
         IndexType::IvfHnswFlat => {
             let StageParams::Hnsw(hnsw_params) = &stages[1] else {
@@ -426,19 +456,21 @@ pub(crate) async fn build_vector_index(
                     location: location!(),
                 });
             };
-            IvfIndexBuilder::<HNSW, FlatQuantizer>::new(
+            let mut builder = IvfIndexBuilder::<HNSW, FlatQuantizer>::new(
                 dataset.clone(),
                 column.to_owned(),
                 dataset.indices_dir().child(uuid),
                 params.metric_type,
                 Box::new(shuffler),
-                Some(ivf_params),
+                Some(ivf_params.clone()),
                 Some(()),
                 hnsw_params.clone(),
                 frag_reuse_index,
-            )?
-            .build()
-            .await?;
+            )?;
+            if params.metadata_only {
+                builder.metadata_only(true);
+            }
+            builder.build().await?;
         }
         IndexType::IvfHnswPq => {
             let StageParams::Hnsw(hnsw_params) = &stages[1] else {
@@ -453,19 +485,21 @@ pub(crate) async fn build_vector_index(
                     location: location!(),
                 });
             };
-            IvfIndexBuilder::<HNSW, ProductQuantizer>::new(
+            let mut builder = IvfIndexBuilder::<HNSW, ProductQuantizer>::new(
                 dataset.clone(),
                 column.to_owned(),
                 dataset.indices_dir().child(uuid),
                 params.metric_type,
                 Box::new(shuffler),
-                Some(ivf_params),
+                Some(ivf_params.clone()),
                 Some(pq_params.clone()),
                 hnsw_params.clone(),
                 frag_reuse_index,
-            )?
-            .build()
-            .await?;
+            )?;
+            if params.metadata_only {
+                builder.metadata_only(true);
+            }
+            builder.build().await?;
         }
         IndexType::IvfHnswSq => {
             let StageParams::Hnsw(hnsw_params) = &stages[1] else {
@@ -480,19 +514,21 @@ pub(crate) async fn build_vector_index(
                     location: location!(),
                 });
             };
-            IvfIndexBuilder::<HNSW, ScalarQuantizer>::new(
+            let mut builder = IvfIndexBuilder::<HNSW, ScalarQuantizer>::new(
                 dataset.clone(),
                 column.to_owned(),
                 dataset.indices_dir().child(uuid),
                 params.metric_type,
                 Box::new(shuffler),
-                Some(ivf_params),
+                Some(ivf_params.clone()),
                 Some(sq_params.clone()),
                 hnsw_params.clone(),
                 frag_reuse_index,
-            )?
-            .build()
-            .await?;
+            )?;
+            if params.metadata_only {
+                builder.metadata_only(true);
+            }
+            builder.build().await?;
         }
         _ => {
             return Err(Error::Index {
@@ -523,6 +559,13 @@ pub(crate) async fn build_vector_index_incremental(
             location: location!(),
         });
     };
+
+    if params.metadata_only {
+        return Err(Error::Index {
+            message: "metadata_only is only supported for initial index creation".to_string(),
+            location: location!(),
+        });
+    }
 
     let StageParams::Ivf(ivf_params) = &stages[0] else {
         return Err(Error::Index {

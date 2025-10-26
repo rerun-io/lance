@@ -260,6 +260,7 @@ pub fn get_vector_index_params(
             metric_type: distance_type,
             stages,
             version: IndexFileVersion::V3,
+            metadata_only: false,
         })
     } else {
         None

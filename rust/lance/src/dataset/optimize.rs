@@ -3341,6 +3341,7 @@ mod tests {
                         }),
                     ],
                     version: crate::index::vector::IndexFileVersion::V3,
+                    metadata_only: false,
                 },
                 false,
             )

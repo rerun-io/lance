@@ -7258,6 +7258,7 @@ mod test {
                         }),
                     ],
                     version: crate::index::vector::IndexFileVersion::Legacy,
+                    metadata_only: false,
                 },
                 false,
             )
