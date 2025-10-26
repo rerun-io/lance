@@ -108,6 +108,12 @@ impl<'a> CreateIndexBuilder<'a> {
             false
         };
 
+        let metadata_only = self
+            .params
+            .as_any()
+            .downcast_ref::<VectorIndexParams>()
+            .map_or(false, |params| params.metadata_only);
+
         // Load indices from the disk.
         let indices = self.dataset.load_indices().await?;
         let fri = self
@@ -355,7 +361,9 @@ impl<'a> CreateIndexBuilder<'a> {
             name: index_name,
             fields: vec![field.id],
             dataset_version: self.dataset.manifest.version,
-            fragment_bitmap: if train {
+            fragment_bitmap: if metadata_only {
+                Some(roaring::RoaringBitmap::new())
+            } else if train {
                 match &self.fragments {
                     Some(fragment_ids) => Some(fragment_ids.iter().collect()),
                     None => Some(
