@@ -241,6 +241,55 @@ impl<'a> CreateIndexBuilder<'a> {
                     index_version: lance_index::scalar::inverted::INVERTED_INDEX_VERSION,
                 }
             }
+            // Can't use if let Some(...) here because it's not stable yet.
+            // TODO: fix after https://github.com/rust-lang/rust/issues/51114
+            (IndexType::Vector, name)
+                if self
+                    .dataset
+                    .session
+                    .index_extensions
+                    .contains_key(&(IndexType::Vector, name.to_string())) =>
+            {
+                if let Some(vec_params) = self
+                    .params
+                    .as_any()
+                    .downcast_ref::<VectorIndexParams>()
+                {
+                    if vec_params.metadata_only {
+                        return Err(Error::NotSupported {
+                            source: "metadata_only is not supported for custom vector index extensions"
+                                .into(),
+                            location: location!(),
+                        });
+                    }
+                }
+
+                let ext = self
+                    .dataset
+                    .session
+                    .index_extensions
+                    .get(&(IndexType::Vector, name.to_string()))
+                    .expect("already checked")
+                    .clone()
+                    .to_vector()
+                    // this should never happen because we control the registration
+                    // if this fails, the registration logic has a bug
+                    .ok_or(Error::Internal {
+                        message: "unable to cast index extension to vector".to_string(),
+                        location: location!(),
+                    })?;
+
+                if train {
+                    ext.create_index(self.dataset, column, &index_id.to_string(), self.params)
+                        .await?;
+                } else {
+                    todo!("create empty vector index when train=false");
+                }
+                CreatedIndex {
+                    index_details: vector_index_details(),
+                    index_version: VECTOR_INDEX_VERSION,
+                }
+            }
             (IndexType::Vector, LANCE_VECTOR_INDEX) => {
                 // Vector index params.
                 let vec_params = self
@@ -280,59 +329,6 @@ impl<'a> CreateIndexBuilder<'a> {
                         vec_params,
                     )
                     .await?;
-                }
-                CreatedIndex {
-                    index_details: vector_index_details(),
-                    index_version: VECTOR_INDEX_VERSION,
-                }
-            }
-            // Can't use if let Some(...) here because it's not stable yet.
-            // TODO: fix after https://github.com/rust-lang/rust/issues/51114
-            (IndexType::Vector, name)
-                if self
-                    .dataset
-                    .session
-                    .index_extensions
-                    .contains_key(&(IndexType::Vector, name.to_string())) =>
-            {
-                // Vector index params.
-                let vec_params = self
-                    .params
-                    .as_any()
-                    .downcast_ref::<VectorIndexParams>()
-                    .ok_or_else(|| Error::Index {
-                        message: "Vector index type must take a VectorIndexParams".to_string(),
-                        location: location!(),
-                    })?;
-
-                let ext = self
-                    .dataset
-                    .session
-                    .index_extensions
-                    .get(&(IndexType::Vector, name.to_string()))
-                    .expect("already checked")
-                    .clone()
-                    .to_vector()
-                    // this should never happen because we control the registration
-                    // if this fails, the registration logic has a bug
-                    .ok_or(Error::Internal {
-                        message: "unable to cast index extension to vector".to_string(),
-                        location: location!(),
-                    })?;
-
-                if vec_params.metadata_only {
-                    return Err(Error::NotSupported {
-                        source: "metadata_only is not supported for custom vector index extensions"
-                            .into(),
-                        location: location!(),
-                    });
-                }
-
-                if train {
-                    ext.create_index(self.dataset, column, &index_id.to_string(), self.params)
-                        .await?;
-                } else {
-                    todo!("create empty vector index when train=false");
                 }
                 CreatedIndex {
                     index_details: vector_index_details(),

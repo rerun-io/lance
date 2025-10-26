@@ -53,15 +53,13 @@ pub async fn merge_indices<'a>(
         });
     };
 
-    let mut unindexed = dataset
-        .unindexed_fragments(&old_indices[0].name)
-        .await?;
+    let mut unindexed = dataset.unindexed_fragments(&old_indices[0].name).await?;
     if let Some(targets) = options.fragments.as_ref() {
         let filter: HashSet<u32> = targets.iter().copied().collect();
         unindexed.retain(|frag| filter.contains(&(frag.id as u32)));
-    }
-    if unindexed.is_empty() {
-        return Ok(None);
+        if unindexed.is_empty() && options.num_indices_to_merge == 0 && !options.retrain {
+            return Ok(None);
+        }
     }
     merge_indices_with_unindexed_frags(dataset, old_indices, &unindexed, options).await
 }
