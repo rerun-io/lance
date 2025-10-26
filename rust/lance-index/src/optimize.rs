@@ -33,6 +33,11 @@ pub struct OptimizeOptions {
     ///
     /// NOTE: this option is only supported for v3 vector indices.
     pub retrain: bool,
+
+    /// Optional list of fragment IDs to optimize. When set, only the specified
+    /// fragments will be considered unindexed for this optimization run.
+    /// Fragment IDs correspond to the manifest fragment identifiers (u32).
+    pub fragments: Option<Vec<u32>>,
 }
 
 impl Default for OptimizeOptions {
@@ -41,6 +46,7 @@ impl Default for OptimizeOptions {
             num_indices_to_merge: 1,
             index_names: None,
             retrain: false,
+            fragments: None,
         }
     }
 }
@@ -51,6 +57,7 @@ impl OptimizeOptions {
             num_indices_to_merge: 1,
             index_names: None,
             retrain: false,
+            fragments: None,
         }
     }
 
@@ -59,6 +66,7 @@ impl OptimizeOptions {
             num_indices_to_merge: 0,
             index_names: None,
             retrain: false,
+            fragments: None,
         }
     }
 
@@ -67,6 +75,7 @@ impl OptimizeOptions {
             num_indices_to_merge: 0,
             index_names: None,
             retrain: true,
+            fragments: None,
         }
     }
 
@@ -77,6 +86,11 @@ impl OptimizeOptions {
 
     pub fn index_names(mut self, names: Vec<String>) -> Self {
         self.index_names = Some(names);
+        self
+    }
+
+    pub fn fragments(mut self, fragments: Vec<u32>) -> Self {
+        self.fragments = Some(fragments);
         self
     }
 }

@@ -2685,6 +2685,10 @@ fn prepare_vector_index_params(
             metadata_only = flag.extract()?;
         }
 
+        if let Some(shuffle_batches) = kwargs.get_item("shuffle_partition_batches")? {
+            ivf_params.shuffle_partition_batches = shuffle_batches.extract()?;
+        }
+
     }
 
     let mut params = match index_type {

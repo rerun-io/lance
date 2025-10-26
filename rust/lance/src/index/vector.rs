@@ -1803,6 +1803,7 @@ mod tests {
             num_indices_to_merge: 10, // High value to ensure all indices are merged
             index_names: None,
             retrain: false, // Don't retrain, just merge with existing centroids
+            fragments: None,
         };
         target_dataset
             .optimize_indices(&optimize_options)

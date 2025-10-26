@@ -1601,17 +1601,18 @@ mod tests {
                     .await
                     .unwrap();
 
-            dataset
-                .optimize_indices(&OptimizeOptions {
-                    num_indices_to_merge: 1,
-                    index_names: Some(vec![
-                        "fully_indexed_idx".to_string(),
-                        "recheck_idx_idx".to_string(),
-                    ]),
-                    retrain: false,
-                })
-                .await
-                .unwrap();
+        dataset
+            .optimize_indices(&OptimizeOptions {
+                num_indices_to_merge: 1,
+                index_names: Some(vec![
+                    "fully_indexed_idx".to_string(),
+                    "recheck_idx_idx".to_string(),
+                ]),
+                retrain: false,
+                fragments: None,
+            })
+            .await
+            .unwrap();
 
             dataset
                 .delete("fully_indexed >= 100 AND fully_indexed < 250")
