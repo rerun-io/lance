@@ -83,7 +83,7 @@ impl IvfShuffler {
             object_store: Arc::new(ObjectStore::local()),
             output_dir,
             num_partitions,
-            buffer_size: 4096,
+            buffer_size: 64,
             precomputed_shuffle_buffers: None,
         }
     }

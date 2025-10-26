@@ -470,6 +470,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
                     .batch_readahead(get_num_compute_intensive_cpus())
                     .project(&[self.column.as_str()])?
                     .with_row_id();
+                builder.batch_size(64);
 
                 let (vector_type, _) = get_vector_type(dataset.schema(), &self.column)?;
                 let is_multivector = matches!(vector_type, datatypes::DataType::List(_));
