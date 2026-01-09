@@ -748,7 +748,7 @@ impl std::fmt::Debug for OneShotPartitionStream {
 }
 
 impl OneShotPartitionStream {
-    fn new(data: SendableRecordBatchStream) -> Self {
+    pub fn new(data: SendableRecordBatchStream) -> Self {
         let schema = data.schema();
         Self {
             data: Arc::new(Mutex::new(Some(data))),
