@@ -182,7 +182,7 @@ pub trait SessionContextExt {
     ) -> datafusion::common::Result<DataFrame>;
 }
 
-struct OneShotPartitionStream {
+pub struct OneShotPartitionStream {
     data: Arc<Mutex<Option<SendableRecordBatchStream>>>,
     schema: Arc<Schema>,
 }
