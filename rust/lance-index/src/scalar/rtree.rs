@@ -511,6 +511,7 @@ impl ScalarIndex for RTreeIndex {
         &self,
         new_data: SendableRecordBatchStream,
         dest_store: &dyn IndexStore,
+        _valid_old_fragments: Option<&RoaringBitmap>,
     ) -> Result<CreatedIndex> {
         let bbox_data = RTreeIndexPlugin::convert_bbox_stream(new_data)?;
         let tmpdir = Arc::new(TempDir::default());
@@ -1172,7 +1173,7 @@ mod tests {
             Arc::new(UInt64Array::from(new_rowaddr_arr.clone())),
         );
         rtree_index
-            .update(stream, new_store.as_ref())
+            .update(stream, new_store.as_ref(), None)
             .await
             .unwrap();
 

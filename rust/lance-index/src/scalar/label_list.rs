@@ -207,9 +207,10 @@ impl ScalarIndex for LabelListIndex {
         &self,
         new_data: SendableRecordBatchStream,
         dest_store: &dyn IndexStore,
+        valid_old_fragments: Option<&RoaringBitmap>,
     ) -> Result<CreatedIndex> {
         self.values_index
-            .update(unnest_chunks(new_data)?, dest_store)
+            .update(unnest_chunks(new_data)?, dest_store, valid_old_fragments)
             .await?;
 
         Ok(CreatedIndex {

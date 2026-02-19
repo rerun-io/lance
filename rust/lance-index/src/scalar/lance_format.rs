@@ -472,6 +472,7 @@ pub mod tests {
             .update(
                 lance_datafusion::utils::reader_to_stream(Box::new(data)),
                 updated_index_store.as_ref(),
+                None,
             )
             .await
             .unwrap();
@@ -1290,6 +1291,7 @@ pub mod tests {
             .update(
                 lance_datafusion::utils::reader_to_stream(Box::new(data)),
                 updated_index_store.as_ref(),
+                None,
             )
             .await
             .unwrap();
