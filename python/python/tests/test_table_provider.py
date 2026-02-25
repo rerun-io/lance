@@ -76,9 +76,7 @@ def test_table_loading():
     pd.testing.assert_frame_equal(result.to_pandas(), expected)
 
     ctx = make_ctx()
-    result = normalize(
-        ctx.table("ffi_lance_table").filter(col("col1") == 4).collect()
-    )
+    result = normalize(ctx.table("ffi_lance_table").filter(col("col1") == 4).collect())
     assert len(result) == 1
 
     ctx = make_ctx()
