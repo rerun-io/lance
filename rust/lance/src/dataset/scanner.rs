@@ -417,8 +417,9 @@ impl ExprFilter {
                 let filter = planner.parse_filter(sql)?;
 
                 let df_schema = DFSchema::try_from(schema)?;
-                let (ret_type, _) = filter.data_type_and_nullable(&df_schema)?;
-                if ret_type != DataType::Boolean {
+                let ret_field = filter.to_field(&df_schema)?.1;
+                let ret_type = ret_field.data_type();
+                if ret_type != &DataType::Boolean {
                     return Err(Error::InvalidInput {
                         source: format!("The filter {} does not return a boolean", filter).into(),
                         location: location!(),
