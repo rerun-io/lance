@@ -13,9 +13,9 @@ use object_store_opendal::OpendalStore;
 use opendal::{Operator, services::Azblob};
 
 use object_store::{
-    path::Path,
     RetryConfig,
     azure::{AzureConfigKey, MicrosoftAzureBuilder},
+    path::Path,
 };
 use url::Url;
 
@@ -95,7 +95,7 @@ impl ObjectStoreProvider for AzureBlobStoreProvider {
             url.path_segments()
                 .map(|s| Path::from_iter(s.skip(1)))
                 .ok_or_else(|| {
-                    Error::invalid_input(format!("Invalid Azure URL: {url}"), location!())
+                    Error::invalid_input(format!("Invalid Azure URL: {url}"))
                 })
         } else {
             Ok(Path::from(url.path()))
