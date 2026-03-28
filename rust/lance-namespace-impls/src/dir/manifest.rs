@@ -629,11 +629,13 @@ impl DatasetConsistencyWrapper {
 
     /// Get a mutable reference to the dataset.
     /// Always reloads to ensure strong consistency.
+    ///
+    /// Acquires the write lock before reloading so that tokio's write-fairness
+    /// prevents reader starvation of the writer.
     pub async fn get_mut(&self) -> Result<DatasetWriteGuard<'_>> {
-        self.reload().await?;
-        let guard = DatasetWriteGuard {
-            guard: self.0.write().await,
-        };
+        let mut write_guard = self.0.write().await;
+        Self::reload_under_write_lock(&mut write_guard).await?;
+        let guard = DatasetWriteGuard { guard: write_guard };
         ensure_readable(guard.metadata())?;
         ensure_writable(guard.metadata())?;
         Ok(guard)
@@ -650,7 +652,10 @@ impl DatasetConsistencyWrapper {
         }
     }
 
-    /// Reload the dataset to the latest version.
+    /// Reload the dataset to the latest version (for the read path).
+    ///
+    /// Takes a read lock first to check if a reload is needed, then upgrades
+    /// to a write lock only if necessary.
     async fn reload(&self) -> Result<()> {
         // First check if we need to reload (with read lock)
         let read_guard = self.0.read().await;
@@ -686,16 +691,29 @@ impl DatasetConsistencyWrapper {
 
         // Need to reload, acquire write lock
         let mut write_guard = self.0.write().await;
+        Self::reload_under_write_lock(&mut write_guard).await
+    }
 
-        // Double-check after acquiring write lock (someone else might have reloaded)
-        let has_successor_version = write_guard.has_successor_version().await.map_err(|e| {
+    /// Reload the dataset while already holding the write lock.
+    async fn reload_under_write_lock(
+        dataset: &mut tokio::sync::RwLockWriteGuard<'_, Dataset>,
+    ) -> Result<()> {
+        let dataset_uri = dataset.uri().to_string();
+        let current_version = dataset.version().version;
+        log::debug!(
+            "Reload (under write lock) for uri={}, current_version={}",
+            dataset_uri,
+            current_version
+        );
+
+        let has_successor_version = dataset.has_successor_version().await.map_err(|e| {
             lance_core::Error::from(NamespaceError::Internal {
                 message: format!("Failed to check dataset staleness: {:?}", e),
             })
         })?;
 
         if has_successor_version {
-            write_guard.checkout_latest().await.map_err(|e| {
+            dataset.checkout_latest().await.map_err(|e| {
                 lance_core::Error::from(NamespaceError::Internal {
                     message: format!("Failed to checkout latest: {:?}", e),
                 })
