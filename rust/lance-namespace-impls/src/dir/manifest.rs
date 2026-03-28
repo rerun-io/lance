@@ -192,11 +192,13 @@ impl DatasetConsistencyWrapper {
 
     /// Get a mutable reference to the dataset.
     /// Always reloads to ensure strong consistency.
+    ///
+    /// Acquires the write lock before reloading so that tokio's write-fairness
+    /// prevents reader starvation of the writer.
     pub async fn get_mut(&self) -> Result<DatasetWriteGuard<'_>> {
-        self.reload().await?;
-        Ok(DatasetWriteGuard {
-            guard: self.0.write().await,
-        })
+        let mut write_guard = self.0.write().await;
+        Self::reload_under_write_lock(&mut write_guard).await?;
+        Ok(DatasetWriteGuard { guard: write_guard })
     }
 
     /// Provide a known latest version of the dataset.
@@ -210,7 +212,10 @@ impl DatasetConsistencyWrapper {
         }
     }
 
-    /// Reload the dataset to the latest version.
+    /// Reload the dataset to the latest version (for the read path).
+    ///
+    /// Takes a read lock first to check if a reload is needed, then upgrades
+    /// to a write lock only if necessary.
     async fn reload(&self) -> Result<()> {
         // First check if we need to reload (with read lock)
         let read_guard = self.0.read().await;
@@ -227,31 +232,41 @@ impl DatasetConsistencyWrapper {
             })
         })?;
         log::debug!(
-            "Reload got latest_version={} for uri={}, current_version={}",
-            latest_version,
-            dataset_uri,
-            current_version
+            "Reload got latest_version={latest_version} for uri={dataset_uri}, current_version={current_version}",
         );
         drop(read_guard);
 
         // If already up-to-date, return early
         if latest_version == current_version {
-            log::debug!("Already up-to-date for uri={}", dataset_uri);
+            log::debug!("Already up-to-date for uri={dataset_uri}");
             return Ok(());
         }
 
         // Need to reload, acquire write lock
         let mut write_guard = self.0.write().await;
+        Self::reload_under_write_lock(&mut write_guard).await
+    }
 
-        // Double-check after acquiring write lock (someone else might have reloaded)
-        let latest_version = write_guard.latest_version_id().await.map_err(|e| {
+    /// Reload the dataset while already holding the write lock.
+    async fn reload_under_write_lock(
+        dataset: &mut tokio::sync::RwLockWriteGuard<'_, Dataset>,
+    ) -> Result<()> {
+        let dataset_uri = dataset.uri().to_string();
+        let current_version = dataset.version().version;
+        log::debug!(
+            "Reload (under write lock) for uri={}, current_version={}",
+            dataset_uri,
+            current_version
+        );
+
+        let latest_version = dataset.latest_version_id().await.map_err(|e| {
             lance_core::Error::from(NamespaceError::Internal {
                 message: format!("Failed to get latest version: {:?}", e),
             })
         })?;
 
-        if latest_version != write_guard.version().version {
-            write_guard.checkout_latest().await.map_err(|e| {
+        if latest_version != current_version {
+            dataset.checkout_latest().await.map_err(|e| {
                 lance_core::Error::from(NamespaceError::Internal {
                     message: format!("Failed to checkout latest: {:?}", e),
                 })
