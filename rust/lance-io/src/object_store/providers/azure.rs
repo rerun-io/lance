@@ -94,9 +94,7 @@ impl ObjectStoreProvider for AzureBlobStoreProvider {
         if url.scheme() == "https" {
             url.path_segments()
                 .map(|s| Path::from_iter(s.skip(1)))
-                .ok_or_else(|| {
-                    Error::invalid_input(format!("Invalid Azure URL: {url}"))
-                })
+                .ok_or_else(|| Error::invalid_input(format!("Invalid Azure URL: {url}")))
         } else {
             Ok(Path::from(url.path()))
         }

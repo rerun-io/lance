@@ -150,15 +150,11 @@ impl DatasetConsistencyWrapper {
         let read_guard = self.0.read().await;
         let dataset_uri = read_guard.uri().to_string();
         let current_version = read_guard.version().version;
-        //    Error::io_source(box_error(std::io::Error::other(format!(
-        //        "Failed to get latest version: {}",
-        //        e
-        //    ))))
         log::debug!("Reload starting for uri={dataset_uri}, current_version={current_version}",);
         let latest_version = read_guard.latest_version_id().await.map_err(|err| {
-            lance_core::Error::from(NamespaceError::Internal {
-                message: format!("Failed to get latest version: {err}"),
-            })
+            Error::io_source(box_error(std::io::Error::other(format!(
+                "Failed to get latest version: {err}"
+            ))))
         })?;
         log::debug!(
             "Reload got latest_version={latest_version} for uri={dataset_uri}, current_version={current_version}",

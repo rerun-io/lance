@@ -48,7 +48,7 @@ use lance_core::{
     },
 };
 use log::{debug, info, warn};
-use tracing::{instrument, Span};
+use tracing::{Span, instrument};
 
 use crate::udf::register_functions;
 use crate::{
