@@ -45,7 +45,10 @@ use futures::stream::{Stream, StreamExt};
 use futures::{FutureExt, TryStreamExt};
 use lance_arrow::floats::{coerce_float_vector, FloatType};
 use lance_arrow::{DataTypeExt, SchemaExt as ArrowSchemaExt};
-use lance_core::datatypes::{escape_field_path_for_project, format_field_path, BlobHandling, BlobVersion, Field, OnMissing, Projection};
+use lance_core::datatypes::{
+    escape_field_path_for_project, format_field_path, BlobHandling, BlobVersion, Field, OnMissing,
+    Projection,
+};
 use lance_core::error::LanceOptionExt;
 use lance_core::utils::address::RowAddress;
 use lance_core::utils::mask::{RowAddrMask, RowAddrTreeMap};
@@ -907,7 +910,8 @@ impl Scanner {
     /// See [`ProjectionPlan::from_schema`] for more information.
     pub fn project_from_schema(&mut self, projection: &Schema) -> Result<&mut Self> {
         self.explicit_projection = true;
-        self.projection_plan = ProjectionPlan::from_schema(self.dataset.clone(), projection, BlobVersion::default())?;
+        self.projection_plan =
+            ProjectionPlan::from_schema(self.dataset.clone(), projection, BlobVersion::default())?;
         if self.legacy_with_row_id {
             self.projection_plan.include_row_id();
         }
