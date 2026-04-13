@@ -2,6 +2,8 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use std::collections::HashSet;
+
+use datafusion::config::ConfigOptions;
 use std::ops::Range;
 use std::pin::Pin;
 use std::sync::{Arc, LazyLock};
@@ -18,6 +20,7 @@ use datafusion::common::{DFSchema, JoinType, NullEquality, SchemaExt, exec_dataf
 use datafusion::functions_aggregate;
 use datafusion::logical_expr::{Expr, ScalarUDF, col, lit};
 use datafusion::physical_expr::PhysicalSortExpr;
+#[allow(deprecated)]
 use datafusion::physical_plan::coalesce_batches::CoalesceBatchesExec;
 use datafusion::physical_plan::expressions;
 use datafusion::physical_plan::projection::ProjectionExec as DFProjectionExec;
@@ -2557,7 +2560,7 @@ impl Scanner {
         }
 
         let optimizer = get_physical_optimizer();
-        let options = Default::default();
+        let options: ConfigOptions = Default::default();
         for rule in optimizer.rules {
             plan = rule.optimize(plan, &options)?;
         }
@@ -3251,6 +3254,7 @@ impl Scanner {
                             None,
                             datafusion_physical_plan::joins::PartitionMode::CollectLeft,
                             NullEquality::NullEqualsNothing,
+                            false,
                         )?) as _);
                     } else {
                         must = Some(plan);
@@ -4207,6 +4211,7 @@ impl Scanner {
                     None,
                     PartitionMode::CollectLeft,
                     NullEquality::NullEqualsNull,
+                    false,
                 )?;
 
                 let schema = join.schema();
@@ -4559,6 +4564,7 @@ impl Scanner {
     }
 
     /// Take row indices produced by input plan from the dataset (with projection)
+    #[allow(deprecated)]
     fn take(
         &self,
         input: Arc<dyn ExecutionPlan>,
