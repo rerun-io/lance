@@ -532,7 +532,7 @@ impl FilteredReadStream {
                         Self::read_fragment(dataset, scoped_fragment, metrics, limit)
                             .in_current_span(),
                     )
-                    .map(|thread_result| thread_result.unwrap())
+                    .map(|thread_result| thread_result?)
                 }
             })
             .buffered(fragment_readahead);
