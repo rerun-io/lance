@@ -236,7 +236,10 @@ mod tests {
     use arrow_array::{
         Array, ArrayRef, BooleanArray, DictionaryArray, LargeStringArray, ListArray, StructArray,
         UInt8Array, UInt64Array,
-        builder::{Int32Builder, Int64Builder, LargeListBuilder, ListBuilder, StringBuilder},
+        builder::{
+            BooleanBuilder, Int32Builder, Int64Builder, LargeListBuilder, ListBuilder,
+            StringBuilder,
+        },
     };
 
     use arrow_buffer::{BooleanBuffer, NullBuffer, OffsetBuffer, ScalarBuffer};
@@ -922,6 +925,56 @@ mod tests {
                 next_non_empty = next_non_empty.saturating_add(step);
             } else {
                 list_builder.append_value([] as [Option<&str>; 0]);
+            }
+        }
+        let list_array = list_builder.finish();
+
+        let mut field_metadata = HashMap::new();
+        field_metadata.insert(
+            STRUCTURAL_ENCODING_META_KEY.to_string(),
+            structural_encoding.into(),
+        );
+
+        let test_cases = TestCases::default()
+            .with_range(0..1000)
+            .with_range(0..num_rows as u64)
+            .with_indices(vec![0, (step / 2) as u64, num_rows as u64 - 1])
+            .with_max_file_version(LanceFileVersion::V2_2);
+        check_round_trip_encoding_of_data(vec![Arc::new(list_array)], &test_cases, field_metadata)
+            .await;
+    }
+
+    #[rstest]
+    #[test_log::test(tokio::test)]
+    async fn test_sparse_bitpacked_bool_list(
+        #[values(STRUCTURAL_ENCODING_MINIBLOCK, STRUCTURAL_ENCODING_FULLZIP)]
+        structural_encoding: &str,
+    ) {
+        let num_rows = 2_500_000u32;
+        let num_non_empty = 100u32;
+        let bools_per_list = 10;
+
+        let items_builder = BooleanBuilder::new();
+        let mut list_builder = ListBuilder::new(items_builder);
+
+        let step = num_rows / num_non_empty;
+        let mut next_non_empty = step / 2;
+
+        for i in 0..num_rows {
+            if i == next_non_empty {
+                // Mix of true/false/null so `find_constant_scalar` cannot
+                // short-circuit via the V2.2 constant-page path.
+                let vals: Vec<Option<bool>> = (0..bools_per_list)
+                    .map(|j| match j % 3 {
+                        0 => Some(true),
+                        1 => Some(false),
+                        _ => None,
+                    })
+                    .collect();
+                list_builder.append_value(vals);
+                next_non_empty = next_non_empty.saturating_add(step);
+            } else {
+                list_builder.append_value([] as [Option<bool>; 0]);
             }
         }
         let list_array = list_builder.finish();

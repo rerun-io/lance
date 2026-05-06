@@ -175,7 +175,13 @@ impl FixedWidthDataBlock {
         num_values: u64,
         validate: bool,
     ) -> Result<ArrayData> {
-        let data_buffer = self.data.into_buffer();
+        // See [`encode_full_zip`] in `primitive.rs`
+        let data_buffer = if matches!(data_type, DataType::Boolean) && self.bits_per_value == 8 {
+            let bytes = self.data.as_ref();
+            BooleanBuffer::collect_bool(num_values as usize, |i| bytes[i] != 0).into_inner()
+        } else {
+            self.data.into_buffer()
+        };
         let builder = ArrayDataBuilder::new(data_type)
             .add_buffer(data_buffer)
             .len(num_values as usize)

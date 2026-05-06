@@ -24,7 +24,7 @@ use crate::{
     },
 };
 use arrow_array::{Array, ArrayRef, PrimitiveArray, cast::AsArray, make_array, types::UInt64Type};
-use arrow_buffer::{BooleanBuffer, BooleanBufferBuilder, NullBuffer, ScalarBuffer};
+use arrow_buffer::{BooleanBuffer, BooleanBufferBuilder, NullBuffer, ScalarBuffer, bit_util};
 use arrow_schema::{DataType, Field as ArrowField};
 use bytes::Bytes;
 use futures::{FutureExt, TryStreamExt, future::BoxFuture, stream::FuturesOrdered};
@@ -4605,8 +4605,7 @@ impl PrimitiveStructuralEncoder {
         let mut rep_index_builder =
             BytepackedIntegerEncoder::with_capacity(num_values as usize + 1, max_rep_index_val);
 
-        // I suppose we can just pad to the nearest byte but I'm not sure we need to worry about this anytime soon
-        // because it is unlikely compression of large values is going to yield a result that is not byte aligned
+        // This is currently worked around for bitpacked boolean arrays specifically
         assert_eq!(
             fixed.bits_per_value % 8,
             0,
@@ -4818,6 +4817,31 @@ impl PrimitiveStructuralEncoder {
         );
         let bits_rep = repdef_iter.bits_rep();
         let bits_def = repdef_iter.bits_def();
+
+        // `serialize_full_zip_fixed` interleaves whole-byte chunks of value
+        // data with whole-byte control words, which doesn't work for
+        // bitpacked Boolean arrays. Pad to one byte per value here (and
+        // repack on read in `FixedWidthDataBlock::into_arrow`). This is
+        // wasteful but is a needed workaround until the full-zip encoder
+        // can properly handle sub-byte values.
+        let mut data = data;
+        if matches!(field.data_type(), DataType::Boolean)
+            && let DataBlock::FixedWidth(fixed) = &mut data
+            && fixed.bits_per_value == 1
+        {
+            let bits = fixed.data.as_ref();
+            let mut bytes = vec![0u8; fixed.num_values as usize];
+            // TODO: this for sure can be something smarter
+            for (i, b) in bytes.iter_mut().enumerate() {
+                if bit_util::get_bit(bits, i) {
+                    *b = 1;
+                }
+            }
+            fixed.data = LanceBuffer::from(bytes);
+            fixed.bits_per_value = 8;
+            fixed.block_info = BlockInfo::new();
+            fixed.compute_stat();
+        }
 
         let compressor = compression_strategy.create_per_value(field, &data)?;
         let (compressed_data, value_encoding) = compressor.compress(data)?;
