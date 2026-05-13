@@ -180,6 +180,18 @@ pub async fn merge_indices_with_unindexed_frags<'a>(
             Ok((new_uuid, 1, created_index))
         }
         it if it.is_vector() => {
+            // No-op when nothing changed: avoids rewriting an identical
+            // vector index on every optimize_indices() call. Matches the
+            // scalar gate in `Dataset::optimize_indices`; treats
+            // `OptimizeOptions::append()` (num_indices_to_merge=Some(0))
+            // as "no explicit merge requested".
+            if unindexed.is_empty()
+                && !options.retrain
+                && options.num_indices_to_merge.is_none_or(|n| n == 0)
+            {
+                return Ok(None);
+            }
+
             let new_data_stream = if unindexed.is_empty() {
                 None
             } else {
@@ -393,6 +405,102 @@ mod tests {
             num_rows += index.num_rows();
         }
         assert_eq!(num_rows, 2000);
+    }
+
+    /// Regression: a second `OptimizeOptions::append()` call on a steady-state
+    /// vector index used to fall through to `optimize_vector_indices` and write
+    /// a new UUID directory + manifest even though nothing had changed. The
+    /// no-op gate inside `merge_indices_with_unindexed_frags` should bail out
+    /// when no new data is unindexed and no merge/retrain was requested.
+    #[tokio::test]
+    async fn test_optimize_indices_append_is_noop_on_steady_state() {
+        const DIM: usize = 64;
+
+        let test_dir = TempStrDir::default();
+        let test_uri = test_dir.as_str();
+
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "vector",
+            DataType::FixedSizeList(
+                Arc::new(Field::new("item", DataType::Float32, true)),
+                DIM as i32,
+            ),
+            true,
+        )]));
+        let make_batch = || {
+            let arr = Arc::new(
+                FixedSizeListArray::try_new_from_values(
+                    generate_random_array(1000 * DIM),
+                    DIM as i32,
+                )
+                .unwrap(),
+            );
+            RecordBatch::try_new(schema.clone(), vec![arr]).unwrap()
+        };
+
+        let batches =
+            RecordBatchIterator::new(vec![make_batch()].into_iter().map(Ok), schema.clone());
+        let mut dataset = Dataset::write(batches, test_uri, None).await.unwrap();
+
+        // num_partitions = 1 so the auto-rebalance heuristic has no join/split
+        // candidate after the initial build — keeps this test focused on the
+        // append-no-op behavior rather than the rebalance path.
+        let params = VectorIndexParams::with_ivf_pq_params(
+            MetricType::L2,
+            IvfBuildParams::new(1),
+            PQBuildParams {
+                num_sub_vectors: 2,
+                ..Default::default()
+            },
+        );
+        dataset
+            .create_index(&["vector"], IndexType::Vector, None, &params, true)
+            .await
+            .unwrap();
+
+        let batches =
+            RecordBatchIterator::new(vec![make_batch()].into_iter().map(Ok), schema.clone());
+        dataset.append(batches, None).await.unwrap();
+
+        // First append: folds the new fragment into a fresh delta segment.
+        dataset
+            .optimize_indices(&OptimizeOptions::append())
+            .await
+            .unwrap();
+        let dataset = DatasetBuilder::from_uri(test_uri).load().await.unwrap();
+        let version_before = dataset.version().version;
+        let object_store = dataset.object_store.as_ref();
+        let dirs_before = object_store
+            .read_dir(dataset.indices_dir())
+            .await
+            .unwrap()
+            .into_iter()
+            .collect::<std::collections::HashSet<_>>();
+
+        // Second append: nothing changed since the previous call. Must not
+        // bump the manifest version or add a new UUID directory.
+        let mut dataset = DatasetBuilder::from_uri(test_uri).load().await.unwrap();
+        dataset
+            .optimize_indices(&OptimizeOptions::append())
+            .await
+            .unwrap();
+        let dataset = DatasetBuilder::from_uri(test_uri).load().await.unwrap();
+        let dirs_after = object_store
+            .read_dir(dataset.indices_dir())
+            .await
+            .unwrap()
+            .into_iter()
+            .collect::<std::collections::HashSet<_>>();
+
+        assert_eq!(
+            dataset.version().version,
+            version_before,
+            "second optimize_indices(append()) bumped the dataset version"
+        );
+        assert_eq!(
+            dirs_after, dirs_before,
+            "second optimize_indices(append()) created a new index directory"
+        );
     }
 
     #[rstest]
