@@ -132,10 +132,12 @@ impl LanceIndexStoreExt for LanceIndexStore {
     fn from_dataset_for_new(dataset: &Dataset, uuid: &str) -> Result<Self> {
         let index_dir = dataset.indices_dir().child(uuid);
         let cache = dataset.metadata_cache.file_metadata_cache(&index_dir);
-        Ok(Self::new(
+        let file_version = dataset.manifest.data_storage_format.lance_file_version()?;
+        Ok(Self::new_with_version(
             dataset.object_store.clone(),
             index_dir,
             Arc::new(cache),
+            file_version,
         ))
     }
 
@@ -144,10 +146,12 @@ impl LanceIndexStoreExt for LanceIndexStore {
             .indice_files_dir(index)?
             .child(index.uuid.to_string());
         let cache = dataset.metadata_cache.file_metadata_cache(&index_dir);
-        Ok(Self::new(
+        let file_version = dataset.manifest.data_storage_format.lance_file_version()?;
+        Ok(Self::new_with_version(
             dataset.object_store.clone(),
             index_dir,
             Arc::new(cache),
+            file_version,
         ))
     }
 }
