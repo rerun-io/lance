@@ -69,10 +69,20 @@ impl std::fmt::Debug for LanceCache {
 
 impl DeepSizeOf for LanceCache {
     fn deep_size_of_children(&self, _: &mut Context) -> usize {
-        self.cache
-            .iter()
-            .map(|(_, v)| (v.size_accessor)(&v.record))
-            .sum()
+        // Report this cache's footprint via moka's running weighted_size counter,
+        // which is maintained in O(1) by the weigher installed in `with_capacity`
+        // (same `size_accessor` formula used here, so the value matches the old
+        // `iter().map().sum()` modulo a tiny near-real-time lag and the per-entry
+        // u32::MAX clamp that the weigher applies — both already accepted by
+        // `approx_size_bytes()`).
+        //
+        // Critically, we must NOT iterate cache entries: cached values can hold
+        // Arc<LanceCache> back-references (e.g. LanceIndexStore.metadata_cache
+        // reached transitively from a cached BTreeIndex), so iterating here
+        // re-enters every other entry and makes a single weigher call O(N).
+        // Aggregate cost under concurrent inserts is O(N^2) and dominates server
+        // CPU at high fanout.
+        self.cache.weighted_size() as usize
     }
 }
 
@@ -802,5 +812,48 @@ mod tests {
         let stats = cache.stats().await;
         assert_eq!(stats.hits, 1);
         assert_eq!(stats.misses, 2);
+    }
+
+    /// Regression test for the O(N^2) DeepSizeOf pathology on `LanceCache`.
+    ///
+    /// Before the fix, `LanceCache::deep_size_of_children` iterated every cache
+    /// entry. Cached values that transitively hold an `Arc<LanceCache>`
+    /// back-reference (e.g. `LanceIndexStore.metadata_cache` reached from a
+    /// `BTreeIndex`) caused each insert's weigher to walk every sibling — O(N)
+    /// per insert, O(N^2) aggregate. Under concurrent fanout this dominated
+    /// server CPU.
+    ///
+    /// This test reproduces the shape: a cached value owns an `Arc<LanceCache>`
+    /// pointing at the very cache it lives in. With the fix
+    /// (`deep_size_of_children` returns `weighted_size()` in O(1)) the loop is
+    /// linear and finishes in milliseconds; without it the loop is quadratic
+    /// and blows well past the 2-second budget at n=2000.
+    #[tokio::test]
+    async fn deep_size_of_is_constant_per_insert_with_back_reference() {
+        #[derive(Debug)]
+        struct HoldsCache(Arc<LanceCache>, Vec<u8>);
+
+        impl DeepSizeOf for HoldsCache {
+            fn deep_size_of_children(&self, ctx: &mut Context) -> usize {
+                self.0.deep_size_of_children(ctx) + self.1.deep_size_of_children(ctx)
+            }
+        }
+
+        let cache = Arc::new(LanceCache::with_capacity(1 << 30));
+        let n = 2000;
+        let t0 = std::time::Instant::now();
+        for i in 0..n {
+            cache
+                .insert(
+                    &format!("k{i}"),
+                    Arc::new(HoldsCache(cache.clone(), vec![0u8; 1024])),
+                )
+                .await;
+        }
+        let elapsed = t0.elapsed();
+        assert!(
+            elapsed < std::time::Duration::from_secs(2),
+            "n={n} inserts took {elapsed:?} — expected linear time, got quadratic"
+        );
     }
 }

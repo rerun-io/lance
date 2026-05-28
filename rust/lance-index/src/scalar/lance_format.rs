@@ -43,9 +43,18 @@ pub struct LanceIndexStore {
 
 impl DeepSizeOf for LanceIndexStore {
     fn deep_size_of_children(&self, context: &mut deepsize::Context) -> usize {
+        // NOTE: `metadata_cache` is intentionally NOT walked here. It is an
+        // Arc<LanceCache> back-reference to the shared cache this index store
+        // is registered with; recursing into it from a cached value (e.g.
+        // BTreeIndex's `Arc<LanceIndexStore>`) re-enters every cache entry and
+        // turns each insert weigher call into O(N). The cache's footprint is
+        // tracked separately via `LanceCache::approx_size_bytes()`.
+        //
+        // This mirrors the existing pattern in BTreeIndex::deep_size_of_children
+        // which already skips its `index_cache` field "to avoid circular
+        // references".
         self.object_store.deep_size_of_children(context)
             + self.index_dir.as_ref().deep_size_of_children(context)
-            + self.metadata_cache.deep_size_of_children(context)
     }
 }
 
