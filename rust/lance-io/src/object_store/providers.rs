@@ -320,7 +320,8 @@ impl Default for ObjectStoreRegistry {
         {
             let azure = Arc::new(azure::AzureBlobStoreProvider);
             providers.insert("az".into(), azure.clone());
-            providers.insert("abfss".into(), azure);
+            providers.insert("abfss".into(), azure.clone());
+            providers.insert("https".into(), azure);
         }
         #[cfg(feature = "gcp")]
         providers.insert("gs".into(), Arc::new(gcp::GcsStoreProvider));
