@@ -49,9 +49,19 @@ pub struct LanceIndexStore {
 
 impl DeepSizeOf for LanceIndexStore {
     fn deep_size_of_children(&self, context: &mut deepsize::Context) -> usize {
-        self.object_store.deep_size_of_children(context)
-            + self.index_dir.as_ref().deep_size_of_children(context)
-            + self.metadata_cache.deep_size_of_children(context)
+        // Only count data this store actually owns. `object_store`, `metadata_cache`
+        // and `scheduler` are `Arc`s to process-wide shared infrastructure, not data
+        // owned by the index. Counting `metadata_cache` here is doubly wrong:
+        //   - Correctness: a cached `BTreeIndex` reaches this store via `Arc`, so each
+        //     index entry would be charged the entire shared metadata cache — inflating
+        //     (and equalizing) index-cache entry weights so size-based eviction evicts
+        //     indexes immediately and re-opens them on every query.
+        //   - Cost: it makes each index-cache insert walk the metadata cache
+        //     (`approx_size_bytes` iterates all entries), i.e. O(metadata-cache size).
+        // This mirrors `BTreeIndex::deep_size_of_children`, which already skips its
+        // `index_cache` field to avoid circular references.
+        self.index_dir.as_ref().deep_size_of_children(context)
+            + self.file_sizes.deep_size_of_children(context)
     }
 }
 
