@@ -6,7 +6,7 @@ serialize = [
     "{major}.{minor}.{patch}"
 ]
 search = "{current_version}"
-replace = "{new_version}"
+replace = "{new_version}"sdafasdfsdf
 regex = false
 ignore_missing_files = false
 ignore_missing_version = false
