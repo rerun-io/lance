@@ -813,13 +813,14 @@ impl ScalarIndex for BitmapIndex {
         &self,
         new_data: SendableRecordBatchStream,
         dest_store: &dyn IndexStore,
-        _old_data_filter: Option<super::OldIndexDataFilter>,
+        old_data_filter: Option<super::OldIndexDataFilter>,
     ) -> Result<CreatedIndex> {
         let file = BitmapIndexPlugin::streaming_build_and_write(
             new_data,
             Some(self),
             dest_store,
             BITMAP_LOOKUP_NAME,
+            old_data_filter.as_ref(),
         )
         .await?;
 
@@ -1198,6 +1199,19 @@ async fn cleanup_bitmap_shard_files(store: &dyn IndexStore, shard_files: &[Strin
 #[derive(Debug, Default)]
 pub struct BitmapIndexPlugin;
 
+/// Drop the rows an old posting should no longer expose -- rows whose fragment
+/// was removed, or (under stable row ids) rows rewritten by an update -- keeping
+/// only those `filter` still considers valid. A no-op when `filter` is `None`.
+fn retain_valid(
+    mut bitmap: RowAddrTreeMap,
+    filter: Option<&super::OldIndexDataFilter>,
+) -> RowAddrTreeMap {
+    if let Some(filter) = filter {
+        filter.retain_old_rows(&mut bitmap);
+    }
+    bitmap
+}
+
 impl BitmapIndexPlugin {
     fn get_batch_from_arrays(
         keys: Arc<dyn Array>,
@@ -1329,7 +1343,7 @@ impl BitmapIndexPlugin {
         data: SendableRecordBatchStream,
         index_store: &dyn IndexStore,
     ) -> Result<IndexFile> {
-        Self::streaming_build_and_write(data, None, index_store, BITMAP_LOOKUP_NAME).await
+        Self::streaming_build_and_write(data, None, index_store, BITMAP_LOOKUP_NAME, None).await
     }
 
     async fn train_bitmap_shard(
@@ -1344,7 +1358,8 @@ impl BitmapIndexPlugin {
         progress
             .stage_start("build_bitmap_shard", None, "rows")
             .await?;
-        let file = Self::streaming_build_and_write(data, None, index_store, &file_name).await?;
+        let file =
+            Self::streaming_build_and_write(data, None, index_store, &file_name, None).await?;
         progress.stage_complete("build_bitmap_shard").await?;
         Ok(file)
     }
@@ -1361,6 +1376,7 @@ impl BitmapIndexPlugin {
         old_index: Option<&BitmapIndex>,
         index_store: &dyn IndexStore,
         output_file_name: &str,
+        old_data_filter: Option<&super::OldIndexDataFilter>,
     ) -> Result<IndexFile> {
         let value_type = data_source.schema().field(0).data_type().clone();
 
@@ -1407,6 +1423,7 @@ impl BitmapIndexPlugin {
                                 &mut old_pos,
                                 &mut emitted_null,
                                 &mut writer,
+                                old_data_filter,
                             )
                             .await?;
                         }
@@ -1429,6 +1446,7 @@ impl BitmapIndexPlugin {
                 &mut old_pos,
                 &mut emitted_null,
                 &mut writer,
+                old_data_filter,
             )
             .await?;
         }
@@ -1436,7 +1454,13 @@ impl BitmapIndexPlugin {
         // Emit any remaining old-only entries.
         if let Some(idx) = old_index {
             while old_pos < old_keys.len() {
-                let old_bitmap = idx.load_bitmap(&old_keys[old_pos], None).await?;
+                let old_bitmap = retain_valid(
+                    idx.load_bitmap(&old_keys[old_pos], None)
+                        .await?
+                        .as_ref()
+                        .clone(),
+                    old_data_filter,
+                );
                 writer
                     .emit(old_keys[old_pos].0.clone(), &old_bitmap)
                     .await?;
@@ -1451,7 +1475,8 @@ impl BitmapIndexPlugin {
         {
             let null_key = new_null_array(&value_type, 1);
             let null_key = ScalarValue::try_from_array(null_key.as_ref(), 0)?;
-            writer.emit(null_key, &idx.null_map).await?;
+            let null_bitmap = retain_valid((*idx.null_map).clone(), old_data_filter);
+            writer.emit(null_key, &null_bitmap).await?;
         }
 
         writer.finish().await
@@ -1460,6 +1485,7 @@ impl BitmapIndexPlugin {
     /// Flush a completed value-run from the new data stream, emitting any
     /// old-only entries that sort before it and merging the old bitmap if the
     /// key exists in both old and new.
+    #[allow(clippy::too_many_arguments)]
     async fn finish_run(
         key: ScalarValue,
         bitmap: &mut RowAddrTreeMap,
@@ -1468,13 +1494,14 @@ impl BitmapIndexPlugin {
         old_pos: &mut usize,
         emitted_null: &mut bool,
         writer: &mut BitmapBatchWriter,
+        old_data_filter: Option<&super::OldIndexDataFilter>,
     ) -> Result<()> {
         if key.is_null() {
             // Null values are stored separately in the old index's null_map.
             if let Some(idx) = old_index
                 && !idx.null_map.is_empty()
             {
-                *bitmap |= &*idx.null_map;
+                *bitmap |= &retain_valid((*idx.null_map).clone(), old_data_filter);
             }
             *emitted_null = true;
             writer.emit(key, bitmap).await?;
@@ -1483,7 +1510,13 @@ impl BitmapIndexPlugin {
 
             // Emit old-only entries that sort before this key.
             while *old_pos < old_keys.len() && old_keys[*old_pos] < orderable {
-                let old_bitmap = idx.load_bitmap(&old_keys[*old_pos], None).await?;
+                let old_bitmap = retain_valid(
+                    idx.load_bitmap(&old_keys[*old_pos], None)
+                        .await?
+                        .as_ref()
+                        .clone(),
+                    old_data_filter,
+                );
                 writer
                     .emit(old_keys[*old_pos].0.clone(), &old_bitmap)
                     .await?;
@@ -1492,8 +1525,13 @@ impl BitmapIndexPlugin {
 
             // If the old index also has this key, merge its bitmap.
             if *old_pos < old_keys.len() && old_keys[*old_pos] == orderable {
-                let old_bitmap = idx.load_bitmap(&old_keys[*old_pos], None).await?;
-                *bitmap |= &*old_bitmap;
+                *bitmap |= &retain_valid(
+                    idx.load_bitmap(&old_keys[*old_pos], None)
+                        .await?
+                        .as_ref()
+                        .clone(),
+                    old_data_filter,
+                );
                 *old_pos += 1;
             }
 
