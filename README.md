@@ -1,236 +1,189 @@
-<div align="center">
-<p align="center">
+# Rerun's fork of Lance
 
-<img width="257" alt="Lance Logo" src="https://user-images.githubusercontent.com/917119/199353423-d3e202f7-0269-411d-8ff2-e747e419e492.png">
+This is [Rerun](https://rerun.io)'s fork of [Lance](https://github.com/lancedb/lance).
 
-**The Open Lakehouse Format for Multimodal AI**<br/>
-**High-performance vector search, full-text search, random access, and feature engineering capabilities for the lakehouse.**<br/>
-**Compatible with Pandas, DuckDB, Polars, PyArrow, Ray, Spark, and more integrations on the way.**
+It exists to carry a small set of **Rerun-only patches** on top of an official upstream Lance
+release until those patches are upstreamed (or no longer needed). The goal of this document is to
+make the fork **boring to maintain**: a predictable, repeatable process for adding patches and for
+rebasing them onto each new upstream release.
 
-<a href="https://lance.org">Documentation</a> •
-<a href="https://lance.org/community">Community</a> •
-<a href="https://discord.gg/lance">Discord</a> •
-<a href="https://groups.google.com/a/lance.org/g/dev">Mailing List</a>
+For the upstream project README (what Lance is, how to use it), see
+[the upstream repo](https://github.com/lancedb/lance/blob/main/README.md).
 
-[CI]: https://github.com/lance-format/lance/actions/workflows/rust.yml
-[CI Badge]: https://github.com/lance-format/lance/actions/workflows/rust.yml/badge.svg
-[Docs]: https://lance.org
-[Docs Badge]: https://img.shields.io/badge/docs-passing-brightgreen
-[crates.io]: https://crates.io/crates/lance
-[crates.io badge]: https://img.shields.io/crates/v/lance.svg
-[Python versions]: https://pypi.org/project/pylance/
-[Python versions badge]: https://img.shields.io/pypi/pyversions/pylance
+---
 
-[![CI Badge]][CI]
-[![Docs Badge]][Docs]
-[![crates.io badge]][crates.io]
-[![Python versions badge]][Python versions]
+## Repository layout
 
-</p>
-</div>
+Two git remotes:
 
-<hr />
+| Remote     | URL                          | Role                                   |
+|------------|------------------------------|----------------------------------------|
+| `upstream` | `lancedb/lance`              | Upstream. Source of releases.          |
+| `rerun`    | `rerun-io/lance`             | Our fork. Where we push everything.    |
 
-Lance is an open lakehouse format for multimodal AI. It contains a file format, table format, and catalog spec that allows you to build a complete lakehouse on top of object storage to power your AI workflows. Lance is perfect for:
+Set them up once in a fresh clone:
 
-1. Building search engines and feature stores with hybrid search capabilities.
-2. Large-scale ML training requiring high performance IO and random access.
-3. Storing, querying, and managing multimodal data including images, videos, audio, text, and embeddings.
-
-The key features of Lance include:
-
-* **Expressive hybrid search:** Combine vector similarity search, full-text search (BM25), and SQL analytics on the same dataset with accelerated secondary indices.
-
-* **Lightning-fast random access:** 100x faster than Parquet or Iceberg for random access without sacrificing scan performance.
-
-* **Native multimodal data support:** Store images, videos, audio, text, and embeddings in a single unified format with efficient blob encoding and lazy loading.
-
-* **Data evolution:** Efficiently add columns with backfilled values without full table rewrites, perfect for ML feature engineering.
-
-* **Zero-copy versioning:** Automatic versioning with ACID transactions, time travel, tags, and branches—no extra infrastructure needed.
-
-* **Rich ecosystem integrations:** Apache Arrow, Pandas, Polars, DuckDB, Apache Spark, Ray, Trino, Apache Flink, and open catalogs (Apache Polaris, Unity Catalog, Apache Gravitino).
-
-For more details, see the full [Lance format specification](https://lance.org/format).
-
-> [!TIP]
-> Lance is in active development and we welcome contributions. Please see our [contributing guide](https://lance.org/community/contributing/) for more information.
-
-## Quick Start
-
-**Installation**
-
-```shell
-pip install pylance
+```sh
+git clone git@github.com:rerun-io/lance.git
+cd lance
+git remote rename origin rerun                        # if it cloned as "origin"
+git remote add upstream git@github.com:lancedb/lance.git
+git config --local remote.pushDefault rerun           # push everything to the fork by default
+git fetch --all --tags
 ```
 
-To install a preview release:
+Key branches:
 
-```shell
-pip install --pre --extra-index-url https://pypi.fury.io/lance-format pylance
+| Branch                 | Meaning                                                                       |
+|------------------------|-------------------------------------------------------------------------------|
+| `rerun/main`           | Mirror of upstream `main`. We do **not** put Rerun patches here.               |
+| `rerun/release-X.Y.Z`  | The thing we actually ship: upstream tag `vX.Y.Z` + our Rerun-only commits.    |
+
+We do **not** publish to crates.io. Downstream (Rerun) consumes this fork as a **git dependency**
+pinned to a `release-X.Y.Z` branch (or a commit SHA on it). There are therefore no Rerun-specific
+version bumps and no Rerun git tags — the workspace `version` stays identical to upstream's.
+
+---
+
+## The model
+
+```
+        upstream v7.0.0 (tag on upstream)
+              │
+              ▼
+   ┌───────────────────────────┐
+   │  rerun/release-7.0.0       │   ← branch = upstream tag + our patches, in order
+   │                            │
+   │  • optimize_expr traced    │ ─┐
+   │  • execute/analyze traced  │  │  Rerun-only commits.
+   │  • Scanner::projection_…   │  │  This list is the entire fork.
+   │  • Fix write-starvation    │  │  Keep it SMALL.
+   │  • reject CreateIndex …    │  │
+   │  • Azure https support     │ ─┘
+   └───────────────────────────┘
 ```
 
-> [!TIP]
-> Preview releases are released more often than full releases and contain the
-> latest features and bug fixes. They receive the same level of testing as full releases.
-> We guarantee they will remain published and available for download for at
-> least 6 months. When you want to pin to a specific version, prefer a stable release.
+The complete set of Rerun-only commits on any release branch is exactly:
 
-**Converting to Lance**
-
-```python
-import lance
-
-import pandas as pd
-import pyarrow as pa
-import pyarrow.dataset
-
-df = pd.DataFrame({"a": [5], "b": [10]})
-uri = "/tmp/test.parquet"
-tbl = pa.Table.from_pandas(df)
-pa.dataset.write_dataset(tbl, uri, format='parquet')
-
-parquet = pa.dataset.dataset(uri, format='parquet')
-lance.write_dataset(parquet, "/tmp/test.lance")
+```sh
+git log --oneline vX.Y.Z..rerun/release-X.Y.Z
 ```
 
-**Reading Lance data**
-```python
-dataset = lance.dataset("/tmp/test.lance")
-assert isinstance(dataset, pa.dataset.Dataset)
+If that command shows a commit you don't recognize, something went wrong in a rebase. The list
+should be short and every commit should be a deliberate Rerun patch.
+
+### Rules
+
+- **Never rewrite `rerun/main`.** It tracks upstream only.
+- **Never force-push a `release-X.Y.Z` branch that Rerun is already pinned to** without coordinating
+  — downstream builds pin to it. Cut a new branch or append instead (see below).
+
+---
+
+## Adding a new Rerun-only patch
+
+Branch off the current release branch, do the work, open a PR into that release branch.
+
+Guidelines:
+
+- **Target the active `release-X.Y.Z` branch**, never `rerun/main`.
+- In the PR body, **always note the upstreaming status**: link the upstream PR/issue, or say it is
+  fork-only and why. This is what lets us delete the patch later.
+- After merge, the commit becomes part of the `vX.Y.Z..rerun/release-X.Y.Z` patch set that future
+  rebases must carry.
+
+---
+
+## Cutting a new fork release when upstream releases
+
+When upstream ships a new release `vNEW` (e.g. `v9.0.0`), rebase our patch set onto it.
+
+### 1. Fetch upstream and confirm the target tag
+
+```sh
+git fetch upstream --tags
+git tag --list 'v*' | sort -V | tail        # find the new release tag, e.g. v9.0.0
 ```
 
-**Pandas**
-```python
-df = dataset.to_table().to_pandas()
-df
+### 2. Capture the current patch set
+
+```sh
+# OLD = the release we're currently on, e.g. v7.0.0
+git log --oneline v7.0.0..rerun/release-7.0.0     # eyeball the patches we're about to move
 ```
 
-**DuckDB**
-```python
-import duckdb
+### 3. Create the new release branch and rebase the patches onto it
 
-# If this segfaults, make sure you have duckdb v0.7+ installed
-duckdb.query("SELECT * FROM dataset LIMIT 10").to_df()
+```sh
+git switch -c release-9.0.0 v9.0.0                 # start from the new upstream tag
+
+# Replay our patches (everything that was on the old release branch but not in the old tag)
+# --onto release-9.0.0 puts them on the new base; v7.0.0 is the old base they came from.
+git rebase --onto release-9.0.0 v7.0.0 rerun/release-7.0.0
 ```
 
-**Vector search**
+Resolve conflicts commit-by-commit. For each conflict:
 
-Download the sift1m subset
-
-```shell
-wget ftp://ftp.irisa.fr/local/texmex/corpus/sift.tar.gz
-tar -xzf sift.tar.gz
+```sh
+# edit files, then:
+git add -A
+git rebase --continue
+# if a patch has been upstreamed and is now redundant:
+git rebase --skip
 ```
 
-Convert it to Lance
+When a patch was upstreamed in `vNEW`, **skip it** — that's the payoff for upstreaming.
 
-```python
-import lance
-from lance.vector import vec_to_table
-import numpy as np
-import struct
+### 4. Verify
 
-nvecs = 1000000
-ndims = 128
-with open("sift/sift_base.fvecs", mode="rb") as fobj:
-    buf = fobj.read()
-    data = np.array(struct.unpack("<128000000f", buf[4 : 4 + 4 * nvecs * ndims])).reshape((nvecs, ndims))
-    dd = dict(zip(range(nvecs), data))
-
-table = vec_to_table(dd)
-uri = "vec_data.lance"
-sift1m = lance.write_dataset(table, uri, max_rows_per_group=8192, max_rows_per_file=1024*1024)
+```sh
+git log --oneline v9.0.0..HEAD                     # should be our patch set, minus any upstreamed ones
+cargo fmt --all
+cargo clippy --all --tests --benches -- -D warnings
+cargo test --workspace                             # or at least the crates our patches touch
 ```
 
-Build the index
+The workspace version should now read the upstream `vNEW` version (e.g. `9.0.0`) unchanged — we do
+not bump it.
 
-```python
-sift1m.create_index("vector",
-                    index_type="IVF_PQ",
-                    num_partitions=256,  # IVF
-                    num_sub_vectors=16)  # PQ
+### 5. Publish the new release branch
+
+```sh
+git switch -c release-9.0.0       # if not already on it
+git push rerun release-9.0.0
 ```
 
-Search the dataset
+### 6. Point downstream at it
 
-```python
-# Get top 10 similar vectors
-import duckdb
+Update Rerun's `Cargo.toml` git dependency to the new branch (or a pinned SHA on it):
 
-dataset = lance.dataset(uri)
-
-# Sample 100 query vectors. If this segfaults, make sure you have duckdb v0.7+ installed
-sample = duckdb.query("SELECT vector FROM dataset USING SAMPLE 100").to_df()
-query_vectors = np.array([np.array(x) for x in sample.vector])
-
-# Get nearest neighbors for all of them
-rs = [dataset.to_table(nearest={"column": "vector", "k": 10, "q": q})
-      for q in query_vectors]
+```toml
+lance = { git = "https://github.com/rerun-io/lance.git", branch = "release-9.0.0" }
 ```
 
-## Directory structure
+Pin to a **commit SHA** rather than the bare branch if you need reproducible builds that don't move
+when the release branch gets a new patch appended.
 
-| Directory          | Description              |
-|--------------------|--------------------------|
-| [rust](./rust)     | Core Rust implementation |
-| [python](./python) | Python bindings (PyO3)   |
-| [java](./java)     | Java bindings (JNI)      |
-| [docs](./docs)     | Documentation source     |
+### 7. Keeping `rerun/main` current (optional housekeeping)
 
-## Benchmarks
-
-### Vector search
-
-We used the SIFT dataset to benchmark our results with 1M vectors of 128D
-
-1. For 100 randomly sampled query vectors, we get <1ms average response time (on a 2023 m2 MacBook Air)
-
-![avg_latency.png](docs/src/images/avg_latency.png)
-
-2. ANNs are always a trade-off between recall and performance
-
-![avg_latency.png](docs/src/images/recall_vs_latency.png)
-
-### Vs. parquet
-
-We create a Lance dataset using the Oxford Pet dataset to do some preliminary performance testing of Lance as compared to Parquet and raw image/XMLs. For analytics queries, Lance is 50-100x better than reading the raw metadata. For batched random access, Lance is 100x better than both parquet and raw files.
-
-![](docs/src/images/lance_perf.png)
-
-## Why Lance for AI/ML workflows?
-
-The machine learning development cycle involves multiple stages:
-
-```mermaid
-graph LR
-    A[Collection] --> B[Exploration];
-    B --> C[Analytics];
-    C --> D[Feature Engineer];
-    D --> E[Training];
-    E --> F[Evaluation];
-    F --> C;
-    E --> G[Deployment];
-    G --> H[Monitoring];
-    H --> A;
+```sh
+git fetch upstream
+git push rerun upstream/main:main                  # fast-forward our mirror of upstream main
 ```
 
-Traditional lakehouse formats were designed for SQL analytics and struggle with AI/ML workloads that require:
-- **Vector search** for similarity and semantic retrieval
-- **Fast random access** for sampling and interactive exploration
-- **Multimodal data** storage (images, videos, audio alongside embeddings)
-- **Data evolution** for feature engineering without full table rewrites
-- **Hybrid search** combining vectors, full-text, and SQL predicates
+---
 
-While existing formats (Parquet, Iceberg, Delta Lake) excel at SQL analytics, they require additional specialized systems for AI capabilities. Lance brings these AI-first features directly into the lakehouse format.
+## Quick reference
 
-A comparison of different formats across ML development stages:
+```sh
+# What are our patches on the current release?
+git log --oneline vX.Y.Z..rerun/release-X.Y.Z
 
-|                     | Lance | Parquet & ORC | JSON & XML | TFRecord | Database | Warehouse |
-|---------------------|-------|---------------|------------|----------|----------|-----------|
-| Analytics           | Fast  | Fast          | Slow       | Slow     | Decent   | Fast      |
-| Feature Engineering | Fast  | Fast          | Decent     | Slow     | Decent   | Good      |
-| Training            | Fast  | Decent        | Slow       | Fast     | N/A      | N/A       |
-| Exploration         | Fast  | Slow          | Fast       | Slow     | Fast     | Decent    |
-| Infra Support       | Rich  | Rich          | Decent     | Limited  | Rich     | Rich      |
+# Add a patch
+git switch -c emilk/my-fix rerun/release-X.Y.Z && ... && gh pr create --base release-X.Y.Z --draft
 
+# Rebase onto a new upstream release
+git switch -c release-NEW vNEW
+git rebase --onto release-NEW vOLD rerun/release-OLD
+git push rerun release-NEW
+```
