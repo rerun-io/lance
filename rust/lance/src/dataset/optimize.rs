@@ -110,7 +110,7 @@ use lance_index::frag_reuse::FragReuseGroup;
 use lance_table::format::{Fragment, RowIdMeta};
 use roaring::{RoaringBitmap, RoaringTreemap};
 use serde::{Deserialize, Serialize};
-use tracing::{info, warn};
+use tracing::{Instrument as _, info, instrument, warn};
 
 mod binary_copy;
 pub mod remapping;
@@ -754,7 +754,17 @@ pub async fn compact_files_with_planner(
     remap_options: Option<Arc<dyn IndexRemapperOptions>>, // These will be deprecated later
     planner: &dyn CompactionPlanner,
 ) -> Result<CompactionMetrics> {
-    let compaction_plan: CompactionPlan = planner.plan(dataset).await?;
+    // Phase 1: planning. Decides which fragments are grouped into rewrite tasks.
+    let compaction_plan: CompactionPlan = async {
+        let plan = planner.plan(dataset).await?;
+        tracing::Span::current().record("num_tasks", plan.num_tasks());
+        Ok::<_, Error>(plan)
+    }
+    .instrument(tracing::info_span!(
+        "plan_compaction",
+        num_tasks = tracing::field::Empty
+    ))
+    .await?;
 
     // If nothing to compact, don't make a commit.
     if compaction_plan.tasks().is_empty() {
@@ -763,6 +773,7 @@ pub async fn compact_files_with_planner(
 
     let dataset_ref = &dataset.clone();
 
+    // Phase 2: rewrite. Tasks run concurrently; each gets its own `rewrite_files` span.
     let result_stream = futures::stream::iter(compaction_plan.tasks.into_iter())
         .map(|task| rewrite_files(Cow::Borrowed(dataset_ref), task, &compaction_plan.options))
         .buffer_unordered(
@@ -773,13 +784,17 @@ pub async fn compact_files_with_planner(
         );
 
     let completed_tasks: Vec<RewriteResult> = result_stream.try_collect().await?;
+    let num_tasks = completed_tasks.len();
     let remap_options = remap_options.unwrap_or(Arc::new(DatasetIndexRemapperOptions::default()));
+
+    // Phase 3: commit. Index remapping + a single transaction replacing the old fragments.
     let metrics = commit_compaction(
         dataset,
         completed_tasks,
         remap_options,
         &compaction_plan.options,
     )
+    .instrument(tracing::info_span!("commit_compaction", num_tasks))
     .await?;
 
     Ok(metrics)
@@ -1121,6 +1136,16 @@ async fn reserve_fragment_ids(
 /// Rewrite the files in a single task.
 ///
 /// This assumes that the dataset is the correct read version to be compacted.
+#[instrument(
+    name = "rewrite_files",
+    skip_all,
+    fields(
+        input_fragments = task.fragments.len(),
+        num_rows = tracing::field::Empty,
+        can_binary_copy = tracing::field::Empty,
+        new_fragments = tracing::field::Empty,
+    )
+)]
 async fn rewrite_files(
     dataset: Cow<'_, Dataset>,
     task: TaskData,
@@ -1165,6 +1190,9 @@ async fn rewrite_files(
     );
     let mode = options.compaction_mode();
     let can_binary_copy = can_use_binary_copy(dataset.as_ref(), options, &fragments).await;
+    tracing::Span::current()
+        .record("num_rows", num_rows)
+        .record("can_binary_copy", can_binary_copy);
     if !can_binary_copy && matches!(mode, CompactionMode::ForceBinaryCopy) {
         return Err(Error::not_supported_source(
             format!("compaction task {}: binary copy is not supported", task_id).into(),
@@ -1298,6 +1326,7 @@ async fn rewrite_files(
         .map(|f| f.files.len() + f.deletion_file.is_some() as usize)
         .sum();
 
+    tracing::Span::current().record("new_fragments", new_fragments.len());
     log::info!("Compaction task {}: completed", task_id);
 
     Ok(RewriteResult {
