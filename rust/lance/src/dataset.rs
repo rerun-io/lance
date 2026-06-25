@@ -66,7 +66,7 @@ use std::num::NonZero;
 use std::ops::Range;
 use std::pin::Pin;
 use std::sync::Arc;
-use tracing::{info, instrument};
+use tracing::{Instrument as _, info, instrument};
 
 pub(crate) mod blob;
 mod branch_location;
@@ -993,9 +993,13 @@ impl Dataset {
     }
 
     pub async fn latest_manifest(&self) -> Result<(Arc<Manifest>, ManifestLocation)> {
+        // This resolves the newest version, which for object-store commit handling lists the
+        // version directory — its cost grows with the number of (un-cleaned) versions, so it's
+        // worth seeing on its own in a trace.
         let location = self
             .commit_handler
             .resolve_latest_location(&self.base, &self.object_store)
+            .instrument(tracing::info_span!("resolve_latest_location"))
             .await?;
 
         // Check if manifest is in cache before reading from storage
