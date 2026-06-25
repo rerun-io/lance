@@ -1173,7 +1173,9 @@ async fn rewrite_files(
     // It's possible the fragments are old and don't have physical rows or
     // num deletions recorded. If that's the case, we need to grab and set that
     // information.
-    let fragments = migrate_fragments(dataset.as_ref(), &task.fragments, recompute_stats).await?;
+    let fragments = migrate_fragments(dataset.as_ref(), &task.fragments, recompute_stats)
+        .instrument(tracing::info_span!("migrate_fragments"))
+        .await?;
     let num_rows = fragments
         .iter()
         .map(|f| f.physical_rows.unwrap() as u64)
@@ -1209,6 +1211,7 @@ async fn rewrite_files(
             true,
             needs_remapping,
         )
+        .instrument(tracing::info_span!("prepare_reader"))
         .await?;
         row_ids_rx = rx_initial;
 
@@ -1250,6 +1253,7 @@ async fn rewrite_files(
             &params,
             options.binary_copy_read_batch_bytes,
         )
+        .instrument(tracing::info_span!("rewrite_files_binary_copy"))
         .await?;
 
         if new_fragments.is_empty() && matches!(mode, CompactionMode::ForceBinaryCopy) {
@@ -1277,6 +1281,8 @@ async fn rewrite_files(
             row_ids_rx = Some(rx);
         }
     } else {
+        // `reader` is lazy, so this span covers both the scan (reads) and the writes — they are
+        // fused in the streaming pipeline and can't be timed apart here.
         let (frags, _) = write_fragments_internal(
             Some(dataset.as_ref()),
             dataset.object_store.clone(),
@@ -1286,6 +1292,7 @@ async fn rewrite_files(
             params,
             None,
         )
+        .instrument(tracing::info_span!("write_fragments"))
         .await?;
         new_fragments = frags;
     }
@@ -1303,12 +1310,17 @@ async fn rewrite_files(
     } else {
         if dataset.manifest.uses_stable_row_ids() {
             log::info!("Compaction task {}: rechunking stable row ids", task_id);
-            rechunk_stable_row_ids(dataset.as_ref(), &mut new_fragments, &fragments).await?;
-            recalc_versions_for_rewritten_fragments(
-                dataset.as_ref(),
-                &mut new_fragments,
-                &fragments,
-            )
+            async {
+                rechunk_stable_row_ids(dataset.as_ref(), &mut new_fragments, &fragments).await?;
+                recalc_versions_for_rewritten_fragments(
+                    dataset.as_ref(),
+                    &mut new_fragments,
+                    &fragments,
+                )
+                .await?;
+                Ok::<_, Error>(())
+            }
+            .instrument(tracing::info_span!("rechunk_stable_row_ids"))
             .await?;
         }
         None
