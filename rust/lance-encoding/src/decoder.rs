@@ -263,10 +263,15 @@ const BATCH_SIZE_BYTES_WARNING: u64 = 10 * 1024 * 1024;
 const ENV_LANCE_STRUCTURAL_BATCH_DECODE_SPAWN_MODE: &str =
     "LANCE_STRUCTURAL_BATCH_DECODE_SPAWN_MODE";
 const ENV_LANCE_READ_CACHE_REPETITION_INDEX: &str = "LANCE_READ_CACHE_REPETITION_INDEX";
+// rerun patch: retained but no longer used to force inline scheduling (see
+// `create_scheduler_decoder`). Kept so the env knob still parses / for parity
+// with upstream.
+#[allow(dead_code)]
 const ENV_LANCE_INLINE_SCHEDULING_THRESHOLD: &str = "LANCE_INLINE_SCHEDULING_THRESHOLD";
 
 // If a request is for at most this many rows we skip the scheduler-task spawn
 // and run scheduling inline as part of the `schedule_and_decode` await.
+#[allow(dead_code)]
 const DEFAULT_INLINE_SCHEDULING_THRESHOLD: u64 = 16 * 1024;
 
 fn default_cache_repetition_index() -> bool {
@@ -275,6 +280,7 @@ fn default_cache_repetition_index() -> bool {
         .get_or_init(|| parse_env_as_bool(ENV_LANCE_READ_CACHE_REPETITION_INDEX, true))
 }
 
+#[allow(dead_code)]
 fn inline_scheduling_threshold() -> u64 {
     static THRESHOLD: OnceLock<u64> = OnceLock::new();
     *THRESHOLD.get_or_init(|| {
@@ -2154,35 +2160,35 @@ async fn create_scheduler_decoder(
         config.batch_size_bytes,
     )?;
 
-    // The scheduler's `initialize` may perform I/O to load column metadata
-    // unless that metadata is already in the cache.  This metadata loading
-    // happens as part of this call and should be parallelized if reading
-    // multiple files.
-    let mut decode_scheduler = DecodeBatchScheduler::try_new(
-        target_schema.as_ref(),
-        &column_indices,
-        &column_infos,
-        &vec![],
-        num_rows,
-        config.decoder_plugins,
-        config.io.clone(),
-        config.cache,
-        &filter,
-        &config.decoder_config,
-    )
-    .await?;
+    // The scheduler's `initialize` (inside `try_new`) may perform I/O to load
+    // per-column / per-file metadata unless it is already cached.
+    //
+    // rerun patch (registration perf regression, Lance 3->7): upstream 7.x
+    // awaits `try_new` INLINE on the caller's task, and for small reads
+    // (num_rows <= LANCE_INLINE_SCHEDULING_THRESHOLD) also runs scheduling
+    // inline. The merge_insert target scan / manifest read calls this once per
+    // file under a `.buffered(fragment_readahead)` throttle, so inline init
+    // serializes the metadata I/O across fragments and scales the scan cost
+    // with fragment count (~2x on a highly-fragmented manifest). Lance 3.x ran
+    // BOTH init and scheduling off-task (spawned), letting per-file init
+    // parallelize. We restore that: only honor an EXPLICIT
+    // `inline_scheduling = Some(true)`; otherwise spawn init + scheduling.
+    let force_inline = config.decoder_config.inline_scheduling == Some(true);
 
-    // For small requests the scheduling cost is dwarfed by the overhead of
-    // spawning a task, so we run scheduling inline (still as part of this
-    // await) before returning.  The threshold is configurable via
-    // `LANCE_INLINE_SCHEDULING_THRESHOLD`, and callers can force either
-    // strategy via `DecoderConfig::inline_scheduling`.
-    let inline_scheduling = config
-        .decoder_config
-        .inline_scheduling
-        .unwrap_or_else(|| num_rows <= inline_scheduling_threshold());
-
-    if inline_scheduling {
+    if force_inline {
+        let mut decode_scheduler = DecodeBatchScheduler::try_new(
+            target_schema.as_ref(),
+            &column_indices,
+            &column_infos,
+            &vec![],
+            num_rows,
+            config.decoder_plugins,
+            config.io.clone(),
+            config.cache,
+            &filter,
+            &config.decoder_config,
+        )
+        .await?;
         match requested_rows {
             RequestedRows::Ranges(ranges) => {
                 decode_scheduler.schedule_ranges(&ranges, &filter, tx, config.io)
@@ -2193,10 +2199,31 @@ async fn create_scheduler_decoder(
         }
         Ok(decode_stream)
     } else {
-        // Spawn the (still synchronous) scheduling work so that decoder
-        // messages can stream into the channel while the consumer is
-        // already pulling from the decode stream.
+        // Spawn BOTH initialization and scheduling so that, when reading many
+        // files, the per-file metadata loads in `try_new`/`initialize`
+        // parallelize instead of serializing on the throttled per-file read
+        // task. Errors from init are surfaced through the channel.
         let scheduling = async move {
+            let mut decode_scheduler = match DecodeBatchScheduler::try_new(
+                target_schema.as_ref(),
+                &column_indices,
+                &column_infos,
+                &vec![],
+                num_rows,
+                config.decoder_plugins,
+                config.io.clone(),
+                config.cache,
+                &filter,
+                &config.decoder_config,
+            )
+            .await
+            {
+                Ok(scheduler) => scheduler,
+                Err(e) => {
+                    let _ = tx.send(Err(e));
+                    return;
+                }
+            };
             match requested_rows {
                 RequestedRows::Ranges(ranges) => {
                     decode_scheduler.schedule_ranges(&ranges, &filter, tx, config.io)
