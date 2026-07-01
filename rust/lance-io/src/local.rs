@@ -188,6 +188,35 @@ impl Reader for LocalObjectReader {
         let num_bytes = range.len() as u64;
         let range_u64 = (range.start as u64)..(range.end as u64);
 
+        // rerun perf fix: for small reads, do the pread inline on the current
+        // async task instead of dispatching to tokio's blocking thread pool.
+        // Registration re-scans the (local) Dataset Manifest and issues huge
+        // numbers of tiny reads; with several concurrent workers the per-read
+        // `spawn_blocking` dispatch contends on the blocking-pool queue and
+        // dominates runtime. A small read served from the OS page cache does not
+        // meaningfully stall the runtime, so inlining it removes both the
+        // dispatch overhead and the cross-thread blocking-pool contention.
+        const INLINE_SMALL_MAX: usize = 64 * 1024;
+        if range.len() <= INLINE_SMALL_MAX {
+            let mut buf = BytesMut::with_capacity(range.len());
+            // Safety: capacity reserved above; fully written by read_exact_at below.
+            unsafe { buf.set_len(range.len()) };
+            #[cfg(unix)]
+            let io_res = file.read_exact_at(buf.as_mut(), range.start as u64);
+            #[cfg(windows)]
+            let io_res = read_exact_at(file.clone(), buf.as_mut(), range.start as u64);
+            let result = io_res.map(|()| buf.freeze()).map_err(|err: std::io::Error| {
+                object_store::Error::Generic {
+                    store: "LocalFileSystem",
+                    source: err.into(),
+                }
+            });
+            if result.is_ok() {
+                io_tracker.record_read("get_range", path, num_bytes, Some(range_u64));
+            }
+            return Box::pin(async move { result });
+        }
+
         Box::pin(async move {
             let result = tokio::task::spawn_blocking(move || {
                 let mut buf = BytesMut::with_capacity(range.len());
