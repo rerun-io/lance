@@ -3,6 +3,7 @@
 
 //! Query-time logical views over scalar index segments.
 
+use lance_core::utils::row_addr_remap::RowAddrRemap;
 use std::any::Any;
 use std::sync::Arc;
 
@@ -148,7 +149,7 @@ impl ScalarIndex for LogicalScalarIndex {
 
     async fn remap(
         &self,
-        _mapping: &std::collections::HashMap<u64, Option<u64>>,
+        _mapping: &RowAddrRemap,
         _dest_store: &dyn lance_index::scalar::IndexStore,
     ) -> Result<CreatedIndex> {
         Err(Error::invalid_input(format!(

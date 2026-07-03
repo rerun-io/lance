@@ -31,6 +31,7 @@ use datafusion::execution::SendableRecordBatchStream;
 use futures::StreamExt;
 use lance_core::cache::LanceCache;
 use lance_core::deepsize::DeepSizeOf;
+use lance_core::utils::row_addr_remap::RowAddrRemap;
 use lance_core::{Error, ROW_ADDR, Result};
 use roaring::RoaringBitmap;
 
@@ -1363,11 +1364,7 @@ impl ScalarIndex for FMIndexScalarIndex {
     fn can_remap(&self) -> bool {
         false
     }
-    async fn remap(
-        &self,
-        _: &HashMap<u64, Option<u64>>,
-        _: &dyn IndexStore,
-    ) -> Result<CreatedIndex> {
+    async fn remap(&self, _: &RowAddrRemap, _: &dyn IndexStore) -> Result<CreatedIndex> {
         Err(Error::not_supported("Fm does not support remap"))
     }
     async fn update(

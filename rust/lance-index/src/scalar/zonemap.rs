@@ -24,6 +24,7 @@ use crate::scalar::{
 };
 use lance_arrow_stats::StatisticsAccumulator;
 use lance_core::cache::{LanceCache, WeakLanceCache};
+use lance_core::utils::row_addr_remap::RowAddrRemap;
 use serde::{Deserialize, Serialize};
 use std::sync::LazyLock;
 
@@ -33,7 +34,7 @@ use arrow_array::{
 use arrow_schema::{DataType, Field};
 use datafusion::execution::SendableRecordBatchStream;
 use datafusion_common::ScalarValue;
-use std::{collections::HashMap, sync::Arc};
+use std::sync::Arc;
 
 use super::{AnyQuery, IndexStore, MetricsCollector, ScalarIndex, SearchResult};
 use crate::scalar::FragReuseIndex;
@@ -611,7 +612,7 @@ impl ScalarIndex for ZoneMapIndex {
     /// Remap the row ids, creating a new remapped version of this index in `dest_store`
     async fn remap(
         &self,
-        _mapping: &HashMap<u64, Option<u64>>,
+        _mapping: &RowAddrRemap,
         _dest_store: &dyn IndexStore,
     ) -> Result<CreatedIndex> {
         Err(Error::invalid_input_source(
