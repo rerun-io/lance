@@ -9361,6 +9361,184 @@ MergeInsert: on=[id], when_matched=DoNothing, when_not_matched=InsertAll, when_n
         assert_eq!(combined.num_rows(), 300);
     }
 
+    // Regression test for the block-list variant of the stale-index bug (#6664
+    // regressed the #6563 fix): when any *claimed* fragment carries a deletion
+    // file, `create_deletion_mask_impl` takes its block-list branch instead of
+    // the allow-list branch — and a block-list built from manifest fragments
+    // cannot block stale index entries pointing at a fragment that is dead AND
+    // absent from the index bitmap. The probe then feeds the dead address to
+    // TakeExec: "The input to a take operation specified fragment id N but
+    // this fragment does not exist in the dataset".
+    //
+    // Same shape as `test_partial_merge_insert_stale_index_fragment_not_exist`,
+    // plus one deletion on a still-claimed fragment before the final probe.
+    // Without that deletion the prefilter builds a true allow-list and the
+    // stale entries are blocked, which is why that test alone did not catch
+    // this.
+    #[tokio::test]
+    async fn test_partial_merge_insert_stale_index_fragment_not_exist_with_deletions() {
+        let dataset = create_indexed_3frag_dataset().await;
+
+        // Step 2: Partial merge_insert on fragment 1 rows -> fragment 1 drops from
+        // the index bitmap while the btree data keeps its addresses.
+        let dataset = partial_merge_insert(dataset, 100..200, 999.0).await;
+
+        // Step 3: Update all rows that were in fragment 1 -> fragment 1 is fully
+        // deleted and replaced; the stale btree entries now point at a fragment
+        // that is dead AND unclaimed.
+        let update_result = crate::dataset::UpdateBuilder::new(Arc::new((*dataset).clone()))
+            .update_where("id >= 'id-0100' AND id < 'id-0200'")
+            .unwrap()
+            .set("category", "'B'")
+            .unwrap()
+            .build()
+            .unwrap()
+            .execute()
+            .await
+            .unwrap();
+        let dataset = update_result.new_dataset;
+
+        // Step 4: Delete one row from fragment 0, which IS still in the index
+        // bitmap. The deletion file forces the prefilter into its block-list
+        // branch, which cannot block the dead fragment's stale entries.
+        let mut ds = (*dataset).clone();
+        ds.delete("id = 'id-0000'").await.unwrap();
+        let dataset = Arc::new(ds);
+
+        // Step 5: Partial merge_insert on the moved rows.
+        // This should succeed, not fail with "fragment does not exist".
+        let dataset = partial_merge_insert(dataset, 100..200, 888.0).await;
+
+        // Verify correctness: 299 rows survive (300 minus the deleted one) and
+        // the probed rows carry the new value.
+        let batches = dataset
+            .scan()
+            .try_into_stream()
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        let all_schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Utf8, false),
+            Field::new("category", DataType::Utf8, false),
+            Field::new("value_a", DataType::Float64, false),
+            Field::new("value_b", DataType::Float64, false),
+        ]));
+        let combined = concat_batches(&all_schema, &batches).unwrap();
+        assert_eq!(combined.num_rows(), 299);
+
+        let updated = dataset
+            .scan()
+            .filter("id = 'id-0150'")
+            .unwrap()
+            .try_into_stream()
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        let combined = concat_batches(&all_schema, &updated).unwrap();
+        assert_eq!(combined.num_rows(), 1);
+        let values = combined
+            .column_by_name("value_a")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .unwrap();
+        assert_eq!(values.value(0), 888.0);
+    }
+
+    // Regression test for the no-mask fast path: same dead-fragment shape as
+    // `test_partial_merge_insert_stale_index_fragment_not_exist_with_deletions`,
+    // but with NO deletion files anywhere and the index bitmaps covering
+    // exactly the live fragments (claimed == live).
+    //
+    // In that state `create_deletion_mask_impl` returns no mask at all
+    // (nothing deleted, nothing missing, no live fragment outside the
+    // bitmaps), so the probe runs unfiltered and takes the stale dead
+    // address. The state arises naturally: after an update moves a pruned
+    // fragment's rows, a delta-append optimize (num_indices_to_merge=0)
+    // indexes the new fragment — closing the claimed/live gap — while
+    // leaving the poisoned main segment untouched.
+    #[tokio::test]
+    async fn test_partial_merge_insert_stale_index_fragment_not_exist_no_mask() {
+        let dataset = create_indexed_3frag_dataset().await;
+
+        // Step 2: Partial merge_insert on fragment 1 rows -> fragment 1 drops from
+        // the index bitmap while the btree data keeps its addresses.
+        let dataset = partial_merge_insert(dataset, 100..200, 999.0).await;
+
+        // Step 3: Update all rows that were in fragment 1 -> fragment 1 is fully
+        // deleted and replaced by fragment 3; no deletion files remain anywhere.
+        let update_result = crate::dataset::UpdateBuilder::new(Arc::new((*dataset).clone()))
+            .update_where("id >= 'id-0100' AND id < 'id-0200'")
+            .unwrap()
+            .set("category", "'B'")
+            .unwrap()
+            .build()
+            .unwrap()
+            .execute()
+            .await
+            .unwrap();
+        let dataset = update_result.new_dataset;
+
+        // Step 4: Delta-append optimize: indexes fragment 3 into a new delta
+        // segment without rewriting the main segment (which still holds
+        // fragment 1's addresses). Index bitmaps now cover exactly the live
+        // fragments {0, 2, 3}.
+        let mut ds = (*dataset).clone();
+        ds.optimize_indices(
+            &lance_index::optimize::OptimizeOptions::new().num_indices_to_merge(Some(0)),
+        )
+        .await
+        .unwrap();
+        let dataset = Arc::new(ds);
+
+        // Step 5: Partial merge_insert on the moved rows.
+        // This should succeed, not fail with "fragment does not exist".
+        let dataset = partial_merge_insert(dataset, 100..200, 888.0).await;
+
+        // Verify correctness: all 300 rows survive and the probed rows carry
+        // the new value.
+        let batches = dataset
+            .scan()
+            .try_into_stream()
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        let all_schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Utf8, false),
+            Field::new("category", DataType::Utf8, false),
+            Field::new("value_a", DataType::Float64, false),
+            Field::new("value_b", DataType::Float64, false),
+        ]));
+        let combined = concat_batches(&all_schema, &batches).unwrap();
+        assert_eq!(combined.num_rows(), 300);
+
+        let updated = dataset
+            .scan()
+            .filter("id = 'id-0150'")
+            .unwrap()
+            .try_into_stream()
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        let combined = concat_batches(&all_schema, &updated).unwrap();
+        assert_eq!(combined.num_rows(), 1);
+        let values = combined
+            .column_by_name("value_a")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .unwrap();
+        assert_eq!(values.value(0), 888.0);
+    }
+
     // Regression test: partial-schema merge_insert followed by update (deleting SOME rows
     // in a fragment) followed by partial merge_insert should not produce
     // "RecordBatch size mismatch" errors.
