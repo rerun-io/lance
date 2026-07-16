@@ -256,40 +256,14 @@ impl ExecutionPlan for ScalarIndexExec {
 pub static INDEX_LOOKUP_SCHEMA: LazyLock<SchemaRef> =
     LazyLock::new(|| Arc::new(Schema::new(vec![ROW_ID_FIELD.clone()])));
 
-/// A single scalar-index lookup used by [`MapIndexExec`].
-///
-/// `column` identifies a column whose values will be probed against the
-/// index named `index_name`. Multiple lookups are intersected with logical
-/// AND semantics inside `MapIndexExec`.
-#[derive(Debug, Clone)]
-pub struct IndexLookup {
-    pub column: String,
-    pub index_name: String,
-}
-
-impl IndexLookup {
-    pub fn new(column: impl Into<String>, index_name: impl Into<String>) -> Self {
-        Self {
-            column: column.into(),
-            index_name: index_name.into(),
-        }
-    }
-}
-
 /// An execution node that translates index values into row addresses
 ///
-/// This can be combined with TakeExec to perform an "indexed take".
-///
-/// Multiple `(column, index_name)` lookups can be supplied: the operator
-/// expects one input column per lookup (in matching order) and emits the
-/// row addresses where every column's value is present in its respective
-/// index — that is, the AND of the per-column index probes. This lets a
-/// composite-key join trim the candidate row set with every available
-/// scalar index before the downstream take.
+/// This can be combined with TakeExec to perform an "indexed take"
 #[derive(Debug)]
 pub struct MapIndexExec {
     dataset: Arc<Dataset>,
-    lookups: Vec<IndexLookup>,
+    column_name: String,
+    index_name: String,
     input: Arc<dyn ExecutionPlan>,
     properties: Arc<PlanProperties>,
     metrics: ExecutionPlanMetricsSet,
@@ -301,49 +275,19 @@ impl DisplayAs for MapIndexExec {
             DisplayFormatType::Default
             | DisplayFormatType::Verbose
             | DisplayFormatType::TreeRender => {
-                write!(f, "IndexedLookup")?;
-                if self.lookups.len() > 1 {
-                    let cols = self
-                        .lookups
-                        .iter()
-                        .map(|l| l.column.as_str())
-                        .collect::<Vec<_>>()
-                        .join(", ");
-                    write!(f, " [{cols}]")?;
-                }
-                Ok(())
+                write!(f, "IndexedLookup")
             }
         }
     }
 }
 
 impl MapIndexExec {
-    /// Convenience constructor for the common single-column case.
     pub fn new(
         dataset: Arc<Dataset>,
         column_name: String,
         index_name: String,
         input: Arc<dyn ExecutionPlan>,
     ) -> Self {
-        Self::new_multi(
-            dataset,
-            vec![IndexLookup::new(column_name, index_name)],
-            input,
-        )
-    }
-
-    /// Build a `MapIndexExec` that probes one or more scalar indices and
-    /// emits the AND of their results. `lookups` must be non-empty and
-    /// `input` must produce one column per lookup, in the same order.
-    pub fn new_multi(
-        dataset: Arc<Dataset>,
-        lookups: Vec<IndexLookup>,
-        input: Arc<dyn ExecutionPlan>,
-    ) -> Self {
-        debug_assert!(
-            !lookups.is_empty(),
-            "MapIndexExec requires at least one index lookup"
-        );
         let properties = Arc::new(PlanProperties::new(
             EquivalenceProperties::new(INDEX_LOOKUP_SCHEMA.clone()),
             Partitioning::RoundRobinBatch(1),
@@ -352,7 +296,8 @@ impl MapIndexExec {
         ));
         Self {
             dataset,
-            lookups,
+            column_name,
+            index_name,
             input,
             properties,
             metrics: ExecutionPlanMetricsSet::new(),
@@ -363,30 +308,18 @@ impl MapIndexExec {
         input: datafusion::physical_plan::SendableRecordBatchStream,
         partition: usize,
         dataset: Arc<Dataset>,
-        lookups: Vec<IndexLookup>,
+        column_name: String,
+        index_name: String,
         index_metrics: Arc<IndexMetrics>,
         metrics_set: ExecutionPlanMetricsSet,
     ) -> datafusion::error::Result<datafusion::physical_plan::SendableRecordBatchStream> {
-        // A row can be found by the composite probe only if it lives in a
-        // fragment covered by *every* index in `lookups`; restrict the
-        // deletion mask to that intersection so we only filter deletes we
-        // could actually see.
-        let mut fragment_bitmap: Option<RoaringBitmap> = None;
-        for lookup in &lookups {
-            let bm = scalar_index_fragment_bitmap(&dataset, &lookup.column, &lookup.index_name)
-                .await?
-                .ok_or_else(|| {
-                    datafusion::error::DataFusionError::Internal(format!(
-                        "IndexedLookupExec: index '{}' on column '{}' disappeared after planning",
-                        lookup.index_name, lookup.column,
-                    ))
-                })?;
-            fragment_bitmap = Some(match fragment_bitmap {
-                None => bm,
-                Some(acc) => acc & bm,
-            });
-        }
-        let fragment_bitmap = fragment_bitmap.expect("MapIndexExec built with no lookups");
+        let fragment_bitmap = scalar_index_fragment_bitmap(&dataset, &column_name, &index_name)
+            .await?
+            .ok_or_else(|| {
+                datafusion::error::DataFusionError::Internal(format!(
+                    "IndexedLookupExec: index '{index_name}' on column '{column_name}' disappeared after planning"
+                ))
+            })?;
         let deletion_mask_fut =
             DatasetPreFilter::create_restricted_deletion_mask(dataset.clone(), fragment_bitmap);
         let deletion_mask = if let Some(fut) = deletion_mask_fut {
@@ -398,7 +331,8 @@ impl MapIndexExec {
         let baseline = BaselineMetrics::new(&metrics_set, partition);
         let elapsed_compute = baseline.elapsed_compute().clone();
         let stream = input.then(move |batch_result| {
-            let lookups = lookups.clone();
+            let column_name = column_name.clone();
+            let index_name = index_name.clone();
             let dataset = dataset.clone();
             let deletion_mask = deletion_mask.clone();
             let metrics = index_metrics.clone();
@@ -409,7 +343,15 @@ impl MapIndexExec {
                 // the per-batch sargable index evaluation, which is the work
                 // we want attributed here.
                 let _t = elapsed_compute.timer();
-                Self::map_batch(lookups, dataset, deletion_mask, batch, metrics).await
+                Self::map_batch(
+                    column_name,
+                    index_name,
+                    dataset,
+                    deletion_mask,
+                    batch,
+                    metrics,
+                )
+                .await
             }
         });
         let stream = stream.map(move |batch| {
@@ -425,42 +367,27 @@ impl MapIndexExec {
         )))
     }
 
-    /// Build the AND-of-IsIn `ScalarIndexExpr` describing this batch's
-    /// composite lookup: each input column contributes one `IsIn` query
-    /// against its matching index.
-    fn build_query(
-        lookups: &[IndexLookup],
-        batch: &RecordBatch,
-    ) -> datafusion::error::Result<ScalarIndexExpr> {
-        let per_column = lookups.iter().enumerate().map(|(idx, lookup)| {
-            let column = batch.column(idx);
-            let values = (0..column.len())
-                .map(|row| ScalarValue::try_from_array(column, row))
-                .collect::<datafusion::error::Result<Vec<_>>>()?;
-            Ok::<_, datafusion::error::DataFusionError>(ScalarIndexExpr::Query(ScalarIndexSearch {
-                column: lookup.column.clone(),
-                index_name: lookup.index_name.clone(),
-                // Internal IndexedLookup-style query — type is unknown at this layer
-                index_type: String::new(),
-                query: Arc::new(SargableQuery::IsIn(values)),
-                needs_recheck: false,
-                fragment_bitmap: None,
-            }))
-        });
-
-        per_column
-            .reduce(|lhs, rhs| Ok(ScalarIndexExpr::And(Box::new(lhs?), Box::new(rhs?))))
-            .expect("MapIndexExec built with no lookups")
-    }
-
     async fn map_batch(
-        lookups: Vec<IndexLookup>,
+        column_name: String,
+        index_name: String,
         dataset: Arc<Dataset>,
         deletion_mask: Option<Arc<RowAddrMask>>,
         batch: RecordBatch,
         metrics: Arc<IndexMetrics>,
     ) -> datafusion::error::Result<RecordBatch> {
-        let query = Self::build_query(&lookups, &batch)?;
+        let index_vals = batch.column(0);
+        let index_vals = (0..index_vals.len())
+            .map(|idx| ScalarValue::try_from_array(index_vals, idx))
+            .collect::<datafusion::error::Result<Vec<_>>>()?;
+        let query = ScalarIndexExpr::Query(ScalarIndexSearch {
+            column: column_name,
+            index_name,
+            // Internal IndexedLookup-style query — type is unknown at this layer
+            index_type: String::new(),
+            query: Arc::new(SargableQuery::IsIn(index_vals)),
+            needs_recheck: false,
+            fragment_bitmap: None,
+        });
         let query_result = query.evaluate(dataset.as_ref(), metrics.as_ref()).await?;
         if !query_result.is_exact() {
             todo!("Support for non-exact query results as input for merge_insert")
@@ -510,9 +437,10 @@ impl ExecutionPlan for MapIndexExec {
                 "MapIndexExec requires exactly one child".to_string(),
             ))
         } else {
-            Ok(Arc::new(Self::new_multi(
+            Ok(Arc::new(Self::new(
                 self.dataset.clone(),
-                self.lookups.clone(),
+                self.column_name.clone(),
+                self.index_name.clone(),
                 children.into_iter().next().unwrap(),
             )))
         }
@@ -528,7 +456,8 @@ impl ExecutionPlan for MapIndexExec {
             input,
             partition,
             self.dataset.clone(),
-            self.lookups.clone(),
+            self.column_name.clone(),
+            self.index_name.clone(),
             Arc::new(IndexMetrics::new(&self.metrics, partition)),
             self.metrics.clone(),
         );
