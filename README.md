@@ -94,6 +94,48 @@ Guidelines:
 
 ---
 
+## CI on release branches
+
+Upstream scopes its workflows to `main` and `release/**`, which does not match our hyphenated
+`release-X.Y.Z`. Renaming our branches would be the other way to fix that, but downstream pins to
+them by name, so instead the workflows we want carry an extra `release-*` branch filter.
+
+Two things then decide what actually runs.
+
+**Runner labels.** Most of upstream's build and test jobs request larger runners — `ubuntu-24.04-8x`,
+`ubuntu-24.04-arm64-8x`, `ubuntu-24.04-4x`, `warp-macos-14-arm64-6x`, `windows-latest-4x` — that exist
+only in the upstream org. **A job requesting a label that does not resolve queues for 24 hours and is
+then cancelled**, which is why the Rust and Python runs on `rerun/main` have never gone green. Those
+jobs therefore carry `if: github.repository != 'rerun-io/lance'` so they skip here instead of hanging.
+`if:` is evaluated before scheduling, so a skipped job never queues.
+
+**Upstream's disabled bit does not travel.** `notebook.yml` is `disabled_manually` upstream, but a
+fork inherits the workflow *file*, not that state — give it a matching branch filter and it wakes up
+and fails (it installs the wheel plus `jupyter` and `duckdb`, while `quickstart.ipynb` also imports
+`pandas`). Before enabling anything here, check upstream first:
+
+```sh
+gh api repos/lance-format/lance/actions/workflows --jq '.workflows[] | "\(.state)\t\(.path)"'
+```
+
+What runs on a PR into a release branch:
+
+| Workflow                   | What it checks                                                     |
+|----------------------------|---------------------------------------------------------------------|
+| `rust.yml`                 | `clippy` (all features, all targets), `cargo-deny`, `cargo fmt`, `rustdoc`, MSRV, and the qemu pre-Haswell SIGILL test |
+| `java.yml`                 | clippy and fmt for `java/lance-jni`                                  |
+| `typos.yml`                | Spelling, whole repo                                                 |
+| `license-header-check.yml` | Apache headers under `rust/`, `python/`, `protos/`                   |
+| `docs-check.yml`           | `docs/` still builds                                                 |
+
+`python.yml` is not enabled: its only standard-runner job is `compat`, which `needs: linux`, and
+`linux` is on a larger runner — so it would produce nothing.
+
+So the lint, advisory and dependency gates do cover you, but **the build-and-test matrix and the
+Python suite do not run here.** Verify those locally and say what you ran in the PR body.
+
+---
+
 ## Cutting a new fork release when upstream releases
 
 When upstream ships a new release `vNEW` (e.g. `v9.0.0`), rebase our patch set onto it.
