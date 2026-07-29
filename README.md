@@ -94,6 +94,35 @@ Guidelines:
 
 ---
 
+## CI on release branches
+
+Upstream scopes its workflows to `main` and `release/**`, which does not match our hyphenated
+`release-X.Y.Z`. Renaming our branches would be the other way to fix that, but downstream pins to
+them by name, so instead these three checks carry an extra `release-*` branch filter and run on PRs
+into a release branch:
+
+| Workflow                   | What it checks                                     |
+|----------------------------|-----------------------------------------------------|
+| `typos.yml`                | Spelling, whole repo                                 |
+| `license-header-check.yml` | Apache headers under `rust/`, `python/`, `protos/`   |
+| `docs-check.yml`           | `docs/` still builds                                 |
+
+Everything else stays off, for two different reasons.
+
+`rust.yml`, `python.yml` and `java.yml` mostly request lancedb's larger runners
+(`ubuntu-24.04-8x`, `warp-macos-14-arm64-6x`, …), which do not exist in `rerun-io`: such a job sits
+queued for 24 hours and is then cancelled. That is why the Rust and Python runs on `rerun/main` have
+never gone green.
+
+`notebook.yml` is `disabled_manually` upstream and broken as written — it installs the wheel plus
+`jupyter` and `duckdb`, but `quickstart.ipynb` also imports `pandas`. A fork inherits the workflow
+file, not the disabled bit, so leave its filter alone or it wakes up red.
+
+So **`cargo test`, `clippy` and the Python suite do not run for you here.** Verify them locally and
+say what you ran in the PR body.
+
+---
+
 ## Cutting a new fork release when upstream releases
 
 When upstream ships a new release `vNEW` (e.g. `v9.0.0`), rebase our patch set onto it.
