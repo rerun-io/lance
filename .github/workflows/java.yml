@@ -5,10 +5,12 @@ on:
     branches:
       - main
       - release/**
+      - release-*
   pull_request:
     branches:
       - main
       - release/**
+      - release-*
     paths:
       - java/**
       - rust/**
@@ -50,6 +52,8 @@ jobs:
         run: cargo clippy --all-targets --locked -- -D warnings
 
   build-and-test-java:
+    # Rerun fork: `ubuntu-24.04-4x` exists only in the upstream org; see rust.yml.
+    if: github.repository != 'rerun-io/lance'
     runs-on: ubuntu-24.04-4x
     timeout-minutes: 60
     strategy:

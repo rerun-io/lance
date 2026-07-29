@@ -4,10 +4,12 @@ on:
     branches:
       - main
       - release/**
+      - release-*
   pull_request:
     branches:
       - main
       - release/**
+      - release-*
     paths:
       - rust/**
       - protos/**
@@ -31,6 +33,10 @@ env:
   RUST_BACKTRACE: "1"
 
 jobs:
+  # Rerun fork: jobs carrying `if: github.repository != 'rerun-io/lance'` request larger
+  # runners that exist only in the upstream org. A job asking for a label that does not
+  # resolve queues for 24h and is then cancelled, so we skip them rather than let them
+  # hang. See "CI on release branches" in the README.
   format:
     runs-on: ubuntu-24.04
     timeout-minutes: 15
@@ -84,6 +90,7 @@ jobs:
           command: check
 
   linux-build:
+    if: github.repository != 'rerun-io/lance'
     runs-on: "ubuntu-24.04-8x"
     timeout-minutes: 75
     env:
@@ -122,6 +129,7 @@ jobs:
           flags: unittests
           fail_ci_if_error: false
   linux-arm:
+    if: github.repository != 'rerun-io/lance'
     runs-on: ubuntu-24.04-arm64-8x
     timeout-minutes: 75
     steps:
@@ -147,6 +155,7 @@ jobs:
           ALL_FEATURES=`cargo metadata --format-version=1 --no-deps | jq -r '.packages[] | .features | keys | .[]' | grep -v -e protoc -e slow_tests | sort | uniq | paste -s -d "," -`
           cargo test --profile ci --locked --features ${ALL_FEATURES}
   query-integration-tests:
+    if: github.repository != 'rerun-io/lance'
     runs-on: ubuntu-24.04-4x
     timeout-minutes: 75
     env:
@@ -174,6 +183,7 @@ jobs:
         run: |
           cargo test --locked -p lance --no-default-features --features fp16kernels,slow_tests --test integration_tests
   build-no-lock:
+    if: github.repository != 'rerun-io/lance'
     runs-on: ubuntu-24.04-8x
     timeout-minutes: 30
     env:
@@ -199,6 +209,7 @@ jobs:
           ALL_FEATURES=`cargo metadata --format-version=1 --no-deps | jq -r '.packages[] | .features | keys | .[]' | grep -v -e protoc -e slow_tests | sort | uniq | paste -s -d "," -`
           cargo build --profile ci --benches --features ${ALL_FEATURES} --tests
   mac-build:
+    if: github.repository != 'rerun-io/lance'
     runs-on: warp-macos-14-arm64-6x
     timeout-minutes: 45
     strategy:
@@ -231,6 +242,7 @@ jobs:
         run: |
           cargo check --profile ci --benches --features fp16kernels,cli,dynamodb,substrait
   windows-build:
+    if: github.repository != 'rerun-io/lance'
     runs-on: windows-latest-4x
     defaults:
       run:
