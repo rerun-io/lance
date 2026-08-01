@@ -107,14 +107,9 @@ impl AzureBlobStoreProvider {
                     config_map.insert("root".to_string(), format!("/{}", prefix));
                 }
 
-                Operator::from_iter::<Azblob>(config_map)
-                    .map_err(|e| {
-                        Error::invalid_input(format!(
-                            "Failed to create Azure Blob operator: {:?}",
-                            e
-                        ))
-                    })
-                    .map(|b| b.finish())
+                Operator::from_iter::<Azblob>(config_map).map_err(|e| {
+                    Error::invalid_input(format!("Failed to create Azure Blob operator: {:?}", e))
+                })
             }
             "abfss" => {
                 let filesystem = base_path.username();
@@ -140,14 +135,12 @@ impl AzureBlobStoreProvider {
                     config_map.insert("root".to_string(), format!("/{}", root_path));
                 }
 
-                Operator::from_iter::<Azdls>(config_map)
-                    .map_err(|e| {
-                        Error::invalid_input(format!(
-                            "Failed to create Azure DFS (ADLS Gen2) operator: {:?}",
-                            e
-                        ))
-                    })
-                    .map(|b| b.finish())
+                Operator::from_iter::<Azdls>(config_map).map_err(|e| {
+                    Error::invalid_input(format!(
+                        "Failed to create Azure DFS (ADLS Gen2) operator: {:?}",
+                        e
+                    ))
+                })
             }
             "https" => {
                 let host = base_path.host_str().ok_or_else(|| {
@@ -179,14 +172,9 @@ impl AzureBlobStoreProvider {
                     config_map.insert("root".to_string(), format!("/{}", prefix.join("/")));
                 }
 
-                Operator::from_iter::<Azblob>(config_map)
-                    .map_err(|e| {
-                        Error::invalid_input(format!(
-                            "Failed to create Azure Blob operator: {:?}",
-                            e
-                        ))
-                    })
-                    .map(|b| b.finish())
+                Operator::from_iter::<Azblob>(config_map).map_err(|e| {
+                    Error::invalid_input(format!("Failed to create Azure Blob operator: {:?}", e))
+                })
             }
             _ => Err(Error::invalid_input(format!(
                 "Unsupported Azure scheme: {}",
@@ -792,8 +780,8 @@ mod tests {
         let abfss_operator =
             AzureBlobStoreProvider::build_opendal_operator(&abfss_url, &common_opts).unwrap();
 
-        let azblob_cap = az_operator.info().native_capability();
-        let azdls_cap = abfss_operator.info().native_capability();
+        let azblob_cap = az_operator.info().capability();
+        let azdls_cap = abfss_operator.info().capability();
 
         // Both support basic operations
         assert!(azblob_cap.read);
