@@ -251,6 +251,26 @@ pub trait IndexReader: Send + Sync {
             futures::stream::once(async move { Ok(batch) }),
         )))
     }
+    /// Stream the entire file as `batch_size`-row batches under a **single** decode plan,
+    /// or `None` if this reader has no such fast path (the caller then falls back to
+    /// per-batch reads).
+    ///
+    /// This exists because building a decode plan is not free: for the v2 structural
+    /// encoding, `DecodeBatchScheduler::try_new` runs `initialize()`, which initializes
+    /// *every page in the column* — it does not scope to the rows being requested. Reading
+    /// a whole file as N independent `read_record_batch` calls therefore costs
+    /// O(batches x pages) metadata reads instead of O(pages), and those reads are tiny
+    /// (one chunk-metadata buffer per page, kilobytes apart) so nothing coalesces.
+    ///
+    /// A large index runs to thousands of pages, so this dominates the cost of a full
+    /// scan. Callers that read a file end to end should prefer this method.
+    async fn whole_file_stream(
+        &self,
+        _batch_size: u32,
+        _batch_readahead: u32,
+    ) -> Result<Option<Pin<Box<dyn RecordBatchStream>>>> {
+        Ok(None)
+    }
     /// Return the number of batches in the file
     async fn num_batches(&self, batch_size: u64) -> u32;
     /// Return the number of rows in the file

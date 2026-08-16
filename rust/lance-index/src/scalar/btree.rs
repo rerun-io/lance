@@ -52,9 +52,9 @@ use datafusion_physical_expr::{
     PhysicalExpr, PhysicalSortExpr, create_physical_expr, expressions::Column,
 };
 use futures::{
-    FutureExt, Stream, StreamExt, TryFutureExt, TryStreamExt,
+    FutureExt, Stream, StreamExt, TryStreamExt,
     future::BoxFuture,
-    stream::{self},
+    stream::{self, BoxStream},
 };
 use lance_core::deepsize::DeepSizeOf;
 use lance_core::{
@@ -1808,10 +1808,9 @@ impl BTreeIndex {
         let reader = lazy_reader.get().await?;
         let new_schema = Arc::new(self.train_schema());
         let new_schema_clone = new_schema.clone();
-        let reader_stream = IndexReaderStream::new(reader, self.batch_size).await;
-        let batches = reader_stream
-            .map(|fut| fut.map_err(DataFusionError::from))
-            .buffered(self.store.io_parallelism())
+        let batches = stream_index_file(reader, self.batch_size, self.store.io_parallelism())
+            .await?
+            .map_err(DataFusionError::from)
             .map_ok(move |batch| {
                 RecordBatch::try_new(
                     new_schema.clone(),
@@ -2076,9 +2075,12 @@ impl Index for BTreeIndex {
 
         let lazy_reader = LazyIndexReader::new(self.store.clone(), self.ranges_to_files.clone());
         let sub_index_reader = lazy_reader.get().await?;
-        let mut reader_stream = IndexReaderStream::new(sub_index_reader, self.batch_size)
-            .await
-            .buffered(self.store.io_parallelism());
+        let mut reader_stream = stream_index_file(
+            sub_index_reader,
+            self.batch_size,
+            self.store.io_parallelism(),
+        )
+        .await?;
         while let Some(serialized) = reader_stream.try_next().await? {
             let page = FlatIndex::try_new(serialized)?;
             frag_ids |= page.calculate_included_frags()?;
@@ -2253,20 +2255,23 @@ impl ScalarIndex for BTreeIndex {
             let train_schema_clone = train_schema.clone();
             let train_schema = train_schema.clone();
 
-            let remapped_stream = IndexReaderStream::new(sub_index_reader, self.batch_size)
-                .await
-                .buffered(self.store.io_parallelism())
-                .map_err(DataFusionError::from)
-                .and_then(move |batch| {
-                    // Remap the batch and then convert from the serialized schema to the training input schema
-                    let remapped =
-                        FlatIndex::remap_batch(batch, &mapping).map_err(DataFusionError::from);
-                    let with_train_schema = remapped.and_then(|batch| {
-                        RecordBatch::try_new(train_schema.clone(), batch.columns().to_vec())
-                            .map_err(DataFusionError::from)
-                    });
-                    std::future::ready(with_train_schema)
+            let remapped_stream = stream_index_file(
+                sub_index_reader,
+                self.batch_size,
+                self.store.io_parallelism(),
+            )
+            .await?
+            .map_err(DataFusionError::from)
+            .and_then(move |batch| {
+                // Remap the batch and then convert from the serialized schema to the training input schema
+                let remapped =
+                    FlatIndex::remap_batch(batch, &mapping).map_err(DataFusionError::from);
+                let with_train_schema = remapped.and_then(|batch| {
+                    RecordBatch::try_new(train_schema.clone(), batch.columns().to_vec())
+                        .map_err(DataFusionError::from)
                 });
+                std::future::ready(with_train_schema)
+            });
 
             let remapped_stream = Box::pin(RecordBatchStreamAdapter::new(
                 train_schema_clone,
@@ -2759,8 +2764,12 @@ async fn merge_range_partitioned_lookups(
 
     for (idx, (part_id, part_lookup_file)) in sorted_part_lookup_files.into_iter().enumerate() {
         let lookup_reader = store.open_index_file(&part_lookup_file).await?;
-        let reader_stream = IndexReaderStream::new(lookup_reader.clone(), batch_size).await;
-        let mut stream = reader_stream.buffered(batch_readhead.unwrap_or(1)).boxed();
+        let mut stream = stream_index_file(
+            lookup_reader.clone(),
+            batch_size,
+            batch_readhead.unwrap_or(1),
+        )
+        .await?;
         while let Some(batch) = stream.next().await {
             let original_batch = batch?;
             let modified_batch = add_offset_to_page_idx(&original_batch, num_pages_written)?;
@@ -2921,11 +2930,9 @@ async fn merge_pages(
 
         let reader = store.open_index_file(&page_file_name).await?;
 
-        let reader_stream = IndexReaderStream::new(reader, batch_size).await;
-
-        let stream = reader_stream
-            .map(|fut| fut.map_err(DataFusionError::from))
-            .buffered(batch_readhead.unwrap_or(1))
+        let stream = stream_index_file(reader, batch_size, batch_readhead.unwrap_or(1))
+            .await?
+            .map_err(DataFusionError::from)
             .boxed();
 
         let sendable_stream =
@@ -3107,6 +3114,29 @@ pub(crate) fn part_lookup_file_path(partition_id: u64) -> String {
 /// A stream that reads the original training data back out of the index
 ///
 /// This is used for updating the index
+/// Stream an index file end to end as `batch_size`-row batches.
+///
+/// Prefers the reader's single-decode-plan path ([`IndexReader::whole_file_stream`]).
+/// Falls back to independent per-batch reads for readers that don't offer one, which is
+/// what every caller used to do unconditionally — correct, but it rebuilds the decode plan
+/// once per batch and each rebuild initializes every page in the file.
+async fn stream_index_file(
+    reader: Arc<dyn IndexReader>,
+    batch_size: u64,
+    batch_readahead: usize,
+) -> Result<BoxStream<'static, Result<RecordBatch>>> {
+    if let Some(stream) = reader
+        .whole_file_stream(batch_size as u32, batch_readahead.max(1) as u32)
+        .await?
+    {
+        return Ok(stream.boxed());
+    }
+    Ok(IndexReaderStream::new(reader, batch_size)
+        .await
+        .buffered(batch_readahead.max(1))
+        .boxed())
+}
+
 struct IndexReaderStream {
     reader: Arc<dyn IndexReader>,
     batch_size: u64,
@@ -3504,6 +3534,73 @@ mod tests {
             .unwrap();
 
         assert_eq!(original_data, remapped_data);
+    }
+
+    /// Scanning an index end to end must build ONE decode plan, not one per batch.
+    ///
+    /// `DecodeBatchScheduler::try_new` calls `initialize()`, and
+    /// `StructuralPrimitiveFieldScheduler::initialize` initializes *every page in the
+    /// column* — it does not scope to the rows requested. So reading a file as N
+    /// independent `read_record_batch` calls costs O(batches x pages) metadata reads.
+    /// Those reads are one small chunk-metadata buffer per page, megabytes apart, so the
+    /// scheduler's coalescer cannot merge them and each becomes its own syscall. The
+    /// penalty therefore scales with the file's page count.
+    #[tokio::test]
+    async fn test_data_stream_builds_one_decode_plan() {
+        const BATCH_SIZE: u64 = 64;
+        const ROWS: u64 = 10_000;
+
+        let tmpdir = TempObjDir::default();
+        let object_store = Arc::new(ObjectStore::local());
+        let test_store = Arc::new(LanceIndexStore::new(
+            object_store.clone(),
+            tmpdir.clone(),
+            Arc::new(LanceCache::no_cache()),
+        ));
+
+        let data = gen_batch()
+            .col("value", array::step::<Int32Type>())
+            .col("_rowid", array::step::<UInt64Type>())
+            .into_df_exec(RowCount::from(100), BatchCount::from(100));
+        let schema = data.schema();
+        let sort_expr = PhysicalSortExpr::new_default(col("value", schema.as_ref()).unwrap());
+        let plan = Arc::new(SortExec::new([sort_expr].into(), data));
+        let stream = plan.execute(0, Arc::new(TaskContext::default())).unwrap();
+        let stream = break_stream(stream, BATCH_SIZE as usize);
+        let stream = stream.map_err(DataFusionError::from);
+        let stream =
+            Box::pin(RecordBatchStreamAdapter::new(schema, stream)) as SendableRecordBatchStream;
+
+        train_btree_index(stream, test_store.as_ref(), BATCH_SIZE, None, None)
+            .await
+            .unwrap();
+
+        let index = BTreeIndex::load(test_store, None, &LanceCache::no_cache())
+            .await
+            .unwrap();
+
+        let num_pages = ROWS.div_ceil(BATCH_SIZE);
+
+        // Reset the counters so we measure only the scan.
+        let _ = object_store.io_stats_incremental();
+
+        let mut stream = index.data_stream().await.unwrap();
+        let mut rows_seen = 0u64;
+        while let Some(batch) = stream.try_next().await.unwrap() {
+            rows_seen += batch.num_rows() as u64;
+        }
+        assert_eq!(rows_seen, ROWS);
+
+        let iops = object_store.io_stats_incremental().read_iops;
+        // Measured on this fixture: 4 IOPs with a single plan, 315 with one plan per
+        // batch. The bound is deliberately far below the per-batch figure so the test
+        // fails loudly if the fast path stops being taken, but well above 4 so it does
+        // not tighten into a flake if readahead or footer handling changes.
+        assert!(
+            iops < 32,
+            "scanning a {num_pages}-batch index took {iops} read IOPs; a decode plan \
+             rebuilt per batch costs ~315 here, and far more on a file with many pages"
+        );
     }
 
     #[tokio::test]
