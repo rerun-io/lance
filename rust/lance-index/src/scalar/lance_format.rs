@@ -365,6 +365,32 @@ impl IndexReader for CurrentIndexReader {
             .await
     }
 
+    /// Single decode plan for the whole file — see [`IndexReader::whole_file_stream`].
+    async fn whole_file_stream(
+        &self,
+        batch_size: u32,
+        batch_readahead: u32,
+    ) -> Result<Option<Pin<Box<dyn lance_io::stream::RecordBatchStream>>>> {
+        if CurrentFileReader::num_rows(&self.0) == 0 {
+            return Ok(None);
+        }
+        let projection = ReaderProjection::from_whole_schema(
+            self.0.schema(),
+            self.0.metadata().version(),
+        );
+        let stream = self
+            .0
+            .read_stream_projected(
+                ReadBatchParams::RangeFull,
+                batch_size,
+                batch_readahead,
+                projection,
+                FilterExpression::no_filter(),
+            )
+            .await?;
+        Ok(Some(stream))
+    }
+
     // V2 format has removed the row group concept,
     // so here we assume each batch is with 4096 rows.
     async fn num_batches(&self, batch_size: u64) -> u32 {
