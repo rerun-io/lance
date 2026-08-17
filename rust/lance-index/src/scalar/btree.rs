@@ -1802,7 +1802,23 @@ impl BTreeIndex {
         Schema::new(vec![value_field, row_id_field])
     }
 
+    /// Clone this index with its store rescoped to hold at most `bytes` of outstanding
+    /// prefetched data, for callers that drain several segments at once.
+    ///
+    /// See [`IndexStore::with_io_buffer_size`]; stores that cannot rescope return
+    /// themselves and this is then a no-op.
+    fn with_io_buffer_size(&self, bytes: u64) -> Self {
+        let mut scoped = self.clone();
+        scoped.store = self.store.with_io_buffer_size(bytes);
+        scoped
+    }
+
     /// Create a stream of all the data in the index, in the same format used to train the index
+    ///
+    /// This is a whole-file plan where the reader supports one (see
+    /// [`IndexReader::whole_file_stream`]), so its peak resident encoded bytes are bounded
+    /// by the store's scheduler budget rather than by readahead. Callers that run several
+    /// of these concurrently should rescope with [`Self::with_io_buffer_size`] first.
     async fn data_stream(&self) -> Result<SendableRecordBatchStream> {
         let lazy_reader = LazyIndexReader::new(self.store.clone(), self.ranges_to_files.clone());
         let reader = lazy_reader.get().await?;
@@ -1868,11 +1884,27 @@ impl BTreeIndex {
             )));
         }
 
+        // Every `data_stream()` below is a whole-file plan that begins prefetching as soon
+        // as it is awaited, i.e. before the merge operator below even exists, and each
+        // source segment carries its own store and therefore its own scheduler budget
+        // (`open_scalar_index` builds one store per segment). Left alone the merge would
+        // hold N times a single scan's worth of encoded bytes, none of it visible to the
+        // DataFusion memory pool. Rescope each source so the aggregate stays near one
+        // scan's budget. `new_data` is a dataset scan against a different store and keeps
+        // its own budget.
+        let num_sources = old_data_filters
+            .iter()
+            .filter(|filter| !filter_keeps_nothing(filter))
+            .count()
+            .max(1) as u64;
+        let io_buffer_size = merge_io_buffer_size(first.store.io_parallelism(), num_sources);
+
         let mut inputs: Vec<Arc<dyn ExecutionPlan>> = Vec::with_capacity(segments.len() + 1);
         for (segment, old_data_filter) in segments.iter().zip(old_data_filters) {
             if filter_keeps_nothing(old_data_filter) {
                 continue;
             }
+            let segment = segment.with_io_buffer_size(io_buffer_size);
             let stream = segment.data_stream().await?;
             let stream = match segment.frag_reuse_index.clone() {
                 Some(frag_reuse_index) => remap_row_ids(stream, frag_reuse_index),
@@ -1935,6 +1967,23 @@ fn filter_row_ids(
         Ok(arrow_select::filter::filter_record_batch(&batch, &mask)?)
     });
     Box::pin(RecordBatchStreamAdapter::new(schema, filtered))
+}
+
+/// Prefetch allowance per I/O thread, mirroring `SchedulerConfig::max_bandwidth`, which
+/// sizes an index store's budget assuming a 32 MiB maximum page.
+const MERGE_BYTES_PER_IO_THREAD: u64 = 32 * 1024 * 1024;
+
+/// Divide one scan's worth of prefetch budget across `num_sources` segment streams that
+/// will be drained concurrently.
+///
+/// The floor keeps a whole page in flight per source, so the aggregate bound is
+/// `max(one scan's budget, num_sources * 32 MiB)` rather than a constant. Past
+/// `io_parallelism` sources the floor wins and the total starts growing again; that is the
+/// point at which a caller wanting a real constant would have to merge in passes.
+fn merge_io_buffer_size(io_parallelism: usize, num_sources: u64) -> u64 {
+    let total = crate::scalar::lance_format::io_buffer_size_override()
+        .unwrap_or_else(|| MERGE_BYTES_PER_IO_THREAD * io_parallelism.max(1) as u64);
+    (total / num_sources.max(1)).max(MERGE_BYTES_PER_IO_THREAD)
 }
 
 /// True if `filter` would keep no rows at all (its keep-set is empty), letting
@@ -3611,6 +3660,30 @@ mod tests {
             "scanning a {num_pages}-batch index took {iops} read IOPs; a decode plan \
              rebuilt per batch costs orders of magnitude more, and grows with page count"
         );
+    }
+
+    /// A whole-file plan's prefetch is bounded by its store's scheduler budget, and
+    /// `merge_segments` drains one store per source at the same time. Splitting the budget
+    /// is what keeps the merge's aggregate near a single scan's, and the floor is what
+    /// makes that "near" rather than "equal" past `io_parallelism` sources.
+    #[test]
+    fn test_merge_io_buffer_size_splits_one_scans_budget() {
+        const MIB: u64 = 1024 * 1024;
+        // Cloud default: 64 threads, so one scan gets 2 GiB.
+        assert_eq!(super::merge_io_buffer_size(64, 1), 2048 * MIB);
+        assert_eq!(super::merge_io_buffer_size(64, 4), 512 * MIB);
+        // Aggregate is conserved while the floor is not binding.
+        for sources in [1u64, 2, 8, 64] {
+            assert_eq!(
+                super::merge_io_buffer_size(64, sources) * sources,
+                2048 * MIB
+            );
+        }
+        // Past that the floor wins and the aggregate grows again, as documented.
+        assert_eq!(super::merge_io_buffer_size(64, 128), 32 * MIB);
+        // Local default of 8 threads, and degenerate inputs stay at the floor.
+        assert_eq!(super::merge_io_buffer_size(8, 1), 256 * MIB);
+        assert_eq!(super::merge_io_buffer_size(0, 0), 32 * MIB);
     }
 
     /// `batch_size` is read from the index file's own metadata, so a value that is a

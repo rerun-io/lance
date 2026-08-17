@@ -257,13 +257,28 @@ pub trait IndexReader: Send + Sync {
     ///
     /// This exists because building a decode plan is not free: for the v2 structural
     /// encoding, `DecodeBatchScheduler::try_new` runs `initialize()`, which initializes
-    /// *every page in the column* — it does not scope to the rows being requested. Reading
+    /// *every page in the column*, without scoping to the rows being requested. Reading
     /// a whole file as N independent `read_record_batch` calls therefore costs
     /// O(batches x pages) metadata reads instead of O(pages), and those reads are tiny
     /// (one chunk-metadata buffer per page, kilobytes apart) so nothing coalesces.
     ///
     /// A large index runs to thousands of pages, so this dominates the cost of a full
     /// scan. Callers that read a file end to end should prefer this method.
+    ///
+    /// # Memory profile
+    ///
+    /// Unlike a per-batch read, whose outstanding data is capped by its own readahead,
+    /// a whole-file plan is scheduled eagerly and its peak resident encoded bytes are
+    /// bounded only by the store's scheduler byte budget, which for [`IndexStore`]
+    /// implementations backed by `SchedulerConfig::max_bandwidth` is 32 MiB per I/O
+    /// thread (2 GiB at the cloud default of 64, 256 MiB at the local default of 8).
+    /// `batch_readahead` does not bound this; it bounds decode buffering only. None of
+    /// it is visible to a DataFusion memory pool.
+    ///
+    /// That budget is per store, so a caller that fans out over several stores at once
+    /// (see `BTreeIndex::merge_segments`, which opens one store per source segment)
+    /// multiplies it. Such callers should rescope each store first with
+    /// [`IndexStore::with_io_buffer_size`].
     async fn whole_file_stream(
         &self,
         _batch_size: u32,
@@ -296,6 +311,19 @@ pub trait IndexStore: std::fmt::Debug + Send + Sync + DeepSizeOf {
 
     /// Suggested I/O parallelism for the store
     fn io_parallelism(&self) -> usize;
+
+    /// Return an equivalent store whose scheduler holds at most `bytes` of outstanding
+    /// prefetched data.
+    ///
+    /// This is a hint, for callers that drive several stores concurrently and want the
+    /// aggregate prefetch to stay near what one store would have used on its own. Stores
+    /// that do not own a scheduler return themselves unchanged. Note that the underlying
+    /// budget is soft: a request is admitted regardless of remaining bytes when nothing
+    /// of lower priority is in flight, which is what guarantees forward progress at any
+    /// budget.
+    fn with_io_buffer_size(&self, _bytes: u64) -> Arc<dyn IndexStore> {
+        self.clone_arc()
+    }
 
     /// Create a new file and return a writer to store data in the file
     async fn new_index_file(&self, name: &str, schema: Arc<Schema>)
