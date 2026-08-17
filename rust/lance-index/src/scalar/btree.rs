@@ -52,7 +52,7 @@ use datafusion_physical_expr::{
     PhysicalExpr, PhysicalSortExpr, create_physical_expr, expressions::Column,
 };
 use futures::{
-    FutureExt, Stream, StreamExt, TryStreamExt,
+    FutureExt, Stream, StreamExt, TryFutureExt, TryStreamExt,
     future::BoxFuture,
     stream::{self, BoxStream},
 };
@@ -2764,12 +2764,14 @@ async fn merge_range_partitioned_lookups(
 
     for (idx, (part_id, part_lookup_file)) in sorted_part_lookup_files.into_iter().enumerate() {
         let lookup_reader = store.open_index_file(&part_lookup_file).await?;
-        let mut stream = stream_index_file(
-            lookup_reader.clone(),
-            batch_size,
-            batch_readhead.unwrap_or(1),
-        )
-        .await?;
+        // Deliberately NOT `stream_index_file`: this loop and `merge_pages` below build one
+        // stream per partition against a *shared* `store`, and every stream is constructed
+        // before the consumer polls any of them. A whole-file plan per partition would let
+        // partitions the consumer is not draining occupy the scheduler's byte budget — which
+        // is credited back only when a batch is polled — and stall the partition that is being
+        // drained. These two paths stay demand-paced at `buffered(1)`.
+        let reader_stream = IndexReaderStream::new(lookup_reader.clone(), batch_size).await;
+        let mut stream = reader_stream.buffered(batch_readhead.unwrap_or(1)).boxed();
         while let Some(batch) = stream.next().await {
             let original_batch = batch?;
             let modified_batch = add_offset_to_page_idx(&original_batch, num_pages_written)?;
@@ -2930,9 +2932,11 @@ async fn merge_pages(
 
         let reader = store.open_index_file(&page_file_name).await?;
 
-        let stream = stream_index_file(reader, batch_size, batch_readhead.unwrap_or(1))
-            .await?
-            .map_err(DataFusionError::from)
+        // Shared `store` across k partitions — see the note in `merge_range_partitioned_lookups`.
+        let reader_stream = IndexReaderStream::new(reader, batch_size).await;
+        let stream = reader_stream
+            .map(|fut| fut.map_err(DataFusionError::from))
+            .buffered(batch_readhead.unwrap_or(1))
             .boxed();
 
         let sendable_stream =
@@ -3125,8 +3129,12 @@ async fn stream_index_file(
     batch_size: u64,
     batch_readahead: usize,
 ) -> Result<BoxStream<'static, Result<RecordBatch>>> {
+    // Clamp rather than cast: `batch_size` comes from the index file's own metadata
+    // (`BATCH_SIZE_META_KEY`), so a `u64` that is a multiple of 2^32 would truncate to a
+    // `rows_per_batch` of 0 and yield an empty stream — silently retraining an empty index.
+    let batch_size_u32 = u32::try_from(batch_size).unwrap_or(u32::MAX).max(1);
     if let Some(stream) = reader
-        .whole_file_stream(batch_size as u32, batch_readahead.max(1) as u32)
+        .whole_file_stream(batch_size_u32, batch_readahead.max(1) as u32)
         .await?
     {
         return Ok(stream.boxed());
@@ -3548,7 +3556,9 @@ mod tests {
     #[tokio::test]
     async fn test_data_stream_builds_one_decode_plan() {
         const BATCH_SIZE: u64 = 64;
-        const ROWS: u64 = 10_000;
+        // Above `DEFAULT_INLINE_SCHEDULING_THRESHOLD` (16 Ki rows) so this exercises the
+        // *spawned* scheduling path that production uses, not the inline one.
+        const ROWS: u64 = 40_000;
 
         let tmpdir = TempObjDir::default();
         let object_store = Arc::new(ObjectStore::local());
@@ -3561,7 +3571,7 @@ mod tests {
         let data = gen_batch()
             .col("value", array::step::<Int32Type>())
             .col("_rowid", array::step::<UInt64Type>())
-            .into_df_exec(RowCount::from(100), BatchCount::from(100));
+            .into_df_exec(RowCount::from(100), BatchCount::from(400));
         let schema = data.schema();
         let sort_expr = PhysicalSortExpr::new_default(col("value", schema.as_ref()).unwrap());
         let plan = Arc::new(SortExec::new([sort_expr].into(), data));
@@ -3597,9 +3607,54 @@ mod tests {
         // fails loudly if the fast path stops being taken, but well above 4 so it does
         // not tighten into a flake if readahead or footer handling changes.
         assert!(
-            iops < 32,
+            iops < 64,
             "scanning a {num_pages}-batch index took {iops} read IOPs; a decode plan \
-             rebuilt per batch costs ~315 here, and far more on a file with many pages"
+             rebuilt per batch costs orders of magnitude more, and grows with page count"
+        );
+    }
+
+    /// `batch_size` is read from the index file's own metadata, so a value that is a
+    /// multiple of 2^32 used to truncate to a `rows_per_batch` of 0 — an empty stream that
+    /// silently retrained an empty index and reported success. It must clamp instead.
+    #[tokio::test]
+    async fn test_stream_index_file_clamps_oversized_batch_size() {
+        let tmpdir = TempObjDir::default();
+        let object_store = Arc::new(ObjectStore::local());
+        let test_store = Arc::new(LanceIndexStore::new(
+            object_store.clone(),
+            tmpdir.clone(),
+            Arc::new(LanceCache::no_cache()),
+        ));
+
+        let data = gen_batch()
+            .col("value", array::step::<Int32Type>())
+            .col("_rowid", array::step::<UInt64Type>())
+            .into_df_exec(RowCount::from(100), BatchCount::from(10));
+        let schema = data.schema();
+        let sort_expr = PhysicalSortExpr::new_default(col("value", schema.as_ref()).unwrap());
+        let plan = Arc::new(SortExec::new([sort_expr].into(), data));
+        let stream = plan.execute(0, Arc::new(TaskContext::default())).unwrap();
+        let stream = break_stream(stream, 64);
+        let stream = stream.map_err(DataFusionError::from);
+        let stream =
+            Box::pin(RecordBatchStreamAdapter::new(schema, stream)) as SendableRecordBatchStream;
+        train_btree_index(stream, test_store.as_ref(), 64, None, None)
+            .await
+            .unwrap();
+
+        let reader = test_store.open_index_file(BTREE_PAGES_NAME).await.unwrap();
+
+        // 2^32 truncates to 0 in a bare `as u32`.
+        let mut stream = super::stream_index_file(reader, 1u64 << 32, 8)
+            .await
+            .unwrap();
+        let mut rows = 0usize;
+        while let Some(batch) = stream.try_next().await.unwrap() {
+            rows += batch.num_rows();
+        }
+        assert_eq!(
+            rows, 1000,
+            "oversized batch_size must not yield an empty stream"
         );
     }
 
