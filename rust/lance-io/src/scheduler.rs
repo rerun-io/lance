@@ -270,6 +270,7 @@ struct MutableBatch<F: FnOnce(Response) + Send> {
     err: Option<Box<dyn std::error::Error + Send + Sync + 'static>>,
     // When true, report 0 bytes consumed so the backpressure budget is unaffected
     bypass_backpressure: bool,
+    io_queue: Arc<IoQueue>,
 }
 
 impl<F: FnOnce(Response) + Send> MutableBatch<F> {
@@ -279,6 +280,7 @@ impl<F: FnOnce(Response) + Send> MutableBatch<F> {
         priority: u128,
         num_reqs: usize,
         bypass_backpressure: bool,
+        io_queue: Arc<IoQueue>,
     ) -> Self {
         Self {
             when_done: Some(when_done),
@@ -289,6 +291,7 @@ impl<F: FnOnce(Response) + Send> MutableBatch<F> {
             num_delivered: 0,
             err: None,
             bypass_backpressure,
+            io_queue,
         }
     }
 }
@@ -317,7 +320,7 @@ impl<F: FnOnce(Response) + Send> Drop for MutableBatch<F> {
         // We don't really care if no one is around to receive it, just let
         // the result go out of scope and get cleaned up
         let response = Response {
-            data: result,
+            data: Some(result),
             // Report 0 bytes for bypass tasks so the backpressure budget is unaffected
             num_bytes: if self.bypass_backpressure {
                 0
@@ -326,6 +329,7 @@ impl<F: FnOnce(Response) + Send> Drop for MutableBatch<F> {
             },
             priority: self.priority,
             num_reqs: self.num_reqs,
+            io_queue: self.io_queue.clone(),
         };
         (self.when_done.take().unwrap())(response);
     }
@@ -599,11 +603,39 @@ impl Debug for ScanScheduler {
     }
 }
 
+/// A completed I/O request, carrying the backpressure accounting for its own bytes.
+///
+/// The budget is debited when the task is dispatched and must be credited exactly once. Doing
+/// that in `Drop` rather than at the consumption site means an abandoned request cannot leak
+/// it: whether the consumer polls the response, drops the future before the I/O lands, or
+/// drops it afterwards leaving the value in the channel, the credit happens.
+///
+/// Leaking it is not merely a lost budget. `IoQueue::can_deliver` admits any task whose
+/// priority is `<= priorities_in_flight.min_in_flight()`, so a leaked entry pins that floor
+/// forever: reads below it bypass backpressure entirely, and reads above it block against a
+/// budget that never recovers.
 struct Response {
-    data: Result<Vec<Bytes>>,
+    /// `take`n by the consumer; `Drop` still runs and credits the budget either way.
+    data: Option<Result<Vec<Bytes>>>,
     priority: u128,
     num_reqs: usize,
     num_bytes: u64,
+    io_queue: Arc<IoQueue>,
+}
+
+impl Response {
+    fn take_data(&mut self) -> Result<Vec<Bytes>> {
+        self.data
+            .take()
+            .expect("Response::take_data called more than once")
+    }
+}
+
+impl Drop for Response {
+    fn drop(&mut self) {
+        self.io_queue
+            .on_bytes_consumed(self.num_bytes, self.priority, self.num_reqs);
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -762,6 +794,7 @@ impl ScanScheduler {
             priority,
             request.len(),
             bypass_backpressure,
+            io_queue.clone(),
         ))));
 
         for (task_idx, iop) in request.into_iter().enumerate() {
@@ -800,14 +833,12 @@ impl ScanScheduler {
 
         self.do_submit_request(reader, request, tx, priority, io_queue, bypass_backpressure);
 
-        let io_queue_clone = io_queue.clone();
-
         rx.map(move |wrapped_rsp| {
             // Right now, it isn't possible for I/O to be cancelled so a cancel error should
             // not occur
-            let rsp = wrapped_rsp.unwrap();
-            io_queue_clone.on_bytes_consumed(rsp.num_bytes, rsp.priority, rsp.num_reqs);
-            rsp.data
+            let mut rsp = wrapped_rsp.unwrap();
+            // `Response::drop` credits the backpressure budget; see its doc comment.
+            rsp.take_data()
         })
     }
 
@@ -1158,6 +1189,7 @@ mod tests {
 
     #[test]
     fn test_batch_with_undelivered_slot_is_error() {
+        let io_queue = Arc::new(IoQueue::new(1, 1000));
         let response = Arc::new(Mutex::new(None));
         let response_clone = response.clone();
         let batch = MutableBatch::new(
@@ -1166,10 +1198,11 @@ mod tests {
             0, // priority
             2, // num_reqs
             false,
+            io_queue,
         );
         drop(batch);
 
-        let data = response.lock().unwrap().take().unwrap().data;
+        let data = response.lock().unwrap().take().unwrap().take_data();
         assert!(
             data.is_err(),
             "undelivered slot must yield an error, got {data:?}",
@@ -1773,6 +1806,41 @@ mod tests {
         assert_eq!(bytes2[0].len(), 1000);
         assert_eq!(bytes3[0].len(), 1000);
         assert_eq!(get_range_count.load(Ordering::Acquire), 3);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_dropped_request_credits_backpressure_budget() {
+        // Dropping a request's future without polling it must return its bytes to the
+        // backpressure budget. Previously the credit happened only in the consumer's
+        // `rx.map`, so an abandoned request leaked both the bytes and its
+        // `priorities_in_flight` entry — and because `can_deliver` admits anything at or
+        // below `min_in_flight()`, that leaked entry pinned the floor forever: later reads
+        // at a higher priority could never dispatch.
+        let obj_store = Arc::new(ObjectStore::memory());
+        let config = SchedulerConfig {
+            io_buffer_size_bytes: 1000,
+            use_lite_scheduler: Some(false),
+        };
+        let scheduler = ScanScheduler::new(obj_store, config);
+
+        let get_range_count = Arc::new(AtomicU64::new(0));
+        let reader: Arc<dyn Reader> = Arc::new(TrackingReader {
+            get_range_count: get_range_count.clone(),
+            path: Path::parse("test").unwrap(),
+        });
+
+        // Consume the whole budget, then abandon it unpolled.
+        let abandoned = scheduler.submit_request(reader.clone(), vec![0..1000], 100, false);
+        drop(abandoned);
+
+        // A later, lower-priority (numerically higher) read needs the budget back. Before
+        // the fix this timed out.
+        let later = scheduler.submit_request(reader.clone(), vec![1000..2000], 200, false);
+        let bytes = timeout(Duration::from_secs(10), later)
+            .await
+            .expect("budget was never credited back after the request was dropped")
+            .unwrap();
+        assert_eq!(bytes[0].len(), 1000);
     }
 
     #[tokio::test(flavor = "multi_thread")]
