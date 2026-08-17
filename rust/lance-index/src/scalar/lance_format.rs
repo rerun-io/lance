@@ -30,6 +30,23 @@ use std::collections::HashMap;
 use std::pin::Pin;
 use std::{any::Any, sync::Arc};
 
+/// The user-set value of `LANCE_DEFAULT_IO_BUFFER_SIZE`, or `None` when it is unset or
+/// unparsable.
+///
+/// `SchedulerConfig::max_bandwidth` sizes an index store's prefetch budget from the I/O
+/// thread count, so without this the only way to shrink it is `LANCE_IO_THREADS`, which
+/// also cuts concurrency. Read on each call so tests can mutate the environment.
+pub(crate) fn io_buffer_size_override() -> Option<u64> {
+    let raw = std::env::var("LANCE_DEFAULT_IO_BUFFER_SIZE").ok()?;
+    match raw.parse() {
+        Ok(bytes) => Some(bytes),
+        Err(err) => {
+            log::warn!("ignoring unparsable LANCE_DEFAULT_IO_BUFFER_SIZE={raw:?}: {err}");
+            None
+        }
+    }
+}
+
 /// An index store that serializes scalar indices using the lance format
 ///
 /// Scalar indices are made up of named collections of record batches.  This
@@ -77,10 +94,11 @@ impl LanceIndexStore {
         metadata_cache: Arc<LanceCache>,
         format_version: LanceFileVersion,
     ) -> Self {
-        let scheduler = ScanScheduler::new(
-            object_store.clone(),
-            SchedulerConfig::max_bandwidth(&object_store),
-        );
+        let config = match io_buffer_size_override() {
+            Some(bytes) => SchedulerConfig::new(bytes),
+            None => SchedulerConfig::max_bandwidth(&object_store),
+        };
+        let scheduler = ScanScheduler::new(object_store.clone(), config);
         Self {
             object_store,
             index_dir,
@@ -431,6 +449,16 @@ impl IndexStore for LanceIndexStore {
 
     fn io_parallelism(&self) -> usize {
         self.object_store.io_parallelism()
+    }
+
+    fn with_io_buffer_size(&self, bytes: u64) -> Arc<dyn IndexStore> {
+        // The metadata cache is shared with the original store, so files already opened
+        // through it stay cached; only the scheduler, and therefore the prefetch budget,
+        // is private to the returned store.
+        let mut scoped = self.clone();
+        scoped.scheduler =
+            ScanScheduler::new(self.object_store.clone(), SchedulerConfig::new(bytes));
+        Arc::new(scoped)
     }
 
     async fn new_index_file(
