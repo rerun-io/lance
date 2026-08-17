@@ -82,6 +82,11 @@ impl LanceIndexStore {
         metadata_cache: Arc<LanceCache>,
         format_version: ConcreteFileVersion,
     ) -> Self {
+        // Deliberately not consulting any process-wide buffer-size env var here: this
+        // constructor is on the query path too (`open_scalar_index` builds one per scalar
+        // index a scan opens), so a knob set for one workload would silently retune the
+        // other. Callers that need a smaller budget ask for it explicitly, via
+        // `IndexStore::with_io_buffer_size`.
         let scheduler = ScanScheduler::new(
             object_store.clone(),
             SchedulerConfig::max_bandwidth(&object_store),
@@ -443,6 +448,16 @@ impl IndexStore for LanceIndexStore {
 
     fn io_parallelism(&self) -> usize {
         self.object_store.io_parallelism()
+    }
+
+    fn with_io_buffer_size(&self, bytes: u64) -> Arc<dyn IndexStore> {
+        // The metadata cache is shared with the original store, so files already opened
+        // through it stay cached; only the scheduler, and therefore the prefetch budget,
+        // is private to the returned store.
+        let mut scoped = self.clone();
+        scoped.scheduler =
+            ScanScheduler::new(self.object_store.clone(), SchedulerConfig::new(bytes));
+        Arc::new(scoped)
     }
 
     async fn new_index_file(
