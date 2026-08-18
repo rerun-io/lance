@@ -1780,7 +1780,13 @@ async fn rewrite_files(
             let captured_ids = row_ids_rx
                 .try_recv()
                 .map_err(|err| Error::internal(format!("Failed to receive row ids: {}", err)))?;
-            let row_addrs = captured_ids.row_addrs(None).into_owned();
+            let mut row_addrs = captured_ids.row_addrs(None).into_owned();
+            // Compaction rewrites long contiguous spans of addresses, which roaring
+            // stores as dense bitmap containers unless asked otherwise: one bit per row,
+            // so a large table costs tens of megabytes here. `optimize` converts those to
+            // run containers, a few bytes per span. This payload is read on every index
+            // open, so it is worth shrinking at rest.
+            row_addrs.optimize();
             let mut serialized = Vec::with_capacity(row_addrs.serialized_size());
             row_addrs.serialize_into(&mut serialized)?;
             Ok(Some(serialized))
