@@ -31,10 +31,10 @@ use lance::dataset::optimize::{CompactionOptions, compact_files};
 use lance::dataset::{Dataset, WriteParams};
 use lance::index::{DatasetIndexExt, DatasetIndexInternalExt};
 use lance::session::Session;
+use lance_index::IndexType;
 use lance_index::frag_reuse::FRAG_REUSE_INDEX_NAME;
 use lance_index::metrics::NoOpMetricsCollector;
 use lance_index::scalar::ScalarIndexParams;
-use lance_index::IndexType;
 use lance_io::object_store::ObjectStoreRegistry;
 
 #[tokio::test]
@@ -77,7 +77,7 @@ async fn test_open_frag_reuse_index_does_not_deadlock_with_tiny_index_cache() {
         .unwrap();
 
     // (b) Compaction with deferred index remap creates the frag-reuse index.
-    let metrics = compact_files(
+    compact_files(
         &mut dataset,
         CompactionOptions {
             target_rows_per_fragment: 2_000,
@@ -88,14 +88,8 @@ async fn test_open_frag_reuse_index_does_not_deadlock_with_tiny_index_cache() {
     )
     .await
     .unwrap();
-    println!(
-        "compaction done: {} fragments removed, {} added",
-        metrics.fragments_removed, metrics.fragments_added
-    );
 
     let indices = dataset.load_indices().await.unwrap();
-    let names: Vec<_> = indices.iter().map(|i| i.name.clone()).collect();
-    println!("indices after compaction: {names:?}");
     assert!(
         indices.iter().any(|i| i.name == FRAG_REUSE_INDEX_NAME),
         "frag-reuse index was not created by deferred-remap compaction"
@@ -116,8 +110,6 @@ async fn test_open_frag_reuse_index_does_not_deadlock_with_tiny_index_cache() {
         .unwrap();
 
     // (d) Call the poisoned path with a 20s timeout.
-    println!("calling open_frag_reuse_index (20s timeout)...");
-    let started = std::time::Instant::now();
     let result = tokio::time::timeout(
         Duration::from_secs(20),
         dataset.open_frag_reuse_index(&NoOpMetricsCollector),
@@ -125,12 +117,8 @@ async fn test_open_frag_reuse_index_does_not_deadlock_with_tiny_index_cache() {
     .await;
 
     match result {
-        Ok(Ok(Some(_fri))) => {
-            println!(
-                "OK: open_frag_reuse_index returned the frag-reuse index in {:?}",
-                started.elapsed()
-            );
-        }
+        // Success: open_frag_reuse_index returned the frag-reuse index within the timeout.
+        Ok(Ok(Some(_fri))) => {}
         Ok(Ok(None)) => panic!("unexpected: open_frag_reuse_index returned None (FRI exists)"),
         Ok(Err(e)) => panic!("unexpected error from open_frag_reuse_index: {e}"),
         Err(_elapsed) => panic!(
