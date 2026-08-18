@@ -3417,8 +3417,13 @@ impl ScalarIndexPlugin for BTreeIndexPlugin {
 
 #[cfg(test)]
 mod tests {
+    use std::pin::Pin;
     use std::sync::atomic::Ordering;
     use std::{collections::HashMap, sync::Arc};
+
+    use async_trait::async_trait;
+
+    use super::super::IndexReader;
 
     use arrow::datatypes::{Float32Type, Float64Type, Int32Type, UInt64Type};
     use arrow_array::{FixedSizeListArray, record_batch};
@@ -3428,6 +3433,7 @@ mod tests {
     };
     use datafusion_common::{DataFusionError, ScalarValue};
     use datafusion_physical_expr::{PhysicalSortExpr, expressions::col};
+    use futures::FutureExt;
     use futures::TryStreamExt;
     use futures::stream;
     use lance_core::cache::LanceCache;
@@ -3683,6 +3689,290 @@ mod tests {
         // Local default of 8 threads, and degenerate inputs stay at the floor.
         assert_eq!(super::merge_io_buffer_size(8, 1), 256 * MIB);
         assert_eq!(super::merge_io_buffer_size(0, 0), 32 * MIB);
+    }
+
+    /// Build a btree index of `rows` rows in a fresh store and return both.
+    async fn build_index_for_scan(
+        index_dir: Path,
+        object_store: Arc<ObjectStore>,
+        rows: u64,
+        batch_size: u64,
+    ) -> Arc<LanceIndexStore> {
+        let store = Arc::new(LanceIndexStore::new(
+            object_store,
+            index_dir,
+            Arc::new(LanceCache::no_cache()),
+        ));
+        let data = gen_batch()
+            .col("value", array::step::<Int32Type>())
+            .col("_rowid", array::step::<UInt64Type>())
+            .into_df_exec(RowCount::from(100), BatchCount::from((rows / 100) as u32));
+        let schema = data.schema();
+        let sort_expr = PhysicalSortExpr::new_default(col("value", schema.as_ref()).unwrap());
+        let plan = Arc::new(SortExec::new([sort_expr].into(), data));
+        let stream = plan.execute(0, Arc::new(TaskContext::default())).unwrap();
+        let stream = break_stream(stream, batch_size as usize);
+        let stream = stream.map_err(DataFusionError::from);
+        let stream =
+            Box::pin(RecordBatchStreamAdapter::new(schema, stream)) as SendableRecordBatchStream;
+        train_btree_index(stream, store.as_ref(), batch_size, None, None)
+            .await
+            .unwrap();
+        store
+    }
+
+    /// T1. A whole-file scan must respect the store's byte budget.
+    ///
+    /// The review objection this answers: a whole-file decode plan is scheduled eagerly, so
+    /// its outstanding bytes are bounded only by the scheduler budget, and nothing reported
+    /// that quantity. Now it does, so assert it rather than argue about it.
+    ///
+    /// The bound is deliberately budget + `max_iop_size`: the budget is soft by design, since
+    /// `can_deliver` admits a request whose priority is at or below everything in flight even
+    /// when the budget is exhausted, which is what guarantees forward progress. One such
+    /// admission can exceed the ceiling by at most one split request.
+    #[tokio::test]
+    async fn test_whole_file_scan_respects_the_byte_budget() {
+        const BATCH_SIZE: u64 = 64;
+        const ROWS: u64 = 40_000;
+        const MAX_IOP_SIZE: u64 = 16 * 1024 * 1024;
+
+        let tmpdir = TempObjDir::default();
+        let object_store = Arc::new(ObjectStore::local());
+        let store = build_index_for_scan(tmpdir.clone(), object_store, ROWS, BATCH_SIZE).await;
+
+        for budget in [1024 * 1024u64, 32 * 1024 * 1024] {
+            let scoped = store.with_io_buffer_size(budget);
+            let scoped_lance = scoped
+                .as_any()
+                .downcast_ref::<LanceIndexStore>()
+                .expect("with_io_buffer_size returns a LanceIndexStore");
+            let index = BTreeIndex::load(scoped.clone(), None, &LanceCache::no_cache())
+                .await
+                .unwrap();
+
+            let mut stream = index.data_stream().await.unwrap();
+            let mut rows_seen = 0u64;
+            while let Some(batch) = stream.try_next().await.unwrap() {
+                rows_seen += batch.num_rows() as u64;
+            }
+            assert_eq!(rows_seen, ROWS);
+
+            let bp = scoped_lance.scheduler().backpressure_stats();
+            assert_eq!(bp.io_buffer_size, budget, "store was not rescoped");
+            // Without this the bound below would pass vacuously if the gauge never moved.
+            assert!(
+                bp.max_bytes_in_flight > 0,
+                "no bytes were ever recorded in flight; the bound proves nothing"
+            );
+            assert!(
+                bp.max_bytes_in_flight <= budget + MAX_IOP_SIZE,
+                "whole-file scan held {} bytes in flight against a {} byte budget \
+                 ({} priority-bypass admissions); the budget is soft but not this soft",
+                bp.max_bytes_in_flight,
+                budget,
+                bp.priority_bypass_admissions
+            );
+        }
+    }
+
+    /// T2. Abandoning a scan part-way must return the whole budget.
+    ///
+    /// A whole-file plan has far more outstanding when it is dropped than a 4096-row plan
+    /// did, so any leak in the credit path is proportionally worse here. Drop at three
+    /// depths and require that a later read on the same store still completes.
+    #[tokio::test]
+    async fn test_dropping_a_scan_part_way_returns_the_budget() {
+        const BATCH_SIZE: u64 = 64;
+        const ROWS: u64 = 40_000;
+
+        let tmpdir = TempObjDir::default();
+        let object_store = Arc::new(ObjectStore::local());
+        let store = build_index_for_scan(tmpdir.clone(), object_store, ROWS, BATCH_SIZE).await;
+
+        for stop_after in [1usize, 32, 256] {
+            let scoped = store.with_io_buffer_size(1024 * 1024);
+            let index = BTreeIndex::load(scoped.clone(), None, &LanceCache::no_cache())
+                .await
+                .unwrap();
+
+            {
+                let mut stream = index.data_stream().await.unwrap();
+                let mut batches = 0usize;
+                while (stream.try_next().await.unwrap()).is_some() {
+                    batches += 1;
+                    if batches >= stop_after {
+                        break;
+                    }
+                }
+                assert_eq!(batches, stop_after, "fixture too small to stop this late");
+            }
+
+            // The abandoned scan must not have stranded any of the budget: a full scan on
+            // the same store has to complete. Without the credit-on-drop fix this hangs.
+            let mut stream = index.data_stream().await.unwrap();
+            let mut rows_seen = 0u64;
+            while let Some(batch) =
+                tokio::time::timeout(std::time::Duration::from_secs(30), stream.try_next())
+                    .await
+                    .expect("scan after an abandoned scan stalled; budget was leaked")
+                    .unwrap()
+            {
+                rows_seen += batch.num_rows() as u64;
+            }
+            assert_eq!(
+                rows_seen, ROWS,
+                "scan after dropping at batch {stop_after} did not complete"
+            );
+        }
+    }
+
+    /// A reader that refuses to serve a whole-file scan.
+    struct NoWholeFileReader(Arc<dyn IndexReader>);
+
+    impl std::fmt::Debug for NoWholeFileReader {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("NoWholeFileReader")
+        }
+    }
+
+    #[async_trait]
+    impl IndexReader for NoWholeFileReader {
+        async fn read_record_batch(
+            &self,
+            n: u64,
+            batch_size: u64,
+        ) -> lance_core::Result<RecordBatch> {
+            self.0.read_record_batch(n, batch_size).await
+        }
+        async fn read_range(
+            &self,
+            range: std::ops::Range<usize>,
+            projection: Option<&[&str]>,
+        ) -> lance_core::Result<RecordBatch> {
+            self.0.read_range(range, projection).await
+        }
+        async fn whole_file_stream(
+            &self,
+            _batch_size: u32,
+            _batch_readahead: u32,
+        ) -> lance_core::Result<Option<Pin<Box<dyn lance_io::stream::RecordBatchStream>>>> {
+            panic!("the search path must not take the whole-file scan path");
+        }
+        async fn num_batches(&self, batch_size: u64) -> u32 {
+            self.0.num_batches(batch_size).await
+        }
+        fn num_rows(&self) -> usize {
+            self.0.num_rows()
+        }
+        fn schema(&self) -> &lance_core::datatypes::Schema {
+            self.0.schema()
+        }
+    }
+
+    /// Wraps a store so every reader it hands out panics on a whole-file scan.
+    #[derive(Debug)]
+    struct NoWholeFileStore(Arc<dyn IndexStore>);
+
+    impl DeepSizeOf for NoWholeFileStore {
+        fn deep_size_of_children(&self, _: &mut lance_core::deepsize::Context) -> usize {
+            0
+        }
+    }
+
+    #[async_trait]
+    impl IndexStore for NoWholeFileStore {
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+        fn clone_arc(&self) -> Arc<dyn IndexStore> {
+            Arc::new(Self(self.0.clone()))
+        }
+        fn io_parallelism(&self) -> usize {
+            self.0.io_parallelism()
+        }
+        async fn new_index_file(
+            &self,
+            name: &str,
+            schema: Arc<arrow_schema::Schema>,
+        ) -> lance_core::Result<Box<dyn crate::scalar::IndexWriter>> {
+            self.0.new_index_file(name, schema).await
+        }
+        async fn open_index_file(&self, name: &str) -> lance_core::Result<Arc<dyn IndexReader>> {
+            let inner = self.0.open_index_file(name).await?;
+            Ok(Arc::new(NoWholeFileReader(inner)))
+        }
+        async fn copy_index_file(
+            &self,
+            name: &str,
+            dest_store: &dyn IndexStore,
+        ) -> lance_core::Result<crate::scalar::IndexFile> {
+            self.0.copy_index_file(name, dest_store).await
+        }
+        async fn rename_index_file(
+            &self,
+            name: &str,
+            new_name: &str,
+        ) -> lance_core::Result<crate::scalar::IndexFile> {
+            self.0.rename_index_file(name, new_name).await
+        }
+        async fn delete_index_file(&self, name: &str) -> lance_core::Result<()> {
+            self.0.delete_index_file(name).await
+        }
+        async fn list_files_with_sizes(&self) -> lance_core::Result<Vec<crate::scalar::IndexFile>> {
+            self.0.list_files_with_sizes().await
+        }
+    }
+
+    /// T3. The query path must not reach the whole-file scan.
+    ///
+    /// `whole_file_stream` is wired into three maintenance call sites; searches do point
+    /// lookups through `read_range`. Assert that structurally by handing the index a reader
+    /// that panics if anyone asks it for a whole-file stream, so a future change that routes
+    /// a search through one fails here instead of in production.
+    #[tokio::test]
+    async fn test_search_path_never_takes_the_whole_file_scan() {
+        const BATCH_SIZE: u64 = 64;
+        const ROWS: u64 = 40_000;
+
+        let tmpdir = TempObjDir::default();
+        let object_store = Arc::new(ObjectStore::local());
+        let store = build_index_for_scan(tmpdir.clone(), object_store, ROWS, BATCH_SIZE).await;
+
+        let guarded: Arc<dyn IndexStore> = Arc::new(NoWholeFileStore(store));
+        let index = BTreeIndex::load(guarded, None, &LanceCache::no_cache())
+            .await
+            .unwrap();
+
+        // Positive control: a maintenance scan through the same store must hit the guard.
+        // Without this, the searches below could pass simply because the guard is never
+        // consulted, and the test would prove nothing.
+        let reached = std::panic::AssertUnwindSafe(async {
+            let mut scan = index.data_stream().await.unwrap();
+            while (scan.try_next().await.unwrap()).is_some() {}
+        })
+        .catch_unwind()
+        .await
+        .is_err();
+        assert!(
+            reached,
+            "the guard was never consulted; this test is vacuous"
+        );
+
+        // Equality, range and IS NULL: the three shapes a btree serves.
+        for query in [
+            SargableQuery::Equals(ScalarValue::Int32(Some(17))),
+            SargableQuery::Range(
+                std::ops::Bound::Included(ScalarValue::Int32(Some(10))),
+                std::ops::Bound::Excluded(ScalarValue::Int32(Some(4000))),
+            ),
+            SargableQuery::IsNull(),
+        ] {
+            index
+                .search(&query, &NoOpMetricsCollector)
+                .await
+                .expect("search failed");
+        }
     }
 
     /// `batch_size` is read from the index file's own metadata, so a value that is a
