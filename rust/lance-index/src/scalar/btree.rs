@@ -3694,6 +3694,22 @@ mod tests {
         assert_eq!(super::merge_io_buffer_size(0, 0), 32 * MIB);
     }
 
+    /// A sorted `(value, _rowid)` stream of `rows` rows, the shape `train_btree_index`
+    /// and `merge_segments` both consume.
+    fn sorted_training_stream(rows: u64, batch_size: u64) -> SendableRecordBatchStream {
+        let data = gen_batch()
+            .col("value", array::step::<Int32Type>())
+            .col("_rowid", array::step::<UInt64Type>())
+            .into_df_exec(RowCount::from(100), BatchCount::from((rows / 100) as u32));
+        let schema = data.schema();
+        let sort_expr = PhysicalSortExpr::new_default(col("value", schema.as_ref()).unwrap());
+        let plan = Arc::new(SortExec::new([sort_expr].into(), data));
+        let stream = plan.execute(0, Arc::new(TaskContext::default())).unwrap();
+        let stream = break_stream(stream, batch_size as usize);
+        let stream = stream.map_err(DataFusionError::from);
+        Box::pin(RecordBatchStreamAdapter::new(schema, stream)) as SendableRecordBatchStream
+    }
+
     /// Build a btree index of `rows` rows in a fresh store and return both.
     async fn build_index_for_scan(
         index_dir: Path,
@@ -3706,18 +3722,7 @@ mod tests {
             index_dir,
             Arc::new(LanceCache::no_cache()),
         ));
-        let data = gen_batch()
-            .col("value", array::step::<Int32Type>())
-            .col("_rowid", array::step::<UInt64Type>())
-            .into_df_exec(RowCount::from(100), BatchCount::from((rows / 100) as u32));
-        let schema = data.schema();
-        let sort_expr = PhysicalSortExpr::new_default(col("value", schema.as_ref()).unwrap());
-        let plan = Arc::new(SortExec::new([sort_expr].into(), data));
-        let stream = plan.execute(0, Arc::new(TaskContext::default())).unwrap();
-        let stream = break_stream(stream, batch_size as usize);
-        let stream = stream.map_err(DataFusionError::from);
-        let stream =
-            Box::pin(RecordBatchStreamAdapter::new(schema, stream)) as SendableRecordBatchStream;
+        let stream = sorted_training_stream(rows, batch_size);
         train_btree_index(stream, store.as_ref(), batch_size, None, None)
             .await
             .unwrap();
@@ -3975,6 +3980,223 @@ mod tests {
                 .search(&query, &NoOpMetricsCollector)
                 .await
                 .expect("search failed");
+        }
+    }
+
+    /// Records every store `with_io_buffer_size` hands out, so a test can reach the
+    /// schedulers `merge_segments` actually drained. All other calls pass through.
+    #[derive(Debug)]
+    struct RescopeRecordingStore {
+        inner: Arc<dyn IndexStore>,
+        rescoped: Arc<std::sync::Mutex<Vec<Arc<dyn IndexStore>>>>,
+    }
+
+    impl DeepSizeOf for RescopeRecordingStore {
+        fn deep_size_of_children(&self, _: &mut lance_core::deepsize::Context) -> usize {
+            0
+        }
+    }
+
+    #[async_trait]
+    impl IndexStore for RescopeRecordingStore {
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+        fn clone_arc(&self) -> Arc<dyn IndexStore> {
+            Arc::new(Self {
+                inner: self.inner.clone(),
+                rescoped: self.rescoped.clone(),
+            })
+        }
+        fn io_parallelism(&self) -> usize {
+            self.inner.io_parallelism()
+        }
+        fn with_io_buffer_size(&self, bytes: u64) -> Arc<dyn IndexStore> {
+            let scoped = self.inner.with_io_buffer_size(bytes);
+            self.rescoped.lock().unwrap().push(scoped.clone());
+            scoped
+        }
+        async fn new_index_file(
+            &self,
+            name: &str,
+            schema: Arc<arrow_schema::Schema>,
+        ) -> lance_core::Result<Box<dyn crate::scalar::IndexWriter>> {
+            self.inner.new_index_file(name, schema).await
+        }
+        async fn open_index_file(&self, name: &str) -> lance_core::Result<Arc<dyn IndexReader>> {
+            self.inner.open_index_file(name).await
+        }
+        async fn copy_index_file(
+            &self,
+            name: &str,
+            dest_store: &dyn IndexStore,
+        ) -> lance_core::Result<crate::scalar::IndexFile> {
+            self.inner.copy_index_file(name, dest_store).await
+        }
+        async fn rename_index_file(
+            &self,
+            name: &str,
+            new_name: &str,
+        ) -> lance_core::Result<crate::scalar::IndexFile> {
+            self.inner.rename_index_file(name, new_name).await
+        }
+        async fn delete_index_file(&self, name: &str) -> lance_core::Result<()> {
+            self.inner.delete_index_file(name).await
+        }
+        async fn list_files_with_sizes(&self) -> lance_core::Result<Vec<crate::scalar::IndexFile>> {
+            self.inner.list_files_with_sizes().await
+        }
+    }
+
+    /// T4. `merge_segments` must bound its aggregate prefetch across N sources.
+    ///
+    /// The review objection this answers: every source's whole-file plan starts
+    /// prefetching the moment it is built, each against its own store, so an N-way merge
+    /// holds N budgets of encoded bytes unless something splits them. T1 proved one scan
+    /// respects one store's budget; this proves the merge hands every source a 1/N share,
+    /// drains all N through those rescoped stores and nothing else, and still merges
+    /// correctly. Together the two bound the aggregate at
+    /// `max(one scan's budget, N * 32 MiB)` plus one split request per source.
+    #[tokio::test]
+    #[allow(clippy::print_stderr)] // measured peaks are the point; visible via --nocapture
+    async fn test_merge_segments_bounds_aggregate_prefetch() {
+        const BATCH_SIZE: u64 = 64;
+        const ROWS: u64 = 40_000;
+        const NEW_ROWS: u64 = 1_000;
+        const MIB: u64 = 1024 * 1024;
+        const MAX_IOP_SIZE: u64 = 16 * MIB;
+
+        for num_segments in [2usize, 4, 8] {
+            let object_store = Arc::new(ObjectStore::local());
+            let io_parallelism = object_store.io_parallelism();
+            let expected_budget = super::merge_io_buffer_size(io_parallelism, num_segments as u64);
+
+            let mut tmpdirs = Vec::new();
+            let mut originals = Vec::new();
+            let mut recorders = Vec::new();
+            let mut segments = Vec::new();
+            for _ in 0..num_segments {
+                let tmpdir = TempObjDir::default();
+                let store =
+                    build_index_for_scan(tmpdir.clone(), object_store.clone(), ROWS, BATCH_SIZE)
+                        .await;
+                let recorder = Arc::new(RescopeRecordingStore {
+                    inner: store.clone(),
+                    rescoped: Arc::new(std::sync::Mutex::new(Vec::new())),
+                });
+                let index = BTreeIndex::load(
+                    recorder.clone() as Arc<dyn IndexStore>,
+                    None,
+                    &LanceCache::no_cache(),
+                )
+                .await
+                .unwrap();
+                segments.push(index);
+                originals.push(store);
+                recorders.push(recorder);
+                tmpdirs.push(tmpdir);
+            }
+
+            // Everything the merge reads must go through the rescoped stores, so the
+            // original schedulers have to end the merge exactly where they start it.
+            let before: Vec<_> = originals
+                .iter()
+                .map(|store| store.scheduler().backpressure_stats().max_bytes_in_flight)
+                .collect();
+
+            let dest_dir = TempObjDir::default();
+            let dest_store = Arc::new(LanceIndexStore::new(
+                object_store.clone(),
+                dest_dir.clone(),
+                Arc::new(LanceCache::no_cache()),
+            ));
+            let filters: Vec<Option<OldIndexDataFilter>> = vec![None; num_segments];
+            BTreeIndex::merge_segments(
+                &segments,
+                sorted_training_stream(NEW_ROWS, BATCH_SIZE),
+                dest_store.as_ref(),
+                &filters,
+            )
+            .await
+            .unwrap();
+
+            // Each source was rescoped exactly once, to a 1/N share of one scan's budget.
+            let mut aggregate_peak = 0u64;
+            for (i, recorder) in recorders.iter().enumerate() {
+                let handed_out = recorder.rescoped.lock().unwrap();
+                assert_eq!(
+                    handed_out.len(),
+                    1,
+                    "segment {i} was rescoped {} times, expected exactly once",
+                    handed_out.len()
+                );
+                let scoped = handed_out[0]
+                    .as_any()
+                    .downcast_ref::<LanceIndexStore>()
+                    .expect("rescoping a LanceIndexStore yields a LanceIndexStore");
+                let bp = scoped.scheduler().backpressure_stats();
+                assert_eq!(
+                    bp.io_buffer_size, expected_budget,
+                    "segment {i} of {num_segments} got budget {}, expected {}",
+                    bp.io_buffer_size, expected_budget
+                );
+                // Without this the bounds below pass vacuously if a stream never ran.
+                assert!(
+                    bp.max_bytes_in_flight > 0,
+                    "segment {i} recorded no bytes in flight; the bound proves nothing"
+                );
+                assert!(
+                    bp.max_bytes_in_flight <= expected_budget + MAX_IOP_SIZE,
+                    "segment {i} held {} bytes against a {} byte budget \
+                     ({} priority-bypass admissions)",
+                    bp.max_bytes_in_flight,
+                    expected_budget,
+                    bp.priority_bypass_admissions
+                );
+                aggregate_peak += bp.max_bytes_in_flight;
+                // Visible under --nocapture so a reviewer sees measured peaks, not
+                // just that the asserts held.
+                eprintln!(
+                    "merge N={num_segments} segment {i}: budget={} peak_in_flight={} bypasses={}",
+                    bp.io_buffer_size, bp.max_bytes_in_flight, bp.priority_bypass_admissions
+                );
+            }
+
+            // The documented aggregate bound. Summing per-store peaks overstates the true
+            // simultaneous peak (they need not coincide), so this can only fail on the
+            // conservative side.
+            let one_scan = super::MERGE_BYTES_PER_IO_THREAD * io_parallelism.max(1) as u64;
+            let bound = one_scan.max(num_segments as u64 * super::MERGE_BYTES_PER_IO_THREAD)
+                + num_segments as u64 * MAX_IOP_SIZE;
+            assert!(
+                aggregate_peak <= bound,
+                "merge of {num_segments} segments held {aggregate_peak} bytes aggregate, \
+                 documented bound is {bound}"
+            );
+
+            for (i, (store, before)) in originals.iter().zip(&before).enumerate() {
+                let after = store.scheduler().backpressure_stats().max_bytes_in_flight;
+                assert_eq!(
+                    after, *before,
+                    "segment {i}'s original scheduler saw merge traffic; the budget \
+                     split does not cover whatever read this"
+                );
+            }
+
+            // And the merge has to have actually merged.
+            let merged = BTreeIndex::load(
+                dest_store.clone() as Arc<dyn IndexStore>,
+                None,
+                &LanceCache::no_cache(),
+            )
+            .await
+            .unwrap();
+            let mut stream = merged.data_stream().await.unwrap();
+            let mut rows = 0u64;
+            while let Some(batch) = stream.try_next().await.unwrap() {
+                rows += batch.num_rows() as u64;
+            }
+            assert_eq!(rows, num_segments as u64 * ROWS + NEW_ROWS);
         }
     }
 
