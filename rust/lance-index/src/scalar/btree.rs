@@ -1981,8 +1981,7 @@ const MERGE_BYTES_PER_IO_THREAD: u64 = 32 * 1024 * 1024;
 /// `io_parallelism` sources the floor wins and the total starts growing again; that is the
 /// point at which a caller wanting a real constant would have to merge in passes.
 fn merge_io_buffer_size(io_parallelism: usize, num_sources: u64) -> u64 {
-    let total = crate::scalar::lance_format::io_buffer_size_override()
-        .unwrap_or_else(|| MERGE_BYTES_PER_IO_THREAD * io_parallelism.max(1) as u64);
+    let total = MERGE_BYTES_PER_IO_THREAD * io_parallelism.max(1) as u64;
     (total / num_sources.max(1)).max(MERGE_BYTES_PER_IO_THREAD)
 }
 
