@@ -385,10 +385,8 @@ impl IndexReader for CurrentIndexReader {
         if CurrentFileReader::num_rows(&self.0) == 0 {
             return Ok(None);
         }
-        let projection = ReaderProjection::from_whole_schema(
-            self.0.schema(),
-            self.0.metadata().version(),
-        );
+        let projection =
+            ReaderProjection::from_whole_schema(self.0.schema(), self.0.metadata().version());
         let stream = self
             .0
             .read_stream_projected(
