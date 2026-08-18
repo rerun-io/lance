@@ -2,19 +2,18 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use crate::Dataset;
-use crate::dataset::optimize::remapping::transpose_row_ids_from_digest;
+use crate::dataset::optimize::remapping::stream_row_ids_from_digest;
 use crate::index::DatasetIndexExt;
 use lance_core::Error;
 use lance_index::frag_reuse::{
     FRAG_REUSE_DETAILS_FILE_NAME, FRAG_REUSE_INDEX_NAME, FragReuseGroup, FragReuseIndex,
-    FragReuseIndexDetails, FragReuseVersion,
+    FragReuseIndexDetails, FragReuseVersion, RowAddrRunMap, RowAddrRunMapBuilder,
 };
 use lance_table::format::IndexMetadata;
 use lance_table::format::pb::fragment_reuse_index_details::{Content, InlineContent};
 use lance_table::format::pb::{ExternalFile, FragmentReuseIndexDetails};
 use prost::Message;
 use roaring::{RoaringBitmap, RoaringTreemap};
-use std::collections::HashMap;
 use std::io::Cursor;
 use std::sync::Arc;
 use tokio::io::AsyncWriteExt;
@@ -72,24 +71,29 @@ pub(crate) async fn open_frag_reuse_index(
     uuid: Uuid,
     details: &FragReuseIndexDetails,
 ) -> lance_core::Result<FragReuseIndex> {
-    let mut row_id_maps: Vec<HashMap<u64, Option<u64>>> =
-        Vec::with_capacity(details.versions.len());
+    let mut row_addr_maps: Vec<RowAddrRunMap> = Vec::with_capacity(details.versions.len());
     for version in &details.versions {
-        let mut row_id_map = HashMap::<u64, Option<u64>>::new();
+        // One builder per version: the groups of a version are disjoint slices of the same
+        // compaction, and `finish` rejects them if they turn out not to be.
+        let mut builder = RowAddrRunMapBuilder::default();
         for group in version.groups.iter() {
             let cursor = Cursor::new(&group.changed_row_addrs);
-            let changed_row_addrs = RoaringTreemap::deserialize_from(cursor).unwrap();
-            let group_row_id_map = transpose_row_ids_from_digest(
+            let changed_row_addrs = RoaringTreemap::deserialize_from(cursor)?;
+            stream_row_ids_from_digest(
                 changed_row_addrs,
                 &group.old_frags,
                 &group.new_frags,
+                &mut builder,
             );
-            row_id_map.extend(group_row_id_map);
         }
-        row_id_maps.push(row_id_map);
+        row_addr_maps.push(builder.finish()?);
     }
 
-    Ok(FragReuseIndex::new(uuid, row_id_maps, details.clone()))
+    Ok(FragReuseIndex::new_from_run_maps(
+        uuid,
+        row_addr_maps,
+        details.clone(),
+    ))
 }
 
 pub(crate) async fn build_new_frag_reuse_index(

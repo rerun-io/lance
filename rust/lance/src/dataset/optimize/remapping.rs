@@ -12,7 +12,7 @@ use crate::{Dataset, index};
 use async_trait::async_trait;
 use lance_core::Error;
 use lance_core::utils::address::RowAddress;
-use lance_index::frag_reuse::{FRAG_REUSE_INDEX_NAME, FragDigest};
+use lance_index::frag_reuse::{FRAG_REUSE_INDEX_NAME, FragDigest, RowAddrRunMapBuilder};
 use lance_table::format::{Fragment, IndexFile, IndexMetadata};
 use lance_table::io::manifest::read_manifest_indexes;
 use roaring::RoaringTreemap;
@@ -165,6 +165,29 @@ pub fn transpose_row_addrs(
     transpose_row_ids_from_digest(row_addrs, &old_frag_digests, &new_frag_digests)
 }
 
+/// The same mapping [`transpose_row_ids_from_digest`] produces, accumulated as runs rather
+/// than one hash-map entry per row.
+///
+/// Feeds the identical two streams (the zip of ascending old addresses against the flat new
+/// address generator, then `MissingAddrs`), so the result answers every address the same way
+/// by construction, including any quirk in which addresses `MissingAddrs` reports.
+pub fn stream_row_ids_from_digest(
+    row_addrs: RoaringTreemap,
+    old_fragments: &Vec<FragDigest>,
+    new_fragments: &[FragDigest],
+    builder: &mut RowAddrRunMapBuilder,
+) {
+    let new_addrs = new_fragments.iter().flat_map(|frag| {
+        (0..frag.physical_rows as u32)
+            .map(|offset| u64::from(RowAddress::new_from_parts(frag.id as u32, offset)))
+    });
+    for (old, new) in row_addrs.iter().zip(new_addrs) {
+        builder.push_mapped(old, new);
+    }
+    MissingAddrs::new(row_addrs.into_iter(), old_fragments)
+        .for_each(|addr| builder.push_deleted(addr));
+}
+
 pub fn transpose_row_ids_from_digest(
     row_addrs: RoaringTreemap,
     old_fragments: &Vec<FragDigest>,
@@ -216,7 +239,7 @@ async fn remap_index(dataset: &mut Dataset, index_id: &Uuid) -> Result<()> {
             .await
             .unwrap();
 
-    if frag_reuse_index.row_id_maps.is_empty() {
+    if frag_reuse_index.row_addr_maps.is_empty() {
         return Ok(());
     }
 
@@ -310,9 +333,9 @@ async fn remap_index(dataset: &mut Dataset, index_id: &Uuid) -> Result<()> {
     // bounded by the rows the reuse index touched; addresses this index does not
     // store are simply never looked up.
     let composed_row_id_map: HashMap<u64, Option<u64>> = frag_reuse_index
-        .row_id_maps
+        .row_addr_maps
         .iter()
-        .flat_map(|row_id_map| row_id_map.keys().copied())
+        .flat_map(|row_addr_map| row_addr_map.iter_keys())
         .map(|old_addr| (old_addr, frag_reuse_index.remap_row_id(old_addr)))
         .collect();
 

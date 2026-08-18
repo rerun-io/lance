@@ -196,19 +196,239 @@ impl FragReuseIndexDetails {
     }
 }
 
+/// A maximal span over which consecutive old row addresses map to consecutive new ones.
+///
+/// Compaction copies surviving rows out of the old fragments and into the new ones in order,
+/// so the address mapping is piecewise affine. A span ends at a deleted row, at an old
+/// fragment boundary, or at a new fragment boundary, and nowhere else.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, DeepSizeOf)]
+pub struct RemapRun {
+    /// First old row address in the span.
+    pub old_start: u64,
+    /// Address the first row of the span moved to.
+    pub new_start: u64,
+    /// How many consecutive addresses the span covers.
+    ///
+    /// A span cannot cross a fragment boundary on either side, and a fragment holds fewer
+    /// than `2^32` rows, so this always fits.
+    pub len: u32,
+}
+
+/// One reuse version's old-to-new row address mapping, stored as runs.
+///
+/// This replaces a `HashMap<u64, Option<u64>>` holding one entry per remapped row. The
+/// hashmap form costs about 40 bytes per row resident, so a single compaction of a large
+/// table can cost tens of gibibytes, paid by every reader that opens the index. The runs
+/// form holds the same information in a few entries per fragment.
+///
+/// [`Self::get`] answers with the same three outcomes the hashmap did, and callers must keep
+/// distinguishing them:
+///
+/// * `Some(Some(addr))`, the row moved,
+/// * `Some(None)`, the row was deleted by the compaction,
+/// * `None`, this version never saw the address, so the caller keeps it unchanged.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, DeepSizeOf)]
+pub struct RowAddrRunMap {
+    /// Sorted by `old_start`, disjoint.
+    runs: Vec<RemapRun>,
+    /// Inclusive address ranges `[start, last]` this version deleted. Sorted, disjoint.
+    ///
+    /// Inclusive rather than half-open so that `u64::MAX`, which is a real address
+    /// ([`lance_core::utils::address::RowAddress::TOMBSTONE_ROW`]), is representable.
+    deleted: Vec<(u64, u64)>,
+}
+
+impl RowAddrRunMap {
+    /// Equivalent of `HashMap::get(&addr).copied()`; see the type docs for the three outcomes.
+    #[inline]
+    pub fn get(&self, addr: u64) -> Option<Option<u64>> {
+        let i = self.runs.partition_point(|run| run.old_start <= addr);
+        if i > 0 {
+            let run = &self.runs[i - 1];
+            if addr - run.old_start < run.len as u64 {
+                return Some(Some(run.new_start + (addr - run.old_start)));
+            }
+        }
+        let j = self.deleted.partition_point(|(start, _)| *start <= addr);
+        if j > 0 && addr <= self.deleted[j - 1].1 {
+            return Some(None);
+        }
+        None
+    }
+
+    /// True when this version maps nothing at all.
+    ///
+    /// Note this is not the same question as "are there no reuse versions". A version that
+    /// deleted every row it touched has no runs but is not empty.
+    pub fn is_empty(&self) -> bool {
+        self.runs.is_empty() && self.deleted.is_empty()
+    }
+
+    /// Every old address this version has an answer for, ascending.
+    ///
+    /// Replaces `HashMap::keys()`. Note this is O(rows), so it is only for callers that
+    /// genuinely need to enumerate; prefer [`Self::get`].
+    pub fn iter_keys(&self) -> impl Iterator<Item = u64> + '_ {
+        let mapped = self
+            .runs
+            .iter()
+            .flat_map(|run| run.old_start..run.old_start + run.len as u64);
+        let deleted = self.deleted.iter().flat_map(|(start, last)| *start..=*last);
+        mapped.chain(deleted)
+    }
+
+    /// Number of addresses this version answers for. Equivalent to `HashMap::len()`.
+    pub fn len(&self) -> u64 {
+        let mapped: u64 = self.runs.iter().map(|run| run.len as u64).sum();
+        let deleted: u64 = self
+            .deleted
+            .iter()
+            .map(|(start, last)| last - start + 1)
+            .sum();
+        mapped + deleted
+    }
+
+    /// Number of runs held, for tests and diagnostics.
+    pub fn num_runs(&self) -> usize {
+        self.runs.len()
+    }
+}
+
+impl From<HashMap<u64, Option<u64>>> for RowAddrRunMap {
+    /// Run-encode an already-materialized map.
+    ///
+    /// Only for callers that already hold one; the point of this type is to avoid building
+    /// it at all. Prefer [`RowAddrRunMapBuilder`].
+    fn from(map: HashMap<u64, Option<u64>>) -> Self {
+        let mut mapped: Vec<(u64, u64)> = Vec::new();
+        let mut deleted: Vec<u64> = Vec::new();
+        for (old, new) in map {
+            match new {
+                Some(new) => mapped.push((old, new)),
+                None => deleted.push(old),
+            }
+        }
+        mapped.sort_unstable();
+        deleted.sort_unstable();
+
+        let mut builder = RowAddrRunMapBuilder::default();
+        for (old, new) in mapped {
+            builder.push_mapped(old, new);
+        }
+        for old in deleted {
+            builder.push_deleted(old);
+        }
+        // Sorted input cannot overlap, so this cannot fail.
+        builder
+            .finish()
+            .expect("run map from a HashMap cannot overlap")
+    }
+}
+
+/// Accumulates a [`RowAddrRunMap`] from the same two streams that used to be inserted into
+/// the hashmap: the mapped pairs, and the deleted addresses.
+///
+/// Feeding the identical streams is what makes the result bit-for-bit equivalent, including
+/// any quirk in how the caller decides which addresses count as deleted.
+#[derive(Debug, Default)]
+pub struct RowAddrRunMapBuilder {
+    runs: Vec<RemapRun>,
+    deleted: Vec<(u64, u64)>,
+}
+
+impl RowAddrRunMapBuilder {
+    /// Record that `old` moved to `new`. Ascending within a group; groups may arrive in any
+    /// order.
+    pub fn push_mapped(&mut self, old: u64, new: u64) {
+        if let Some(run) = self.runs.last_mut()
+            && old == run.old_start + run.len as u64
+            && new == run.new_start + run.len as u64
+            && run.len < u32::MAX
+        {
+            run.len += 1;
+            return;
+        }
+        self.runs.push(RemapRun {
+            old_start: old,
+            new_start: new,
+            len: 1,
+        });
+    }
+
+    /// Record that `old` was deleted.
+    pub fn push_deleted(&mut self, old: u64) {
+        if let Some(range) = self.deleted.last_mut()
+            && range.1 < u64::MAX
+            && old == range.1 + 1
+        {
+            range.1 = old;
+            return;
+        }
+        self.deleted.push((old, old));
+    }
+
+    /// Sort and validate. Errors if two spans claim the same address, which would make the
+    /// lookup order-dependent where the hashmap was last-write-wins.
+    pub fn finish(mut self) -> Result<RowAddrRunMap> {
+        self.runs.sort_unstable_by_key(|run| run.old_start);
+        self.deleted.sort_unstable();
+        // Half-open ends for the overlap check, saturating so the tombstone address at
+        // `u64::MAX` cannot overflow. Saturation only collapses a span that already runs to
+        // the end of the address space, and nothing can start above it.
+        let run_ends =
+            |run: &RemapRun| (run.old_start, run.old_start.saturating_add(run.len as u64));
+        let deleted_ends = |(start, last): &(u64, u64)| (*start, last.saturating_add(1));
+        check_disjoint(self.runs.iter().map(run_ends), "mapped")?;
+        check_disjoint(self.deleted.iter().map(deleted_ends), "deleted")?;
+        // A run and a deletion overlapping would make `get` order-dependent too.
+        let mut merged: Vec<(u64, u64)> = self
+            .runs
+            .iter()
+            .map(run_ends)
+            .chain(self.deleted.iter().map(deleted_ends))
+            .collect();
+        merged.sort_unstable();
+        check_disjoint(merged.into_iter(), "mapped and deleted")?;
+        self.runs.shrink_to_fit();
+        self.deleted.shrink_to_fit();
+        Ok(RowAddrRunMap {
+            runs: self.runs,
+            deleted: self.deleted,
+        })
+    }
+}
+
+fn check_disjoint(ranges: impl Iterator<Item = (u64, u64)>, what: &str) -> Result<()> {
+    let mut prev_end = 0u64;
+    let mut first = true;
+    for (start, end) in ranges {
+        if !first && start < prev_end {
+            return Err(Error::invalid_input(format!(
+                "fragment reuse index: overlapping {what} row address spans \
+                 (span starting at {start} overlaps a span ending at {prev_end})"
+            )));
+        }
+        first = false;
+        prev_end = end;
+    }
+    Ok(())
+}
+
 /// An index that stores row ID maps.
 /// A row ID map describes the mapping from old row address to new address after compactions.
 /// Each version contains the mapping for one round of compaction.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FragReuseIndex {
     pub uuid: Uuid,
-    pub row_id_maps: Vec<HashMap<u64, Option<u64>>>,
+    /// One entry per reuse version, oldest first. Order is load-bearing: each version is
+    /// applied to the previous version's output.
+    pub row_addr_maps: Vec<RowAddrRunMap>,
     pub details: FragReuseIndexDetails,
 }
 
 impl DeepSizeOf for FragReuseIndex {
     fn deep_size_of_children(&self, cx: &mut Context) -> usize {
-        self.row_id_maps.deep_size_of_children(cx) + self.details.deep_size_of_children(cx)
+        self.row_addr_maps.deep_size_of_children(cx) + self.details.deep_size_of_children(cx)
     }
 }
 
@@ -218,20 +438,31 @@ impl FragReuseIndex {
         row_id_maps: Vec<HashMap<u64, Option<u64>>>,
         details: FragReuseIndexDetails,
     ) -> Self {
+        Self::new_from_run_maps(
+            uuid,
+            row_id_maps.into_iter().map(RowAddrRunMap::from).collect(),
+            details,
+        )
+    }
+
+    pub fn new_from_run_maps(
+        uuid: Uuid,
+        row_addr_maps: Vec<RowAddrRunMap>,
+        details: FragReuseIndexDetails,
+    ) -> Self {
         Self {
             uuid,
-            row_id_maps,
+            row_addr_maps,
             details,
         }
     }
 
     pub fn remap_row_id(&self, row_id: u64) -> Option<u64> {
         let mut mapped_value = Some(row_id);
-        for row_id_map in self.row_id_maps.iter() {
+        for row_addr_map in self.row_addr_maps.iter() {
             if mapped_value.is_some() {
-                mapped_value = row_id_map
-                    .get(&mapped_value.unwrap())
-                    .copied()
+                mapped_value = row_addr_map
+                    .get(mapped_value.unwrap())
                     .unwrap_or(mapped_value);
             }
         }
@@ -475,6 +706,220 @@ mod tests {
                 physical_rows: 1,
                 num_deleted_rows: 0,
             }]
+        );
+    }
+}
+
+#[cfg(test)]
+mod run_map_tests {
+    use super::*;
+
+    /// Build both representations from the same pairs and assert they answer identically
+    /// for every address in `probes`.
+    fn assert_equivalent(pairs: &[(u64, Option<u64>)], probes: &[u64]) {
+        let hash: HashMap<u64, Option<u64>> = pairs.iter().copied().collect();
+        let runs = RowAddrRunMap::from(hash.clone());
+        for &addr in probes {
+            assert_eq!(
+                hash.get(&addr).copied(),
+                runs.get(addr),
+                "addr {addr} diverged"
+            );
+        }
+        assert_eq!(hash.len() as u64, runs.len());
+        let mut from_runs: Vec<u64> = runs.iter_keys().collect();
+        from_runs.sort_unstable();
+        let mut from_hash: Vec<u64> = hash.keys().copied().collect();
+        from_hash.sort_unstable();
+        assert_eq!(from_hash, from_runs, "iter_keys must match HashMap::keys");
+    }
+
+    fn addr(frag: u64, offset: u32) -> u64 {
+        (frag << 32) | offset as u64
+    }
+
+    #[test]
+    fn contiguous_span_collapses_to_one_run() {
+        let pairs: Vec<_> = (0..1000).map(|i| (addr(7, i), Some(addr(9, i)))).collect();
+        let runs = RowAddrRunMap::from(pairs.iter().copied().collect::<HashMap<_, _>>());
+        assert_eq!(runs.num_runs(), 1, "a contiguous span is one run");
+        let probes: Vec<u64> = (0..1002).map(|i| addr(7, i)).collect();
+        assert_equivalent(&pairs, &probes);
+    }
+
+    #[test]
+    fn deletion_splits_a_run_and_reports_deleted() {
+        let mut pairs = vec![];
+        for i in 0..10u32 {
+            if i == 4 || i == 5 {
+                pairs.push((addr(1, i), None));
+            } else {
+                pairs.push((addr(1, i), Some(addr(2, i))));
+            }
+        }
+        let runs = RowAddrRunMap::from(pairs.iter().copied().collect::<HashMap<_, _>>());
+        assert_eq!(runs.num_runs(), 2, "one gap splits the span in two");
+        assert_eq!(runs.get(addr(1, 4)), Some(None), "deleted, not absent");
+        assert_eq!(runs.get(addr(1, 20)), None, "absent, not deleted");
+        let probes: Vec<u64> = (0..24).map(|i| addr(1, i)).collect();
+        assert_equivalent(&pairs, &probes);
+    }
+
+    /// The three outcomes are distinct and callers depend on it: absent means "keep the
+    /// address", deleted means "the row is gone".
+    #[test]
+    fn absent_is_not_deleted() {
+        let map = RowAddrRunMap::from(HashMap::from([(addr(1, 0), None)]));
+        assert_eq!(map.get(addr(1, 0)), Some(None));
+        assert_eq!(map.get(addr(1, 1)), None);
+        assert_eq!(map.get(addr(2, 0)), None);
+    }
+
+    /// New fragments are visited in slice order, not id order, so the new side can go
+    /// backwards. A run must break there.
+    #[test]
+    fn non_monotone_new_side_breaks_runs() {
+        let pairs = vec![
+            (addr(1, 0), Some(addr(9, 0))),
+            (addr(1, 1), Some(addr(9, 1))),
+            (addr(1, 2), Some(addr(3, 0))),
+            (addr(1, 3), Some(addr(3, 1))),
+        ];
+        let runs = RowAddrRunMap::from(pairs.iter().copied().collect::<HashMap<_, _>>());
+        assert_eq!(runs.num_runs(), 2);
+        let probes: Vec<u64> = (0..6).map(|i| addr(1, i)).collect();
+        assert_equivalent(&pairs, &probes);
+    }
+
+    #[test]
+    fn old_fragment_boundary_breaks_runs() {
+        let pairs = [
+            (addr(1, 0), Some(addr(9, 0))),
+            (addr(2, 0), Some(addr(9, 1))),
+        ];
+        let runs = RowAddrRunMap::from(pairs.iter().copied().collect::<HashMap<_, _>>());
+        assert_eq!(
+            runs.num_runs(),
+            2,
+            "addresses are not consecutive across fragments"
+        );
+    }
+
+    /// A version that deleted everything it touched has no runs, but it is emphatically not
+    /// empty. Treating it as empty would skip the remap and leave stale addresses live.
+    #[test]
+    fn all_deleted_version_is_not_empty() {
+        let map = RowAddrRunMap::from(HashMap::from([(addr(1, 0), None), (addr(1, 1), None)]));
+        assert_eq!(map.num_runs(), 0);
+        assert!(!map.is_empty(), "no runs is not the same as nothing mapped");
+        assert_eq!(map.get(addr(1, 0)), Some(None));
+    }
+
+    #[test]
+    fn empty_map_is_pure_passthrough() {
+        let map = RowAddrRunMap::default();
+        assert!(map.is_empty());
+        assert_eq!(map.get(0), None);
+        assert_eq!(map.get(u64::MAX), None);
+    }
+
+    /// Address 0 and the tombstone address are ordinary values as far as the map is
+    /// concerned, and must not be special-cased by the range search.
+    #[test]
+    fn boundary_addresses_round_trip() {
+        let pairs = [(0u64, Some(addr(1, 0))), (u64::MAX, None)];
+        assert_equivalent(&pairs, &[0, 1, u64::MAX, u64::MAX - 1, addr(1, 0)]);
+    }
+
+    /// Chaining is sticky: once a version deletes a row, later versions must not resurrect
+    /// it, and a version that never saw the address must leave it alone.
+    #[test]
+    fn versions_chain_with_sticky_deletion() {
+        let v0 = RowAddrRunMap::from(HashMap::from([
+            (addr(1, 0), Some(addr(2, 0))),
+            (addr(1, 1), None),
+        ]));
+        let v1 = RowAddrRunMap::from(HashMap::from([(addr(2, 0), Some(addr(3, 0)))]));
+        let index = FragReuseIndex::new_from_run_maps(
+            Uuid::nil(),
+            vec![v0, v1],
+            FragReuseIndexDetails { versions: vec![] },
+        );
+        assert_eq!(index.remap_row_id(addr(1, 0)), Some(addr(3, 0)), "chained");
+        assert_eq!(
+            index.remap_row_id(addr(1, 1)),
+            None,
+            "deleted stays deleted"
+        );
+        assert_eq!(
+            index.remap_row_id(addr(8, 0)),
+            Some(addr(8, 0)),
+            "untouched"
+        );
+    }
+
+    /// `FragReuseIndex::new` is public and callers build one from maps with no matching
+    /// details, so coverage cannot be inferred from `details`.
+    #[test]
+    fn constructible_from_hash_maps_without_details() {
+        let index = FragReuseIndex::new(
+            Uuid::nil(),
+            vec![HashMap::from([(0u64, Some(5000u64))])],
+            FragReuseIndexDetails { versions: vec![] },
+        );
+        assert_eq!(index.remap_row_id(0), Some(5000));
+        assert_eq!(index.remap_row_id(1), Some(1));
+    }
+
+    /// Two spans claiming the same address would make lookups depend on sort order, where
+    /// the hashmap was last-write-wins. Refuse to build rather than answer arbitrarily.
+    #[test]
+    fn overlapping_spans_are_rejected() {
+        let mut builder = RowAddrRunMapBuilder::default();
+        builder.push_mapped(100, 200);
+        builder.push_mapped(500, 600);
+        // Same address again, from a notional second group.
+        builder.push_mapped(100, 900);
+        assert!(builder.finish().is_err(), "overlap must not build silently");
+
+        let mut builder = RowAddrRunMapBuilder::default();
+        builder.push_mapped(100, 200);
+        builder.push_deleted(100);
+        assert!(
+            builder.finish().is_err(),
+            "an address cannot be both mapped and deleted"
+        );
+    }
+
+    /// Groups arrive one after another and need not be in ascending address order.
+    #[test]
+    fn out_of_order_groups_merge() {
+        let mut builder = RowAddrRunMapBuilder::default();
+        builder.push_mapped(addr(5, 0), addr(9, 0));
+        builder.push_mapped(addr(5, 1), addr(9, 1));
+        builder.push_mapped(addr(1, 0), addr(8, 0));
+        builder.push_deleted(addr(1, 1));
+        let map = builder.finish().unwrap();
+        assert_eq!(map.get(addr(1, 0)), Some(Some(addr(8, 0))));
+        assert_eq!(map.get(addr(1, 1)), Some(None));
+        assert_eq!(map.get(addr(5, 1)), Some(Some(addr(9, 1))));
+        assert_eq!(map.get(addr(3, 0)), None);
+    }
+
+    /// The point of the change: a large contiguous remap must not scale with rows.
+    #[test]
+    fn memory_is_bounded_by_runs_not_rows() {
+        let mut builder = RowAddrRunMapBuilder::default();
+        for offset in 0..1_000_000u32 {
+            builder.push_mapped(addr(1, offset), addr(2, offset));
+        }
+        let map = builder.finish().unwrap();
+        assert_eq!(map.num_runs(), 1);
+        assert_eq!(map.len(), 1_000_000);
+        assert!(
+            map.deep_size_of() < 4096,
+            "a million contiguous rows must not cost more than a handful of bytes, got {}",
+            map.deep_size_of()
         );
     }
 }
