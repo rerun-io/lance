@@ -1340,7 +1340,7 @@ mod tests {
         };
         let frag_reuse_index = FragReuseIndex {
             uuid: Uuid::new_v4(),
-            row_id_maps: vec![],
+            row_addr_maps: vec![],
             details: FragReuseIndexDetails {
                 versions: vec![FragReuseVersion {
                     dataset_version: 5,

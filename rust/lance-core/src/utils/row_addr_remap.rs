@@ -283,6 +283,64 @@ impl CompactRowAddrRemap {
     }
 }
 
+// --- rerun fork additions, not present upstream ---
+//
+// `FragReuseIndex` stores these and is `Debug` + `DeepSizeOf`; upstream does not need
+// either yet because it still holds `Vec<HashMap<u64, Option<u64>>>` there.
+
+impl std::fmt::Debug for RowAddrRemap {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Compact(compact) => f
+                .debug_struct("RowAddrRemap::Compact")
+                .field("groups", &compact.num_groups())
+                .field("fragments", &compact.num_fragments())
+                .finish(),
+            Self::Direct(map) => f
+                .debug_struct("RowAddrRemap::Direct")
+                .field("entries", &map.len())
+                .finish(),
+        }
+    }
+}
+
+impl CompactRowAddrRemap {
+    /// Number of rewrite groups held.
+    pub fn num_groups(&self) -> usize {
+        self.groups.len()
+    }
+
+    /// Number of old fragments covered. This is what the structure scales with.
+    pub fn num_fragments(&self) -> usize {
+        self.frag_to_group.len()
+    }
+}
+
+impl crate::deepsize::DeepSizeOf for RowAddrRemap {
+    fn deep_size_of_children(&self, cx: &mut crate::deepsize::Context) -> usize {
+        match self {
+            // Bitmaps dominate; roaring is not `DeepSizeOf`, so approximate from its
+            // own serialized size rather than under-report it as zero.
+            Self::Compact(compact) => {
+                compact
+                    .groups
+                    .iter()
+                    .map(|group| {
+                        group
+                            .frags
+                            .values()
+                            .map(|(bitmap, _)| bitmap.serialized_size() + 16)
+                            .sum::<usize>()
+                            + group.new_frag_row_ranges.len() * 16
+                    })
+                    .sum::<usize>()
+                    + compact.frag_to_group.len() * 12
+            }
+            Self::Direct(map) => map.deep_size_of_children(cx),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
