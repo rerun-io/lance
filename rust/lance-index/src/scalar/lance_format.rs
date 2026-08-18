@@ -105,6 +105,12 @@ impl LanceIndexStore {
         self
     }
 
+    /// The scheduler backing this store, for tests and diagnostics that need to observe
+    /// how much prefetch the store actually held (see `ScanScheduler::backpressure_stats`).
+    pub fn scheduler(&self) -> &Arc<ScanScheduler> {
+        &self.scheduler
+    }
+
     fn index_file_path(&self, name: &str) -> Result<Path> {
         let relative_path = Path::parse(name).map_err(|err| {
             Error::invalid_input(format!("invalid index file path {name:?}: {err}"))

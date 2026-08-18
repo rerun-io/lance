@@ -101,6 +101,18 @@ struct IoQueueState {
     last_warn: AtomicU64,
     // When true, skip all byte-based backpressure checks (set when io_buffer_size == 0)
     no_backpressure: bool,
+    // Byte budget this queue was configured with, kept so in-flight bytes can be reported.
+    io_buffer_size: u64,
+    // High-water mark of bytes debited but not yet credited back.
+    //
+    // This is the quantity the byte budget is supposed to bound, and until now nothing
+    // reported it: callers could only observe whole-process RSS, which cannot separate
+    // scheduler prefetch from decode buffers.
+    max_bytes_in_flight: u64,
+    // Requests admitted even though the remaining budget did not cover them, via the
+    // `priority <= min_in_flight` path that guarantees forward progress. Each one is a
+    // place where the budget is a soft bound rather than a hard one.
+    priority_bypass_admissions: u64,
 }
 
 impl IoQueueState {
@@ -114,7 +126,15 @@ impl IoQueueState {
             start: Instant::now(),
             last_warn: AtomicU64::from(0),
             no_backpressure: io_buffer_size == 0,
+            io_buffer_size,
+            max_bytes_in_flight: 0,
+            priority_bypass_admissions: 0,
         }
+    }
+
+    /// Bytes currently debited and not yet credited back.
+    fn bytes_in_flight(&self) -> u64 {
+        (self.io_buffer_size as i64 - self.bytes_avail).max(0) as u64
     }
 
     fn warn_if_needed(&self) {
@@ -158,7 +178,12 @@ impl IoQueueState {
             self.priorities_in_flight.push(task.priority);
             self.iops_avail -= 1;
             if !skip_bytes_accounting {
+                if task.num_bytes() as i64 > self.bytes_avail {
+                    // `can_deliver` let this through on priority, not on budget.
+                    self.priority_bypass_admissions += 1;
+                }
                 self.bytes_avail -= task.num_bytes() as i64;
+                self.max_bytes_in_flight = self.max_bytes_in_flight.max(self.bytes_in_flight());
                 if self.bytes_avail < 0 {
                     // This can happen when we admit special priority requests
                     log::debug!(
@@ -513,6 +538,19 @@ pub struct ScanStats {
     pub iops: u64,
     pub requests: u64,
     pub bytes_read: u64,
+}
+
+/// What the backpressure budget actually did, as opposed to what it was configured to do.
+///
+/// `max_bytes_in_flight` is the peak of bytes debited and not yet credited: the quantity
+/// the budget bounds. `priority_bypass_admissions` counts the times a request was admitted
+/// despite the budget being exhausted, which is how the budget stays soft enough to
+/// guarantee forward progress. A non-zero count means the ceiling was crossed deliberately.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct BackpressureStats {
+    pub io_buffer_size: u64,
+    pub max_bytes_in_flight: u64,
+    pub priority_bypass_admissions: u64,
 }
 
 impl ScanStats {
@@ -903,6 +941,24 @@ impl ScanScheduler {
 
     pub fn stats(&self) -> ScanStats {
         self.stats.snapshot()
+    }
+
+    /// Peak backpressure usage for this scheduler; see [`BackpressureStats`].
+    ///
+    /// Returns the default (all zero) for the lite scheduler, which accounts for
+    /// reservations with its own RAII type rather than this queue.
+    pub fn backpressure_stats(&self) -> BackpressureStats {
+        match &self.io_queue {
+            IoQueueType::Standard(queue) => {
+                let state = queue.state.lock().expect("io queue mutex poisoned");
+                BackpressureStats {
+                    io_buffer_size: state.io_buffer_size,
+                    max_bytes_in_flight: state.max_bytes_in_flight,
+                    priority_bypass_admissions: state.priority_bypass_admissions,
+                }
+            }
+            IoQueueType::Lite(_) => BackpressureStats::default(),
+        }
     }
 
     #[cfg(test)]
