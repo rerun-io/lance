@@ -1109,6 +1109,9 @@ impl DatasetIndexExt for Dataset {
             let frag_reuse_index = self
                 .index_cache
                 .get_or_insert_with_key(fri_key, || async move {
+                    // GUARD: this closure must never call `load_indices`/`load_index` —
+                    // they re-enter this same cache key and self-deadlock (moka holds
+                    // the waiter's write lock across the init future).
                     let index_details =
                         load_frag_reuse_index_details(self, frag_reuse_index_meta).await?;
                     open_frag_reuse_index(frag_reuse_index_meta.uuid, index_details.as_ref()).await
@@ -2239,14 +2242,16 @@ impl DatasetIndexInternalExt for Dataset {
             let index = self
                 .index_cache
                 .get_or_insert_with_key(frag_reuse_key, || async move {
-                    let index_meta =
-                        self.load_index(&frag_reuse_uuid).await?.ok_or_else(|| {
-                            Error::index(format!(
-                                "Index with id {} does not exist",
-                                frag_reuse_uuid
-                            ))
-                        })?;
-                    let index_details = load_frag_reuse_index_details(self, &index_meta).await?;
+                    // NOTE: do NOT call `self.load_index(&frag_reuse_uuid)` here.
+                    // That re-enters `load_indices()`, which performs a
+                    // `get_or_insert_with_key` on this same `frag_reuse/{uuid}`
+                    // cache key. moka holds the waiter's write lock across this
+                    // init future, so the re-entrant call would park on
+                    // `read().await` against our own write guard and deadlock
+                    // permanently. Use the metadata we already fetched above,
+                    // mirroring the loader in `load_indices()`.
+                    let index_details =
+                        load_frag_reuse_index_details(self, &frag_reuse_index_meta).await?;
                     let index =
                         open_frag_reuse_index(frag_reuse_index_meta.uuid, index_details.as_ref())
                             .await?;
