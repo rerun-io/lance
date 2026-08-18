@@ -216,7 +216,7 @@ async fn remap_index(dataset: &mut Dataset, index_id: &Uuid) -> Result<()> {
             .await
             .unwrap();
 
-    if frag_reuse_index.row_id_maps.is_empty() {
+    if frag_reuse_index.row_addr_maps.is_empty() {
         return Ok(());
     }
 
@@ -309,10 +309,23 @@ async fn remap_index(dataset: &mut Dataset, index_id: &Uuid) -> Result<()> {
     // stale (an empty map makes `index::remap_index` return `Keep`). The map is
     // bounded by the rows the reuse index touched; addresses this index does not
     // store are simply never looked up.
+    //
+    // The compact remap deliberately cannot enumerate its keys: it stores per-fragment
+    // bitmaps, not rows, and treats any unlisted offset in a rewritten fragment as
+    // deleted, so "every key" is not a finite set it knows. Rebuild the per-row maps from
+    // the details here to get the key set. That is O(rows) again, but only on this path,
+    // which no production caller reaches; the cached open path above is what mattered.
     let composed_row_id_map: HashMap<u64, Option<u64>> = frag_reuse_index
-        .row_id_maps
+        .details
+        .versions
         .iter()
-        .flat_map(|row_id_map| row_id_map.keys().copied())
+        .flat_map(|version| version.groups.iter())
+        .flat_map(|group| {
+            let changed =
+                RoaringTreemap::deserialize_from(std::io::Cursor::new(&group.changed_row_addrs))
+                    .expect("fragment reuse index details were already parsed");
+            transpose_row_ids_from_digest(changed, &group.old_frags, &group.new_frags).into_keys()
+        })
         .map(|old_addr| (old_addr, frag_reuse_index.remap_row_id(old_addr)))
         .collect();
 

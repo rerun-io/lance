@@ -2,9 +2,9 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use crate::Dataset;
-use crate::dataset::optimize::remapping::transpose_row_ids_from_digest;
 use crate::index::DatasetIndexExt;
 use lance_core::Error;
+use lance_core::utils::row_addr_remap::{GroupInput, RowAddrRemap};
 use lance_index::frag_reuse::{
     FRAG_REUSE_DETAILS_FILE_NAME, FRAG_REUSE_INDEX_NAME, FragReuseGroup, FragReuseIndex,
     FragReuseIndexDetails, FragReuseVersion,
@@ -14,7 +14,6 @@ use lance_table::format::pb::fragment_reuse_index_details::{Content, InlineConte
 use lance_table::format::pb::{ExternalFile, FragmentReuseIndexDetails};
 use prost::Message;
 use roaring::{RoaringBitmap, RoaringTreemap};
-use std::collections::HashMap;
 use std::io::Cursor;
 use std::sync::Arc;
 use tokio::io::AsyncWriteExt;
@@ -72,24 +71,33 @@ pub(crate) async fn open_frag_reuse_index(
     uuid: Uuid,
     details: &FragReuseIndexDetails,
 ) -> lance_core::Result<FragReuseIndex> {
-    let mut row_id_maps: Vec<HashMap<u64, Option<u64>>> =
-        Vec::with_capacity(details.versions.len());
+    // Build the compact form rather than a materialized per-row map. This runs on every
+    // index open and the result is cached, so the map's O(#rows) cost is paid by readers:
+    // one production payload here is 88 MB on disk and 40 GB once expanded.
+    let mut row_addr_maps: Vec<RowAddrRemap> = Vec::with_capacity(details.versions.len());
     for version in &details.versions {
-        let mut row_id_map = HashMap::<u64, Option<u64>>::new();
+        let mut groups = Vec::with_capacity(version.groups.len());
         for group in version.groups.iter() {
             let cursor = Cursor::new(&group.changed_row_addrs);
-            let changed_row_addrs = RoaringTreemap::deserialize_from(cursor).unwrap();
-            let group_row_id_map = transpose_row_ids_from_digest(
-                changed_row_addrs,
-                &group.old_frags,
-                &group.new_frags,
-            );
-            row_id_map.extend(group_row_id_map);
+            let rewritten_old_row_addrs = RoaringTreemap::deserialize_from(cursor)?;
+            groups.push(GroupInput {
+                rewritten_old_row_addrs,
+                old_frag_ids: group.old_frags.iter().map(|frag| frag.id as u32).collect(),
+                new_frags: group
+                    .new_frags
+                    .iter()
+                    .map(|frag| (frag.id as u32, frag.physical_rows as u32))
+                    .collect(),
+            });
         }
-        row_id_maps.push(row_id_map);
+        row_addr_maps.push(RowAddrRemap::compact(groups)?);
     }
 
-    Ok(FragReuseIndex::new(uuid, row_id_maps, details.clone()))
+    Ok(FragReuseIndex::new_from_remaps(
+        uuid,
+        row_addr_maps,
+        details.clone(),
+    ))
 }
 
 pub(crate) async fn build_new_frag_reuse_index(

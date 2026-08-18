@@ -7,6 +7,7 @@ use arrow_array::cast::AsArray;
 use arrow_array::types::UInt64Type;
 use arrow_array::{Array, ArrayRef, PrimitiveArray, RecordBatch, UInt64Array};
 use lance_core::deepsize::{Context, DeepSizeOf};
+use lance_core::utils::row_addr_remap::RowAddrRemap;
 use lance_core::{Error, Result};
 use lance_select::RowAddrTreeMap;
 use roaring::{RoaringBitmap, RoaringTreemap};
@@ -199,39 +200,61 @@ impl FragReuseIndexDetails {
 /// An index that stores row ID maps.
 /// A row ID map describes the mapping from old row address to new address after compactions.
 /// Each version contains the mapping for one round of compaction.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone)]
 pub struct FragReuseIndex {
     pub uuid: Uuid,
-    pub row_id_maps: Vec<HashMap<u64, Option<u64>>>,
+    /// One remap per reuse version, oldest first. Order is load-bearing: each version is
+    /// applied to the previous version's output.
+    ///
+    /// Built as [`RowAddrRemap::Compact`] when the index is opened, which costs
+    /// O(#fragments) instead of the O(#rows) a materialized map would. A large compaction
+    /// here produced 676M row entries, 40 GB resident, which OOMs the pod that opens it.
+    pub row_addr_maps: Vec<RowAddrRemap>,
     pub details: FragReuseIndexDetails,
 }
 
 impl DeepSizeOf for FragReuseIndex {
     fn deep_size_of_children(&self, cx: &mut Context) -> usize {
-        self.row_id_maps.deep_size_of_children(cx) + self.details.deep_size_of_children(cx)
+        self.row_addr_maps.deep_size_of_children(cx) + self.details.deep_size_of_children(cx)
     }
 }
 
 impl FragReuseIndex {
+    /// Build from already-materialized maps, one per version.
+    ///
+    /// Kept for callers that hold maps already; it stores them as
+    /// [`RowAddrRemap::Direct`] and so costs O(#rows). Prefer
+    /// [`Self::new_from_remaps`] with [`RowAddrRemap::compact`].
     pub fn new(
         uuid: Uuid,
         row_id_maps: Vec<HashMap<u64, Option<u64>>>,
         details: FragReuseIndexDetails,
     ) -> Self {
+        Self::new_from_remaps(
+            uuid,
+            row_id_maps.into_iter().map(RowAddrRemap::direct).collect(),
+            details,
+        )
+    }
+
+    pub fn new_from_remaps(
+        uuid: Uuid,
+        row_addr_maps: Vec<RowAddrRemap>,
+        details: FragReuseIndexDetails,
+    ) -> Self {
         Self {
             uuid,
-            row_id_maps,
+            row_addr_maps,
             details,
         }
     }
 
     pub fn remap_row_id(&self, row_id: u64) -> Option<u64> {
         let mut mapped_value = Some(row_id);
-        for row_id_map in self.row_id_maps.iter() {
+        for row_addr_map in self.row_addr_maps.iter() {
             if mapped_value.is_some() {
-                mapped_value = row_id_map
-                    .get(&mapped_value.unwrap())
-                    .copied()
+                mapped_value = row_addr_map
+                    .get(mapped_value.unwrap())
                     .unwrap_or(mapped_value);
             }
         }
