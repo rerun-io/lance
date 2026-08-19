@@ -3374,6 +3374,219 @@ mod tests {
         assert_eq!(current_scalar_index.uuid, original_scalar_uuid);
     }
 
+    /// The reason the compact form exists, measured rather than argued: open the same
+    /// dataset each way and compare what the reuse index costs the cache.
+    ///
+    /// `Dataset::cache_size_bytes` is a public API over the same `DeepSizeOf` estimate the
+    /// byte-bounded cache charges an entry at admission, so this measures what the cache
+    /// believes rather than resident set size. The gap it reports is wide enough that the
+    /// distinction does not matter here: roughly thirty times, on a dataset small enough to
+    /// run in a test.
+    #[tokio::test]
+    async fn test_compact_form_costs_the_cache_far_less() {
+        use crate::dataset::builder::DatasetBuilder;
+        use lance_core::utils::tempfile::TempStrDir;
+
+        let test_dir = TempStrDir::default();
+        let uri = test_dir.as_str().to_string();
+        let mut dataset = lance_datagen::gen_batch()
+            .col("id", lance_datagen::array::step::<Int32Type>())
+            .into_dataset(&uri, FragmentCount::from(8), FragmentRowCount::from(5_000))
+            .await
+            .unwrap();
+        dataset
+            .create_index(
+                &["id"],
+                IndexType::BTree,
+                Some("id_idx".into()),
+                &ScalarIndexParams::default(),
+                false,
+            )
+            .await
+            .unwrap();
+
+        // Deferred remap, so the reuse index accumulates instead of being applied, and
+        // several rounds so the reader has to hold more than one version.
+        let options = CompactionOptions {
+            target_rows_per_fragment: 10_000,
+            defer_index_remap: true,
+            ..Default::default()
+        };
+        for round in 0..3 {
+            dataset
+                .delete(&format!("id % 10 == {round}"))
+                .await
+                .unwrap();
+            compact_files(&mut dataset, options.clone(), None)
+                .await
+                .unwrap();
+        }
+
+        let mut growth = Vec::new();
+        let mut answers = Vec::new();
+        for mode in [IndexRemapMode::Direct, IndexRemapMode::Compact] {
+            // A fresh session per open, so the only difference between the two is the form.
+            let reopened = DatasetBuilder::from_uri(&uri)
+                .with_frag_reuse_remap_mode(mode)
+                .load()
+                .await
+                .unwrap();
+            let before = reopened.cache_size_bytes();
+            // Running a query is what pulls the index, and with it the reuse index, into
+            // the cache; measuring before that would compare two empty caches.
+            answers.push(
+                reopened
+                    .count_rows(Some("id >= 3000 and id < 4000".to_owned()))
+                    .await
+                    .unwrap(),
+            );
+            growth.push(reopened.cache_size_bytes() - before);
+        }
+        let (direct, compact) = (growth[0], growth[1]);
+
+        assert_eq!(
+            answers[0], answers[1],
+            "the two forms must agree on the answer, whatever they cost"
+        );
+        assert!(
+            direct > 1_000_000,
+            "expected the materialized form to be the expensive one; it grew by {direct} bytes, \
+             so either nothing was cached or the dataset is too small to show the difference"
+        );
+        assert!(
+            compact * 10 < direct,
+            "expected the compact form to cost far less: {compact} against {direct} bytes"
+        );
+    }
+
+    /// End to end, through the public reader API: build a multi-fragment dataset with a
+    /// scalar index, accumulate several fragment-reuse versions by compacting with the remap
+    /// deferred, then reopen with each form and confirm they answer identically.
+    ///
+    /// The deferral is what makes this exercise the reader: the index is never rewritten, so
+    /// its stored addresses are stale and every count below has to be resolved through the
+    /// reuse index at query time.
+    #[rstest]
+    #[case::direct(IndexRemapMode::Direct)]
+    #[case::compact(IndexRemapMode::Compact)]
+    #[tokio::test]
+    async fn test_frag_reuse_remap_mode_end_to_end(#[case] mode: IndexRemapMode) {
+        use crate::dataset::builder::DatasetBuilder;
+        use lance_core::utils::tempfile::TempStrDir;
+
+        let test_dir = TempStrDir::default();
+        let uri = test_dir.as_str().to_string();
+
+        let mut dataset = lance_datagen::gen_batch()
+            .col("id", lance_datagen::array::step::<Int32Type>())
+            .into_dataset(&uri, FragmentCount::from(8), FragmentRowCount::from(1_000))
+            .await
+            .unwrap();
+
+        dataset
+            .create_index(
+                &["id"],
+                IndexType::BTree,
+                Some("id_idx".into()),
+                &ScalarIndexParams::default(),
+                false,
+            )
+            .await
+            .unwrap();
+
+        // Counts before any compaction, resolved through a freshly built index.
+        let expected_low = dataset
+            .count_rows(Some("id < 1000".to_owned()))
+            .await
+            .unwrap();
+        let expected_mid = dataset
+            .count_rows(Some("id >= 3000 and id < 4000".to_owned()))
+            .await
+            .unwrap();
+
+        // Several rounds, so the reuse index accumulates more than one version and the
+        // reader has to compose them rather than apply a single mapping.
+        let options = CompactionOptions {
+            target_rows_per_fragment: 2_000,
+            defer_index_remap: true,
+            ..Default::default()
+        };
+        for round in 0..3 {
+            dataset
+                .delete(&format!("id % 10 == {round}"))
+                .await
+                .unwrap();
+            compact_files(&mut dataset, options.clone(), None)
+                .await
+                .unwrap();
+        }
+        let versions = {
+            let meta = dataset
+                .load_index_by_name(FRAG_REUSE_INDEX_NAME)
+                .await
+                .unwrap()
+                .expect("compaction should have written a fragment reuse index");
+            load_frag_reuse_index_details(&dataset, &meta)
+                .await
+                .unwrap()
+                .versions
+                .len()
+        };
+        assert!(
+            versions > 1,
+            "expected several reuse versions to compose, got {versions}"
+        );
+
+        // Deletions removed one row in ten per round, from disjoint residues.
+        let deleted = 3 * (8 * 1_000 / 10);
+        let expected_low = expected_low - (1_000 / 10) * 3;
+        let expected_mid = expected_mid - (1_000 / 10) * 3;
+
+        // Reopen through the builder, which is the API a caller uses to pick the form.
+        let reopened = DatasetBuilder::from_uri(&uri)
+            .with_frag_reuse_remap_mode(mode)
+            .load()
+            .await
+            .unwrap();
+
+        // The builder actually applied the requested form. Without this the test would pass
+        // with a no-op setter, since the two forms agree on every count below -- which is the
+        // property being checked, not evidence that either was selected.
+        assert_eq!(reopened.frag_reuse_remap_mode, mode);
+
+        // The index still drives the scan; it was never rewritten.
+        let mut scanner = reopened.scan();
+        scanner.filter("id >= 3000 and id < 4000").unwrap();
+        scanner.project::<String>(&[]).unwrap().with_row_id();
+        let plan = scanner.explain_plan(false).await.unwrap();
+        assert!(
+            plan.contains("ScalarIndexQuery"),
+            "expected the scalar index to serve the query: {plan}"
+        );
+
+        assert_eq!(
+            reopened
+                .count_rows(Some("id < 1000".to_owned()))
+                .await
+                .unwrap(),
+            expected_low,
+            "{mode:?} disagreed on the low range"
+        );
+        assert_eq!(
+            reopened
+                .count_rows(Some("id >= 3000 and id < 4000".to_owned()))
+                .await
+                .unwrap(),
+            expected_mid,
+            "{mode:?} disagreed on the middle range"
+        );
+        assert_eq!(
+            reopened.count_rows(None).await.unwrap(),
+            8 * 1_000 - deleted,
+            "{mode:?} disagreed on the total"
+        );
+    }
+
     #[tokio::test]
     async fn test_defer_index_remap_multiple_compactions() {
         let mut data_gen = BatchGenerator::new()
