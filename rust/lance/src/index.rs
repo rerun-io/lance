@@ -1097,13 +1097,11 @@ impl DatasetIndexExt for Dataset {
         if let Some(frag_reuse_index_meta) =
             indices.iter().find(|idx| idx.name == FRAG_REUSE_INDEX_NAME)
         {
-            // The two forms resolve some addresses differently, so a dataset that asked for
-            // one must not be served the other from a `Session` shared with a dataset that
-            // asked for the other.
+            // Isolation between the two forms comes from the cache's own prefix, which the
+            // dataset built with its remap mode, so the key itself needs only the uuid.
             let mode = self.frag_reuse_remap_mode;
             let fri_key = FragReuseIndexKey {
                 uuid: &frag_reuse_index_meta.uuid,
-                mode,
             };
             let frag_reuse_index = self
                 .index_cache
@@ -2242,7 +2240,6 @@ impl DatasetIndexInternalExt for Dataset {
             let mode = self.frag_reuse_remap_mode;
             let frag_reuse_key = FragReuseIndexKey {
                 uuid: &frag_reuse_uuid,
-                mode,
             };
 
             let index = self

@@ -28,6 +28,28 @@ impl GlobalIndexCache {
         // This prevents collisions between different datasets.
         DSIndexCache(self.0.with_key_prefix(uri))
     }
+
+    /// As [`Self::for_dataset`], keeping the two fragment-reuse remap forms apart.
+    ///
+    /// What an index caches is not the index as stored: with the remap deferred, its row
+    /// addresses are translated through the fragment reuse index as it loads. So the cached
+    /// state is the index *as translated*, and the two forms do not translate identically --
+    /// an offset past a fragment's `physical_rows`, for instance, is deleted under
+    /// [`IndexRemapMode::Compact`] and untouched under [`IndexRemapMode::Direct`].
+    ///
+    /// Datasets sharing a [`Session`](crate::session::Session) may disagree about the form,
+    /// so without this a reader would silently be served state translated the other way, and
+    /// whichever form opened first would decide for the rest.
+    ///
+    /// Costs nothing when a session sees one form, which is the ordinary case: one form means
+    /// one prefix, and the cache behaves exactly as it did before. Two forms cost a second
+    /// copy of the state for the datasets that differ.
+    ///
+    /// If `Direct` is eventually removed there is only one form left, and this collapses back
+    /// into [`Self::for_dataset`].
+    pub fn for_dataset_with_remap_mode(&self, uri: &str, mode: IndexRemapMode) -> DSIndexCache {
+        DSIndexCache(self.0.with_key_prefix(&format!("{uri}/{mode:?}")))
+    }
 }
 
 impl Clone for GlobalIndexCache {
@@ -81,17 +103,13 @@ impl DSIndexCache {
 #[derive(Debug)]
 pub struct FragReuseIndexKey<'a> {
     pub uuid: &'a Uuid,
-    /// Part of the key because the two forms are not interchangeable: they resolve some
-    /// addresses differently, so datasets sharing a session must not share an entry unless
-    /// they asked for the same one.
-    pub mode: IndexRemapMode,
 }
 
 impl CacheKey for FragReuseIndexKey<'_> {
     type ValueType = FragReuseIndex;
 
     fn key(&self) -> Cow<'_, str> {
-        Cow::Owned(format!("frag_reuse/{}/{:?}", self.uuid, self.mode))
+        Cow::Owned(format!("frag_reuse/{}", self.uuid))
     }
 
     fn type_name() -> &'static str {
