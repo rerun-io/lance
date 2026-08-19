@@ -4745,8 +4745,15 @@ mod tests {
         assert!(frag_reuse_index.is_some());
     }
 
+    /// Both forms of an all-rows-deleted remap. This is the one place `fully_deleted_fragments`
+    /// decides the outcome -- `remap_index` returns `Keep` when it equals the index's fragment
+    /// bitmap -- and the two arms compute it differently: `Direct` infers the set from whichever
+    /// keys are present, `Compact` reads it off the fragments the groups cover.
+    #[rstest]
+    #[case::direct(all_deleted_direct())]
+    #[case::compact(all_deleted_compact())]
     #[tokio::test]
-    async fn test_remap_empty() {
+    async fn test_remap_empty(#[case] remap: RowAddrRemap) {
         let data = gen_batch()
             .col("int", array::step::<Int32Type>())
             .col(
@@ -4762,14 +4769,29 @@ mod tests {
             .await
             .unwrap();
 
+        // The remaps below name fragment 0 and its 256 rows; keep that honest.
+        assert_eq!(dataset.count_all_rows().await.unwrap(), 256);
+        assert_eq!(dataset.get_fragments().len(), 1);
+
         let index_uuid = dataset.load_indices().await.unwrap()[0].uuid;
-        let remap_to_empty = (0..dataset.count_all_rows().await.unwrap())
-            .map(|i| (i as u64, None))
-            .collect::<HashMap<_, _>>();
-        let new_uuid = remap_index(&dataset, &index_uuid, &RowAddrRemap::direct(remap_to_empty))
-            .await
-            .unwrap();
+        let new_uuid = remap_index(&dataset, &index_uuid, &remap).await.unwrap();
         assert_eq!(new_uuid, RemapResult::Keep(index_uuid));
+    }
+
+    /// Every row of the single fragment mapped to deleted, enumerated.
+    fn all_deleted_direct() -> RowAddrRemap {
+        RowAddrRemap::direct((0..256u64).map(|row| (row, None)).collect())
+    }
+
+    /// The same thing said structurally: fragment 0 covered, nothing rewritten out of it, so
+    /// every address it holds is deleted without enumerating any of them.
+    fn all_deleted_compact() -> RowAddrRemap {
+        RowAddrRemap::compact([lance_core::utils::row_addr_remap::GroupInput {
+            rewritten_old_row_addrs: roaring::RoaringTreemap::new(),
+            old_frag_ids: vec![0],
+            new_frags: vec![],
+        }])
+        .unwrap()
     }
 
     #[tokio::test]
