@@ -88,7 +88,7 @@ use crate::dataset::optimize::RemappedIndex;
 use crate::dataset::optimize::remapping::RemapResult;
 use crate::dataset::transaction::{Operation, Transaction, TransactionBuilder};
 pub use crate::index::api::{DatasetIndexExt, IndexSegment, IntoIndexSegment};
-use crate::index::frag_reuse::{load_frag_reuse_index_details, open_frag_reuse_index};
+use crate::index::frag_reuse::{load_frag_reuse_index_details, open_frag_reuse_index_with_mode};
 use crate::index::mem_wal::open_mem_wal_index;
 pub use crate::index::prefilter::{FilterLoader, PreFilter};
 use crate::index::scalar::{IndexDetails, fetch_index_details, load_training_data};
@@ -1097,8 +1097,13 @@ impl DatasetIndexExt for Dataset {
         if let Some(frag_reuse_index_meta) =
             indices.iter().find(|idx| idx.name == FRAG_REUSE_INDEX_NAME)
         {
+            // The two forms resolve some addresses differently, so a dataset that asked for
+            // one must not be served the other from a `Session` shared with a dataset that
+            // asked for the other.
+            let mode = self.frag_reuse_remap_mode;
             let fri_key = FragReuseIndexKey {
                 uuid: &frag_reuse_index_meta.uuid,
+                mode,
             };
             let frag_reuse_index = self
                 .index_cache
@@ -1108,7 +1113,12 @@ impl DatasetIndexExt for Dataset {
                     // the waiter's write lock across the init future).
                     let index_details =
                         load_frag_reuse_index_details(self, frag_reuse_index_meta).await?;
-                    open_frag_reuse_index(frag_reuse_index_meta.uuid, index_details.as_ref()).await
+                    open_frag_reuse_index_with_mode(
+                        frag_reuse_index_meta.uuid,
+                        index_details.as_ref(),
+                        mode,
+                    )
+                    .await
                 })
                 .await?;
             let mut indices = indices.as_ref().clone();
@@ -2229,8 +2239,10 @@ impl DatasetIndexInternalExt for Dataset {
     ) -> Result<Option<Arc<FragReuseIndex>>> {
         if let Some(frag_reuse_index_meta) = self.load_index_by_name(FRAG_REUSE_INDEX_NAME).await? {
             let frag_reuse_uuid = frag_reuse_index_meta.uuid;
+            let mode = self.frag_reuse_remap_mode;
             let frag_reuse_key = FragReuseIndexKey {
                 uuid: &frag_reuse_uuid,
+                mode,
             };
 
             let index = self
@@ -2246,9 +2258,12 @@ impl DatasetIndexInternalExt for Dataset {
                     // mirroring the loader in `load_indices()`.
                     let index_details =
                         load_frag_reuse_index_details(self, &frag_reuse_index_meta).await?;
-                    let index =
-                        open_frag_reuse_index(frag_reuse_index_meta.uuid, index_details.as_ref())
-                            .await?;
+                    let index = open_frag_reuse_index_with_mode(
+                        frag_reuse_index_meta.uuid,
+                        index_details.as_ref(),
+                        mode,
+                    )
+                    .await?;
 
                     info!(target: TRACE_IO_EVENTS, index_uuid=%frag_reuse_uuid, r#type=IO_TYPE_OPEN_FRAG_REUSE);
                     metrics.record_index_load();

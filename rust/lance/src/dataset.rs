@@ -64,7 +64,7 @@ use std::fmt::Debug;
 use std::num::NonZero;
 use std::ops::Range;
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use tracing::{info, instrument};
 
 pub(crate) mod blob;
@@ -104,6 +104,7 @@ use self::transaction::{Operation, Transaction, TransactionBuilder, UpdateMapEnt
 use self::write::{cleanup_data_fragments, write_fragments_internal};
 use crate::dataset::branch_location::BranchLocation;
 use crate::dataset::cleanup::{CleanupOperation, CleanupPolicy, CleanupPolicyBuilder};
+use crate::dataset::optimize::IndexRemapMode;
 use crate::dataset::refs::{BranchContents, BranchIdentifier, Branches, Tags};
 use crate::dataset::sql::SqlQueryBuilder;
 use crate::datatypes::Schema;
@@ -183,6 +184,10 @@ pub struct Dataset {
 
     /// File reader options to use when reading data files.
     pub(crate) file_reader_options: Option<FileReaderOptions>,
+
+    /// How to expand the fragment reuse index when opening an index. See
+    /// [`ReadParams::frag_reuse_remap_mode`].
+    pub(crate) frag_reuse_remap_mode: IndexRemapMode,
 
     /// Object store parameters used when opening this dataset.
     /// These are used when creating object stores for additional base paths.
@@ -270,6 +275,23 @@ pub struct ReadParams {
     /// per-scan basis via [`Scanner::batch_size_bytes`](crate::dataset::scanner::Scanner::batch_size_bytes) or
     /// [`Scanner::with_file_reader_options`](crate::dataset::scanner::Scanner::with_file_reader_options).
     pub file_reader_options: Option<FileReaderOptions>,
+
+    /// How the fragment reuse index expands its payload when an index is opened.
+    ///
+    /// Compaction chooses between the same two forms via
+    /// [`CompactionOptions::index_remap_mode`](crate::dataset::optimize::CompactionOptions);
+    /// this is the reader's equivalent.
+    ///
+    /// [`IndexRemapMode::Direct`] materializes one entry per rewritten or deleted row, so its
+    /// memory grows with the rows compaction has touched. [`IndexRemapMode::Compact`] stores
+    /// per-fragment bitmaps instead, so it grows with the number of fragments, at the cost of
+    /// more work per lookup. A dataset with a long reuse history can make the materialized
+    /// form large enough to exhaust memory when an index is opened.
+    ///
+    /// This defaults to the `LANCE_FRAG_REUSE_REMAP_MODE` environment variable when present,
+    /// accepting `"direct"` or `"compact"`, and to [`IndexRemapMode::Direct`] otherwise. The
+    /// env var is read once per process.
+    pub frag_reuse_remap_mode: IndexRemapMode,
 }
 
 impl ReadParams {
@@ -318,6 +340,14 @@ impl ReadParams {
     }
 
     /// Set the file reader options.
+    /// Choose how the fragment reuse index expands its payload when an index is opened.
+    ///
+    /// See [`ReadParams::frag_reuse_remap_mode`] for what the two forms cost.
+    pub fn frag_reuse_remap_mode(&mut self, mode: IndexRemapMode) -> &mut Self {
+        self.frag_reuse_remap_mode = mode;
+        self
+    }
+
     pub fn file_reader_options(&mut self, options: FileReaderOptions) -> &mut Self {
         self.file_reader_options = Some(options);
         self
@@ -333,8 +363,29 @@ impl Default for ReadParams {
             store_options: None,
             commit_handler: None,
             file_reader_options: None,
+            frag_reuse_remap_mode: default_frag_reuse_remap_mode(),
         }
     }
+}
+
+const ENV_LANCE_FRAG_REUSE_REMAP_MODE: &str = "LANCE_FRAG_REUSE_REMAP_MODE";
+
+/// The reuse-remap form a reader uses unless told otherwise, from the environment if set.
+///
+/// Read once per process, so a deployment sets it before opening datasets rather than
+/// expecting a running process to notice a change.
+pub(crate) fn default_frag_reuse_remap_mode() -> IndexRemapMode {
+    static MODE: OnceLock<IndexRemapMode> = OnceLock::new();
+    *MODE.get_or_init(|| match std::env::var(ENV_LANCE_FRAG_REUSE_REMAP_MODE) {
+        Err(_) => IndexRemapMode::Direct,
+        Ok(raw) => IndexRemapMode::try_from(raw.as_str()).unwrap_or_else(|_| {
+            log::warn!(
+                "Ignoring {ENV_LANCE_FRAG_REUSE_REMAP_MODE}='{raw}': expected \"direct\" or \
+                 \"compact\". Using direct."
+            );
+            IndexRemapMode::Direct
+        }),
+    })
 }
 
 #[derive(Debug, Clone)]
@@ -622,6 +673,7 @@ impl Dataset {
             self.session.clone(),
             self.commit_handler.clone(),
             self.file_reader_options.clone(),
+            self.frag_reuse_remap_mode,
             self.store_params.as_deref().cloned(),
             self.base_store_params.clone(),
         )
@@ -741,6 +793,7 @@ impl Dataset {
         session: Arc<Session>,
         commit_handler: Arc<dyn CommitHandler>,
         file_reader_options: Option<FileReaderOptions>,
+        frag_reuse_remap_mode: IndexRemapMode,
         store_params: Option<ObjectStoreParams>,
         base_store_params: Option<Arc<HashMap<String, ObjectStoreParams>>>,
     ) -> Result<Self> {
@@ -769,6 +822,7 @@ impl Dataset {
             metadata_cache,
             index_cache,
             file_reader_options,
+            frag_reuse_remap_mode,
             store_params: store_params.map(Box::new),
             base_store_params,
         })
@@ -2957,6 +3011,7 @@ pub(crate) fn load_new_transactions(dataset: &Dataset) -> NewTransactionResult<'
                         dataset.session(),
                         dataset.commit_handler.clone(),
                         dataset.file_reader_options.clone(),
+                        dataset.frag_reuse_remap_mode,
                         dataset.store_params.as_deref().cloned(),
                         dataset.base_store_params.clone(),
                     )?;
@@ -2989,6 +3044,7 @@ pub(crate) fn load_new_transactions(dataset: &Dataset) -> NewTransactionResult<'
                 dataset.session(),
                 dataset.commit_handler.clone(),
                 dataset.file_reader_options.clone(),
+                dataset.frag_reuse_remap_mode,
                 dataset.store_params.as_deref().cloned(),
                 dataset.base_store_params.clone(),
             )

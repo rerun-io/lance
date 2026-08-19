@@ -7,7 +7,7 @@
 use crate::Result;
 use crate::dataset::transaction::{Operation, Transaction};
 use crate::index::DatasetIndexExt;
-use crate::index::frag_reuse::{load_frag_reuse_index_details, open_frag_reuse_index};
+use crate::index::frag_reuse::{load_frag_reuse_index_details, open_frag_reuse_index_with_mode};
 use crate::{Dataset, index};
 use async_trait::async_trait;
 use lance_core::Error;
@@ -216,10 +216,13 @@ async fn remap_index(dataset: &mut Dataset, index_id: &Uuid) -> Result<()> {
     let frag_reuse_details = load_frag_reuse_index_details(dataset, frag_reuse_index_meta)
         .await
         .unwrap();
-    let frag_reuse_index =
-        open_frag_reuse_index(frag_reuse_index_meta.uuid, frag_reuse_details.as_ref())
-            .await
-            .unwrap();
+    let frag_reuse_index = open_frag_reuse_index_with_mode(
+        frag_reuse_index_meta.uuid,
+        frag_reuse_details.as_ref(),
+        dataset.frag_reuse_remap_mode,
+    )
+    .await
+    .unwrap();
 
     if frag_reuse_index.row_addr_maps.is_empty() {
         return Ok(());

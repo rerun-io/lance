@@ -7,6 +7,7 @@ use lance_core::cache::CacheBackend;
 use super::refs::{Branches, Ref, Refs, check_valid_branch, normalize_branch, standardize_branch};
 use super::{DEFAULT_INDEX_CACHE_SIZE, DEFAULT_METADATA_CACHE_SIZE, ReadParams, WriteParams};
 use crate::dataset::branch_location::BranchLocation;
+use crate::dataset::optimize::IndexRemapMode;
 use crate::io::commit::namespace_manifest::LanceNamespaceExternalManifestStore;
 use crate::{Dataset, Error, Result, session::Session};
 use futures::FutureExt;
@@ -49,6 +50,7 @@ pub struct DatasetBuilder {
     version: Option<Ref>,
     table_uri: String,
     file_reader_options: Option<FileReaderOptions>,
+    frag_reuse_remap_mode: IndexRemapMode,
     /// Storage options that override user-provided options (e.g., from namespace client)
     storage_options_override: Option<HashMap<String, String>>,
     /// Runtime-only exact object store bindings keyed by base path URI.
@@ -72,6 +74,7 @@ impl std::fmt::Debug for DatasetBuilder {
             .field("version", &self.version)
             .field("table_uri", &self.table_uri)
             .field("file_reader_options", &self.file_reader_options)
+            .field("frag_reuse_remap_mode", &self.frag_reuse_remap_mode)
             .field(
                 "storage_options_override",
                 &self.storage_options_override.is_some(),
@@ -95,6 +98,7 @@ impl DatasetBuilder {
             version: None,
             manifest: None,
             file_reader_options: None,
+            frag_reuse_remap_mode: crate::dataset::default_frag_reuse_remap_mode(),
             storage_options_override: None,
             base_store_params: HashMap::new(),
             namespace_managed: None,
@@ -472,6 +476,14 @@ impl DatasetBuilder {
     }
 
     /// Set options based on [ReadParams].
+    /// Choose how the fragment reuse index is expanded when an index is opened.
+    ///
+    /// See [`ReadParams::frag_reuse_remap_mode`] for what the two forms cost.
+    pub fn with_frag_reuse_remap_mode(mut self, mode: IndexRemapMode) -> Self {
+        self.frag_reuse_remap_mode = mode;
+        self
+    }
+
     pub fn with_read_params(mut self, read_params: ReadParams) -> Self {
         self = self
             .with_index_cache_size_bytes(read_params.index_cache_size_bytes)
@@ -492,6 +504,11 @@ impl DatasetBuilder {
         if let Some(file_reader_options) = read_params.file_reader_options {
             self.file_reader_options = Some(file_reader_options);
         }
+
+        // Not an `Option`, so it always carries across: `ReadParams::default()` already
+        // resolved the environment default, and taking it here keeps the two ways of setting
+        // read options agreeing.
+        self.frag_reuse_remap_mode = read_params.frag_reuse_remap_mode;
 
         self
     }
@@ -668,6 +685,7 @@ impl DatasetBuilder {
         let manifest = self.manifest.take();
 
         let file_reader_options = self.file_reader_options.clone();
+        let frag_reuse_remap_mode = self.frag_reuse_remap_mode;
         let store_params = self.options.clone();
         let base_store_params = (!self.base_store_params.is_empty())
             .then(|| Arc::new(std::mem::take(&mut self.base_store_params)));
@@ -765,6 +783,7 @@ impl DatasetBuilder {
             session,
             manifest,
             file_reader_options,
+            frag_reuse_remap_mode,
             table_uri,
             version_number,
             object_store,
@@ -817,6 +836,7 @@ impl DatasetBuilder {
         session: Arc<Session>,
         manifest: Option<Manifest>,
         file_reader_options: Option<FileReaderOptions>,
+        frag_reuse_remap_mode: IndexRemapMode,
         table_uri: String,
         version_number: Option<u64>,
         object_store: Arc<ObjectStore>,
@@ -885,6 +905,7 @@ impl DatasetBuilder {
             session,
             commit_handler,
             file_reader_options,
+            frag_reuse_remap_mode,
             store_params,
             base_store_params,
         )

@@ -12,6 +12,7 @@
 
 use std::{borrow::Cow, ops::Deref, sync::Arc};
 
+use crate::dataset::optimize::IndexRemapMode;
 use lance_core::cache::{CacheKey, LanceCache};
 use lance_core::deepsize::{Context, DeepSizeOf};
 use lance_index::frag_reuse::FragReuseIndex;
@@ -80,13 +81,17 @@ impl DSIndexCache {
 #[derive(Debug)]
 pub struct FragReuseIndexKey<'a> {
     pub uuid: &'a Uuid,
+    /// Part of the key because the two forms are not interchangeable: they resolve some
+    /// addresses differently, so datasets sharing a session must not share an entry unless
+    /// they asked for the same one.
+    pub mode: IndexRemapMode,
 }
 
 impl CacheKey for FragReuseIndexKey<'_> {
     type ValueType = FragReuseIndex;
 
     fn key(&self) -> Cow<'_, str> {
-        Cow::Owned(format!("frag_reuse/{}", self.uuid))
+        Cow::Owned(format!("frag_reuse/{}/{:?}", self.uuid, self.mode))
     }
 
     fn type_name() -> &'static str {

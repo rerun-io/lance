@@ -460,6 +460,7 @@ impl<'a> CommitBuilder<'a> {
                     fragment_bitmap,
                     metadata_cache,
                     file_reader_options: None,
+                    frag_reuse_remap_mode: crate::dataset::default_frag_reuse_remap_mode(),
                     store_params: self.store_params.clone().map(Box::new),
                     base_store_params: None,
                 })
