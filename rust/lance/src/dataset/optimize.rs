@@ -2276,7 +2276,9 @@ mod tests {
     use crate::dataset::WriteDestination;
     use crate::dataset::index::frag_reuse::cleanup_frag_reuse_index;
     use crate::dataset::optimize::remapping::{transpose_row_addrs, transpose_row_ids_from_digest};
-    use crate::index::frag_reuse::{load_frag_reuse_index_details, open_frag_reuse_index};
+    use crate::index::frag_reuse::{
+        load_frag_reuse_index_details, open_frag_reuse_index_with_mode,
+    };
     use crate::index::vector::{StageParams, VectorIndexParams};
     use crate::utils::test::{DatagenExt, FragmentCount, FragmentRowCount};
     use arrow_array::types::{Float32Type, Float64Type, Int32Type, Int64Type};
@@ -3570,10 +3572,13 @@ mod tests {
         let frag_reuse_details = load_frag_reuse_index_details(&dataset, &frag_reuse_index_meta)
             .await
             .unwrap();
-        let frag_reuse_index =
-            open_frag_reuse_index(frag_reuse_index_meta.uuid, frag_reuse_details.as_ref())
-                .await
-                .unwrap();
+        let frag_reuse_index = open_frag_reuse_index_with_mode(
+            frag_reuse_index_meta.uuid,
+            frag_reuse_details.as_ref(),
+            IndexRemapMode::Compact,
+        )
+        .await
+        .unwrap();
         let stats = FragReuseIndexHandle(Arc::new(frag_reuse_index.clone()))
             .statistics()
             .unwrap();
@@ -3737,10 +3742,13 @@ mod tests {
                 load_frag_reuse_index_details(&dataset, &frag_reuse_index_meta)
                     .await
                     .unwrap();
-            let frag_reuse_index =
-                open_frag_reuse_index(frag_reuse_index_meta.uuid, frag_reuse_details.as_ref())
-                    .await
-                    .unwrap();
+            let frag_reuse_index = open_frag_reuse_index_with_mode(
+                frag_reuse_index_meta.uuid,
+                frag_reuse_details.as_ref(),
+                IndexRemapMode::Compact,
+            )
+            .await
+            .unwrap();
 
             // Verify the index has one version with the correct dataset version
             assert_eq!(
@@ -3991,10 +3999,13 @@ mod tests {
         let frag_reuse_details = load_frag_reuse_index_details(&dataset, &frag_reuse_index_meta)
             .await
             .unwrap();
-        let frag_reuse_index =
-            open_frag_reuse_index(frag_reuse_index_meta.uuid, frag_reuse_details.as_ref())
-                .await
-                .unwrap();
+        let frag_reuse_index = open_frag_reuse_index_with_mode(
+            frag_reuse_index_meta.uuid,
+            frag_reuse_details.as_ref(),
+            IndexRemapMode::Compact,
+        )
+        .await
+        .unwrap();
 
         assert_eq!(frag_reuse_index.details.versions.len(), plan.tasks().len());
 

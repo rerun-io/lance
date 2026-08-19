@@ -2,6 +2,8 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use crate::Dataset;
+use crate::dataset::optimize::IndexRemapMode;
+use crate::dataset::optimize::remapping::transpose_row_ids_from_digest;
 use crate::index::DatasetIndexExt;
 use lance_core::Error;
 use lance_core::utils::row_addr_remap::{GroupInput, RowAddrRemap};
@@ -66,11 +68,42 @@ pub async fn load_frag_reuse_index_details(
     }
 }
 
-/// open fragment reuse index based on its metadata details
-pub(crate) async fn open_frag_reuse_index(
+/// Open a fragment reuse index from its metadata details, in the given form.
+///
+/// The two forms are not interchangeable: see [`ReadParams::frag_reuse_remap_mode`] for what
+/// they cost and where they differ.
+pub(crate) async fn open_frag_reuse_index_with_mode(
     uuid: Uuid,
     details: &FragReuseIndexDetails,
+    mode: IndexRemapMode,
 ) -> lance_core::Result<FragReuseIndex> {
+    if mode == IndexRemapMode::Direct {
+        // The pre-compact behaviour, kept as a fallback. Materializes one entry per rewritten
+        // or deleted row, so its memory grows with the rows compaction has touched -- which is
+        // the cost the compact form exists to avoid. It cannot fail, because pairing rows by
+        // address order silently truncates rather than rejecting a payload whose counts
+        // disagree; see `transpose_row_ids_from_digest`.
+        let mut row_id_maps = Vec::with_capacity(details.versions.len());
+        for version in &details.versions {
+            let mut row_id_map = std::collections::HashMap::new();
+            for group in version.groups.iter() {
+                let changed =
+                    RoaringTreemap::deserialize_from(Cursor::new(&group.changed_row_addrs))?;
+                row_id_map.extend(transpose_row_ids_from_digest(
+                    changed,
+                    &group.old_frags,
+                    &group.new_frags,
+                ));
+            }
+            row_id_maps.push(RowAddrRemap::direct(row_id_map));
+        }
+        return Ok(FragReuseIndex::new_from_remaps(
+            uuid,
+            row_id_maps,
+            details.clone(),
+        ));
+    }
+
     // Build the compact form rather than a materialized per-row map. This runs on every
     // index open and the result is cached, so a per-row map would charge readers a cost
     // that grows with the number of rows compaction has touched, rather than with the
@@ -269,10 +302,134 @@ mod tests {
         }
     }
 
+    /// Opens in the compact form, which is what most tests below are about. Tests that care
+    /// about the other form call `open_frag_reuse_index_with_mode` directly.
     async fn open(details: &FragReuseIndexDetails) -> FragReuseIndex {
-        open_frag_reuse_index(Uuid::new_v4(), details)
+        open_frag_reuse_index_with_mode(Uuid::new_v4(), details, IndexRemapMode::Compact)
             .await
             .expect("index should open")
+    }
+
+    #[test]
+    fn test_builder_default_uses_the_documented_default() {
+        // Two default paths exist -- `ReadParams::default()` and the builder's own field --
+        // and the builder's originally took `IndexRemapMode`'s derived default rather than the
+        // documented one, so the environment variable silently did not apply through the
+        // builder, which is the common way to open a dataset.
+        //
+        // Asserted against the builder's own field, not against `ReadParams`: comparing the
+        // two documented defaults to each other passes whether or not the builder consults
+        // either. This also catches the derived default and the documented one drifting apart,
+        // which is what would happen if `IndexRemapMode`'s `#[default]` ever moved.
+        let builder = crate::dataset::builder::DatasetBuilder::from_uri("memory://test");
+        let expected = crate::dataset::default_frag_reuse_remap_mode();
+        assert!(
+            format!("{builder:?}").contains(&format!("frag_reuse_remap_mode: {expected:?}")),
+            "builder default should be {expected:?}: {builder:?}"
+        );
+    }
+
+    #[test]
+    fn test_read_params_mode_survives_the_builder() {
+        // `with_read_params` copies fields one by one, so a new one is easy to forget: this
+        // caught exactly that.
+        let mut params = crate::dataset::ReadParams::default();
+        params.frag_reuse_remap_mode(IndexRemapMode::Compact);
+        let builder = crate::dataset::builder::DatasetBuilder::from_uri("memory://test")
+            .with_read_params(params);
+        assert!(
+            format!("{builder:?}").contains("frag_reuse_remap_mode: Compact"),
+            "the builder should carry the mode from the read params: {builder:?}"
+        );
+    }
+
+    #[test]
+    fn test_default_mode_is_direct() {
+        // Pinned because it is the compatibility contract: a reader that says nothing keeps
+        // the behaviour it had before the compact form existed, so picking up a Lance that
+        // carries this change is not itself a behaviour change. Callers that want the compact
+        // form ask for it.
+        //
+        // Reads `ReadParams::default()`, so it also covers the env default being absent, which
+        // is the state any normal test process is in.
+        assert_eq!(
+            crate::dataset::ReadParams::default().frag_reuse_remap_mode,
+            IndexRemapMode::Direct
+        );
+    }
+
+    #[rstest]
+    #[case::compact(IndexRemapMode::Compact)]
+    #[case::direct(IndexRemapMode::Direct)]
+    #[tokio::test]
+    async fn test_both_modes_agree_on_a_real_payload(#[case] mode: IndexRemapMode) {
+        // The switch's whole purpose is that either mode can serve a reader, so for a payload
+        // a writer can actually produce they must resolve every real address identically.
+        // Probed against expectations written once, not against each other, so a shared bug
+        // could not make both pass.
+        let old = vec![digest(0, 5), digest(1, 4)];
+        let new = vec![digest(10, 3), digest(11, 3)];
+        let rewritten = [(0, 0), (0, 2), (0, 4), (1, 0), (1, 1), (1, 3)];
+        let index = open_frag_reuse_index_with_mode(
+            Uuid::new_v4(),
+            &details(vec![vec![group(rewritten, old, new)]]),
+            mode,
+        )
+        .await
+        .unwrap();
+
+        // Positions run in read order across both new fragments.
+        assert_eq!(index.remap_row_id(addr(0, 0)), Some(addr(10, 0)));
+        assert_eq!(index.remap_row_id(addr(0, 2)), Some(addr(10, 1)));
+        assert_eq!(index.remap_row_id(addr(0, 4)), Some(addr(10, 2)));
+        assert_eq!(index.remap_row_id(addr(1, 0)), Some(addr(11, 0)));
+        assert_eq!(index.remap_row_id(addr(1, 1)), Some(addr(11, 1)));
+        assert_eq!(index.remap_row_id(addr(1, 3)), Some(addr(11, 2)));
+        // Deleted before compaction.
+        assert_eq!(index.remap_row_id(addr(0, 1)), None);
+        assert_eq!(index.remap_row_id(addr(0, 3)), None);
+        assert_eq!(index.remap_row_id(addr(1, 2)), None);
+        // Untouched by the group.
+        assert_eq!(index.remap_row_id(addr(9, 0)), Some(addr(9, 0)));
+    }
+
+    #[tokio::test]
+    async fn test_direct_mode_yields_the_materialized_form() {
+        let index = open_frag_reuse_index_with_mode(
+            Uuid::new_v4(),
+            &details(vec![vec![group(
+                [(0, 0), (0, 2)],
+                vec![digest(0, 3)],
+                vec![digest(10, 2)],
+            )]]),
+            IndexRemapMode::Direct,
+        )
+        .await
+        .unwrap();
+        assert!(matches!(index.row_addr_maps[0], RowAddrRemap::Direct(_)));
+    }
+
+    #[tokio::test]
+    async fn test_direct_mode_accepts_a_payload_compact_rejects() {
+        // The fallback has to be usable for the case it exists for. A payload whose row counts
+        // disagree is rejected by the compact form and silently truncated by the map form, so
+        // switching modes has to turn that failure into an open.
+        let details = details(vec![vec![group(
+            [(0, 0), (0, 1)],
+            vec![digest(0, 2)],
+            vec![digest(10, 1)],
+        )]]);
+        let uuid = Uuid::new_v4();
+        assert!(
+            open_frag_reuse_index_with_mode(uuid, &details, IndexRemapMode::Compact)
+                .await
+                .is_err()
+        );
+        assert!(
+            open_frag_reuse_index_with_mode(uuid, &details, IndexRemapMode::Direct)
+                .await
+                .is_ok()
+        );
     }
 
     #[tokio::test]
@@ -618,9 +775,10 @@ mod tests {
     ) {
         // The map form silently truncated these; opening now fails instead.
         let details = details(vec![vec![group(rewritten, old_frags, new_frags)]]);
-        let err = open_frag_reuse_index(Uuid::new_v4(), &details)
-            .await
-            .expect_err("inconsistent details should be rejected");
+        let err =
+            open_frag_reuse_index_with_mode(Uuid::new_v4(), &details, IndexRemapMode::Compact)
+                .await
+                .expect_err("inconsistent details should be rejected");
         assert!(
             err.to_string().contains("old rows"),
             "expected the row-count validation, got: {err}"
@@ -670,7 +828,7 @@ mod tests {
         group.changed_row_addrs = corrupt;
         let details = details(vec![vec![group]]);
         assert!(
-            open_frag_reuse_index(Uuid::new_v4(), &details)
+            open_frag_reuse_index_with_mode(Uuid::new_v4(), &details, IndexRemapMode::Compact)
                 .await
                 .is_err()
         );
