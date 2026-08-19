@@ -81,14 +81,39 @@ pub(crate) async fn open_frag_reuse_index(
         for group in version.groups.iter() {
             let cursor = Cursor::new(&group.changed_row_addrs);
             let rewritten_old_row_addrs = RoaringTreemap::deserialize_from(cursor)?;
-            groups.push(GroupInput {
-                rewritten_old_row_addrs,
-                old_frag_ids: group.old_frags.iter().map(|frag| frag.id as u32).collect(),
-                new_frags: group
+
+            // Lance 0.30.0 through 4.0.0-beta.6 recorded an empty set of rewritten
+            // addresses for a stable-row-id dataset whose index remap was deferred, while
+            // still recording how many rows the new fragments received. Such payloads are
+            // on disk and must keep opening.
+            //
+            // Positional mapping needs the two counts to agree, so the new fragments are
+            // dropped for these groups, leaving every covered address resolving to
+            // deleted. That is what the previous per-row map produced for the same input,
+            // so the behaviour is unchanged; only the failure mode would be new.
+            let is_legacy_empty_rewrite =
+                rewritten_old_row_addrs.is_empty() && !group.new_frags.is_empty();
+            if is_legacy_empty_rewrite {
+                tracing::warn!(
+                    old_frags = ?group.old_frags.iter().map(|frag| frag.id).collect::<Vec<_>>(),
+                    "fragment reuse group records no rewritten rows but non-empty new \
+                     fragments; treating its fragments as deleted"
+                );
+            }
+            let new_frags = if is_legacy_empty_rewrite {
+                Vec::new()
+            } else {
+                group
                     .new_frags
                     .iter()
                     .map(|frag| (frag.id as u32, frag.physical_rows as u32))
-                    .collect(),
+                    .collect()
+            };
+
+            groups.push(GroupInput {
+                rewritten_old_row_addrs,
+                old_frag_ids: group.old_frags.iter().map(|frag| frag.id as u32).collect(),
+                new_frags,
             });
         }
         row_addr_maps.push(RowAddrRemap::compact(groups)?);
@@ -545,6 +570,39 @@ mod tests {
             err.to_string().contains("old rows"),
             "expected the row-count validation, got: {err}"
         );
+    }
+
+    #[tokio::test]
+    async fn test_legacy_empty_rewrite_payload_still_opens() {
+        // Lance 0.30.0 through 4.0.0-beta.6 wrote this shape for a stable-row-id dataset
+        // with deferred index remap: no rewritten addresses, but new fragments with real
+        // row counts. Those two disagree, so a strict reading rejects the group -- and
+        // `open_frag_reuse_index` runs inside `load_indices`, which would take a dataset
+        // that used to open and make every scan, validate and commit fail.
+        let index = open(&details(vec![vec![group(
+            [],
+            vec![digest(0, 400), digest(1, 400)],
+            vec![digest(2, 800)],
+        )]]))
+        .await;
+
+        // The old per-row map resolved every covered address to deleted for this input, so
+        // that is what is preserved. The rows are unreachable either way until the index is
+        // rebuilt; what matters is that opening succeeds.
+        assert_eq!(index.remap_row_id(addr(0, 0)), None);
+        assert_eq!(index.remap_row_id(addr(1, 399)), None);
+        // Fragments the group never claimed are still untouched.
+        assert_eq!(index.remap_row_id(addr(2, 0)), Some(addr(2, 0)));
+        assert_eq!(index.remap_row_id(addr(9, 0)), Some(addr(9, 0)));
+    }
+
+    #[tokio::test]
+    async fn test_genuinely_emptied_group_is_unaffected_by_the_legacy_path() {
+        // The legacy shape is distinguished by new fragments being present. A group that
+        // really did delete everything carries none, and must behave as before.
+        let index = open(&details(vec![vec![group([], vec![digest(7, 4)], vec![])]])).await;
+        assert_eq!(index.remap_row_id(addr(7, 0)), None);
+        assert_eq!(index.remap_row_id(addr(8, 0)), Some(addr(8, 0)));
     }
 
     #[tokio::test]
