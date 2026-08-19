@@ -376,6 +376,153 @@ impl FragReuseIndex {
 mod tests {
 
     use super::*;
+    use arrow_array::StringArray;
+    use arrow_schema::{DataType, Field, Schema};
+    use lance_core::utils::address::RowAddress;
+    use lance_core::utils::row_addr_remap::GroupInput;
+    use rstest::rstest;
+
+    fn addr(frag: u32, offset: u32) -> u64 {
+        u64::from(RowAddress::new_from_parts(frag, offset))
+    }
+
+    /// One compaction round: `rewritten` old addresses moving into `new_frags`, in order.
+    fn compact_round(
+        rewritten: &[(u32, u32)],
+        old_frag_ids: Vec<u32>,
+        new_frags: Vec<(u32, u32)>,
+    ) -> RowAddrRemap {
+        RowAddrRemap::compact([GroupInput {
+            rewritten_old_row_addrs: RoaringTreemap::from_iter(
+                rewritten.iter().map(|&(frag, offset)| addr(frag, offset)),
+            ),
+            old_frag_ids,
+            new_frags,
+        }])
+        .unwrap()
+    }
+
+    /// `details` is left empty: nothing on these paths reads it, and keeping it in step
+    /// with `maps` would add noise to every test below.
+    fn index_from(maps: Vec<RowAddrRemap>) -> FragReuseIndex {
+        FragReuseIndex::new_from_remaps(
+            Uuid::new_v4(),
+            maps,
+            FragReuseIndexDetails { versions: vec![] },
+        )
+    }
+
+    /// frag 0 offsets {0,2} -> frag 10; then frag 10 offset {0} -> frag 20.
+    fn two_round_index() -> FragReuseIndex {
+        index_from(vec![
+            compact_round(&[(0, 0), (0, 2)], vec![0], vec![(10, 2)]),
+            compact_round(&[(10, 0)], vec![10], vec![(20, 1)]),
+        ])
+    }
+
+    #[test]
+    fn test_remap_row_id_over_compact_rounds() {
+        let index = two_round_index();
+        // Moved twice.
+        assert_eq!(index.remap_row_id(addr(0, 0)), Some(addr(20, 0)));
+        // Moved by round 1, dropped by round 2.
+        assert_eq!(index.remap_row_id(addr(0, 2)), None);
+        // Deleted before round 1 ever ran.
+        assert_eq!(index.remap_row_id(addr(0, 1)), None);
+        // Untouched by both rounds.
+        assert_eq!(index.remap_row_id(addr(5, 5)), Some(addr(5, 5)));
+    }
+
+    #[test]
+    fn test_chaining_works_with_a_direct_link() {
+        // Nothing in-tree builds a mixed chain -- `new` produces all `Direct`, the open
+        // path all `Compact` -- but `new_from_remaps` and the public field permit one, and
+        // the walk must not care which form a link takes. Asserted against absolute
+        // expectations: a differential check against an all-compact chain would also pass
+        // against a stubbed `remap_row_id`.
+        let mixed = index_from(vec![
+            compact_round(&[(0, 0), (0, 2)], vec![0], vec![(10, 2)]),
+            RowAddrRemap::direct(HashMap::from_iter([
+                (addr(10, 0), Some(addr(20, 0))),
+                (addr(10, 1), None),
+            ])),
+        ]);
+
+        assert_eq!(mixed.remap_row_id(addr(0, 0)), Some(addr(20, 0)));
+        assert_eq!(mixed.remap_row_id(addr(0, 2)), None);
+        assert_eq!(mixed.remap_row_id(addr(0, 1)), None);
+        assert_eq!(mixed.remap_row_id(addr(5, 5)), Some(addr(5, 5)));
+        // The two forms are not interchangeable, only chainable: a `Direct` link knows only
+        // the addresses it lists, so an unlisted offset in a covered fragment is untouched,
+        // where the compact form would report it deleted.
+        assert_eq!(mixed.remap_row_id(addr(10, 2)), Some(addr(10, 2)));
+    }
+
+    /// `row_id_idx` is 1 for scalar indices (`btree.rs`) and 0 for vector storage
+    /// (`vector/flat/storage.rs`, `vector/sq/storage.rs`). Both layouts are in use, and the
+    /// method's only non-trivial logic is the `1 - row_id_idx` swap plus the `take`.
+    #[rstest]
+    #[case::row_id_last(1)]
+    #[case::row_id_first(0)]
+    fn test_remap_row_ids_record_batch_keeps_values_paired(#[case] row_id_idx: usize) {
+        let index = two_round_index();
+        // (0,0) survives to (20,0); (0,2) is dropped by round 2; (5,5) passes through.
+        let values: Arc<dyn Array> = Arc::new(StringArray::from(vec!["keep", "drop", "pass"]));
+        let row_ids: Arc<dyn Array> =
+            Arc::new(UInt64Array::from(vec![addr(0, 0), addr(0, 2), addr(5, 5)]));
+        let (value_field, columns) = if row_id_idx == 0 {
+            (1, vec![row_ids, values])
+        } else {
+            (0, vec![values, row_ids])
+        };
+        let mut fields = vec![
+            Field::new("value", DataType::Utf8, false),
+            Field::new("row_id", DataType::UInt64, false),
+        ];
+        if row_id_idx == 0 {
+            fields.swap(0, 1);
+        }
+        let batch = RecordBatch::try_new(Arc::new(Schema::new(fields)), columns).unwrap();
+
+        let remapped = index.remap_row_ids_record_batch(batch, row_id_idx).unwrap();
+        assert_eq!(remapped.num_rows(), 2);
+        let out_values = remapped
+            .column(value_field)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        let out_row_ids = remapped
+            .column(row_id_idx)
+            .as_any()
+            .downcast_ref::<UInt64Array>()
+            .unwrap();
+        // Each surviving value must still sit beside its own remapped address.
+        assert_eq!(out_values.value(0), "keep");
+        assert_eq!(out_row_ids.value(0), addr(20, 0));
+        assert_eq!(out_values.value(1), "pass");
+        assert_eq!(out_row_ids.value(1), addr(5, 5));
+    }
+
+    #[test]
+    fn test_remap_row_addrs_tree_map_drops_deleted_rows() {
+        // The wrapper with the most callers in-tree (bitmap, rtree and label_list indices).
+        let index = two_round_index();
+        let input = RowAddrTreeMap::from_iter([addr(0, 0), addr(0, 2), addr(5, 5)]);
+        assert_eq!(
+            index.remap_row_addrs_tree_map(&input),
+            RowAddrTreeMap::from_iter([addr(20, 0), addr(5, 5)])
+        );
+    }
+
+    #[test]
+    fn test_remap_roaring_tree_map_drops_deleted_rows() {
+        let index = two_round_index();
+        let input = RoaringTreemap::from_iter([addr(0, 0), addr(0, 2), addr(5, 5)]);
+        assert_eq!(
+            index.remap_row_ids_roaring_tree_map(&input),
+            RoaringTreemap::from_iter([addr(20, 0), addr(5, 5)])
+        );
+    }
 
     #[tokio::test]
     async fn test_serialize_deserialize_index_details() {
