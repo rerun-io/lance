@@ -12,6 +12,7 @@
 
 use std::{borrow::Cow, ops::Deref, sync::Arc};
 
+use crate::dataset::optimize::IndexRemapMode;
 use lance_core::cache::{CacheKey, CacheKeySchema, KeyBuilder, LanceCache};
 use lance_core::deepsize::{Context, DeepSizeOf};
 use lance_index::frag_reuse::FragReuseIndex;
@@ -26,6 +27,28 @@ impl GlobalIndexCache {
         // Create a sub-cache for the dataset by adding the URI as a key prefix.
         // This prevents collisions between different datasets.
         DSIndexCache(self.0.with_key_prefix(uri))
+    }
+
+    /// As [`Self::for_dataset`], keeping the two fragment-reuse remap forms apart.
+    ///
+    /// What an index caches is not the index as stored: with the remap deferred, its row
+    /// addresses are translated through the fragment reuse index as it loads. So the cached
+    /// state is the index *as translated*, and the two forms do not translate identically --
+    /// an offset past a fragment's `physical_rows`, for instance, is deleted under
+    /// [`IndexRemapMode::Compact`] and untouched under [`IndexRemapMode::Direct`].
+    ///
+    /// Datasets sharing a [`Session`](crate::session::Session) may disagree about the form,
+    /// so without this a reader would silently be served state translated the other way, and
+    /// whichever form opened first would decide for the rest.
+    ///
+    /// Costs nothing when a session sees one form, which is the ordinary case: one form means
+    /// one prefix, and the cache behaves exactly as it did before. Two forms cost a second
+    /// copy of the state for the datasets that differ.
+    ///
+    /// If `Direct` is eventually removed there is only one form left, and this collapses back
+    /// into [`Self::for_dataset`].
+    pub fn for_dataset_with_remap_mode(&self, uri: &str, mode: IndexRemapMode) -> DSIndexCache {
+        DSIndexCache(self.0.with_key_prefix(&format!("{uri}/{mode:?}")))
     }
 }
 

@@ -3639,6 +3639,94 @@ mod tests {
         assert_eq!(current_scalar_index.uuid, original_scalar_uuid);
     }
 
+    /// A shared session must serve datasets that disagree about the remap form. The cache it
+    /// owns holds index state that was already translated through the reuse index, so an
+    /// entry built one way must not be handed to a reader that asked for the other.
+    ///
+    /// Both orders, because the hazard is order-dependent: whichever form opens first is the
+    /// one that populates the cache.
+    #[rstest]
+    #[case::direct_then_compact(IndexRemapMode::Direct, IndexRemapMode::Compact)]
+    #[case::compact_then_direct(IndexRemapMode::Compact, IndexRemapMode::Direct)]
+    #[tokio::test]
+    async fn test_shared_session_serves_both_forms(
+        #[case] first: IndexRemapMode,
+        #[case] second: IndexRemapMode,
+    ) {
+        use crate::dataset::builder::DatasetBuilder;
+        use crate::session::Session;
+        use lance_core::utils::tempfile::TempStrDir;
+
+        let test_dir = TempStrDir::default();
+        let uri = test_dir.as_str().to_string();
+        let mut dataset = lance_datagen::gen_batch()
+            .col("id", lance_datagen::array::step::<Int32Type>())
+            .into_dataset(&uri, FragmentCount::from(6), FragmentRowCount::from(2_000))
+            .await
+            .unwrap();
+        dataset
+            .create_index(
+                &["id"],
+                IndexType::BTree,
+                Some("id_idx".into()),
+                &ScalarIndexParams::default(),
+                false,
+            )
+            .await
+            .unwrap();
+
+        let options = CompactionOptions {
+            target_rows_per_fragment: 4_000,
+            defer_index_remap: true,
+            ..Default::default()
+        };
+        for round in 0..3 {
+            dataset
+                .delete(&format!("id % 10 == {round}"))
+                .await
+                .unwrap();
+            compact_files(&mut dataset, options.clone(), None)
+                .await
+                .unwrap();
+        }
+        let expected_total = dataset.count_rows(None).await.unwrap();
+        let expected_range = dataset
+            .count_rows(Some("id >= 3000 and id < 4000".to_owned()))
+            .await
+            .unwrap();
+
+        // One session, deliberately shared, as a caller does to pool caches across datasets.
+        let session = Arc::new(Session::default());
+
+        let mut seen = Vec::new();
+        for mode in [first, second] {
+            let reopened = DatasetBuilder::from_uri(&uri)
+                .with_session(session.clone())
+                .with_frag_reuse_remap_mode(mode)
+                .load()
+                .await
+                .unwrap();
+            assert_eq!(reopened.frag_reuse_remap_mode, mode);
+            let total = reopened.count_rows(None).await.unwrap();
+            let range = reopened
+                .count_rows(Some("id >= 3000 and id < 4000".to_owned()))
+                .await
+                .unwrap();
+            seen.push((mode, total, range));
+        }
+
+        for (mode, total, range) in seen {
+            assert_eq!(
+                total, expected_total,
+                "{mode:?} disagreed on the total after sharing a session"
+            );
+            assert_eq!(
+                range, expected_range,
+                "{mode:?} disagreed on the range after sharing a session"
+            );
+        }
+    }
+
     /// The reason the compact form exists, measured rather than argued: open the same
     /// dataset each way and compare what the reuse index costs the cache.
     ///

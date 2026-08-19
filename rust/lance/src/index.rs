@@ -1524,6 +1524,8 @@ impl DatasetIndexExt for Dataset {
         if let Some(frag_reuse_index_meta) =
             indices.iter().find(|idx| idx.name == FRAG_REUSE_INDEX_NAME)
         {
+            // Isolation between the two forms comes from the cache's own prefix, which the
+            // dataset built with its remap mode, so the key itself needs only the uuid.
             let mode = self.frag_reuse_remap_mode;
             let fri_key = FragReuseIndexKey {
                 uuid: &frag_reuse_index_meta.uuid,

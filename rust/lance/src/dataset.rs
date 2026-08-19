@@ -882,7 +882,15 @@ impl Dataset {
             },
         );
         let metadata_cache = Arc::new(session.metadata_cache.for_dataset(&uri));
-        let index_cache = Arc::new(session.index_cache.for_dataset(&uri));
+        // Partitioned by remap form: what an index caches is already translated through the
+        // fragment reuse index, and the forms do not translate identically. `load_manifest`
+        // keeps the unpartitioned prefix, since the index metadata it caches there is the
+        // manifest's own list and does not depend on the form.
+        let index_cache = Arc::new(
+            session
+                .index_cache
+                .for_dataset_with_remap_mode(&uri, frag_reuse_remap_mode),
+        );
         let fragment_bitmap = Arc::new(manifest.fragments.iter().map(|f| f.id as u32).collect());
         write::log_unregistered_base_scoped_options(
             store_params.as_ref(),
