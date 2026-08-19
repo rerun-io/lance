@@ -206,9 +206,10 @@ pub struct FragReuseIndex {
     /// One remap per reuse version, oldest first. Order is load-bearing: each version is
     /// applied to the previous version's output.
     ///
-    /// Built as [`RowAddrRemap::Compact`] when the index is opened, which costs
-    /// O(#fragments) rather than the O(#rows) a materialized map would. On one production
-    /// payload the map form was 676M entries and 40 GB resident, which OOMs the pod.
+    /// Built as [`RowAddrRemap::Compact`] when the index is opened. A materialized map
+    /// holds one entry per rewritten or deleted row, so it scales with the number of rows
+    /// compaction has touched; the compact form scales with fragment count instead. The
+    /// index is opened on the read path and the result cached, so readers pay that cost.
     pub row_addr_maps: Vec<RowAddrRemap>,
     pub details: FragReuseIndexDetails,
 }
@@ -222,8 +223,9 @@ impl DeepSizeOf for FragReuseIndex {
 impl FragReuseIndex {
     /// Build from already-materialized maps, one per version.
     ///
-    /// Kept for callers that hold maps already; it stores them as
-    /// [`RowAddrRemap::Direct`] and so costs O(#rows). Prefer [`Self::new_from_remaps`].
+    /// Kept for callers that already hold maps; it stores them as
+    /// [`RowAddrRemap::Direct`], whose memory scales with the number of rows touched.
+    /// Prefer [`Self::new_from_remaps`].
     pub fn new(
         uuid: Uuid,
         row_id_maps: Vec<HashMap<u64, Option<u64>>>,
