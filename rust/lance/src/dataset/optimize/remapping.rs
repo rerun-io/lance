@@ -92,9 +92,17 @@ struct MissingAddrs<'a, I: Iterator<Item = u64>> {
 }
 
 impl<'a, I: Iterator<Item = u64>> MissingAddrs<'a, I> {
-    /// row_addrs must be sorted in the same order in which the rows would be
-    /// found by scanning fragments in the order they are presented in.
-    /// fragments is not guaranteed to be sorted by id.
+    /// `row_addrs` must be sorted in the same order in which the rows would be found by
+    /// scanning fragments in the order they are presented in.
+    ///
+    /// This type does not require `fragments` to be sorted by id, and tolerating an
+    /// unsorted list is deliberate. Note though that a manifest's fragment list has been
+    /// stored in id order since #2075, so callers passing fragments straight from a
+    /// manifest are already handing over a sorted list. Do not read the tolerance here as
+    /// evidence that unsorted input arises in practice: for `row_addrs` in ascending
+    /// address order -- which is how a serialized `RoaringTreemap` iterates -- an unsorted
+    /// `fragments` makes this type report rows of the out-of-order fragment as missing,
+    /// overwriting their real mappings.
     fn new(row_addrs: I, fragments: &'a Vec<FragDigest>) -> Self {
         assert!(!fragments.is_empty());
         let first_frag = &fragments[0];

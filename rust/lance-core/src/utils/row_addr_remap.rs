@@ -141,6 +141,11 @@ struct GroupRemap {
 
 impl GroupRemap {
     fn new(input: GroupInput) -> Result<Self> {
+        // Note the asymmetry between the two fragment lists. `old_frag_ids` carries no
+        // ordering requirement beyond being the order the fragments were read: positions are
+        // assigned by walking it, so any order is handled correctly and none is rejected.
+        // `new_frags` is different, and is checked below.
+        //
         // `compute_new_addr` maps a rewritten row's group-local index to a new
         // address by accumulating `physical_rows` in `new_frags` order, so that
         // order must be the order rows were written. New fragment ids are
