@@ -129,7 +129,7 @@ pub struct GroupInput {
     pub new_frags: Vec<(u32, u32)>,
 }
 
-#[derive(Clone)]
+#[derive(Clone, crate::deepsize::DeepSizeOf)]
 struct GroupRemap {
     /// Old fragment id -> (rewritten old row offsets in that fragment,
     /// rewritten row count before this fragment in the group).
@@ -238,7 +238,7 @@ impl GroupRemap {
 }
 
 /// Compact remap backed by per-group rewritten row bitmaps + new-fragment layouts.
-#[derive(Clone)]
+#[derive(Clone, crate::deepsize::DeepSizeOf)]
 pub struct CompactRowAddrRemap {
     groups: Vec<GroupRemap>,
     /// Old fragment id -> index into `groups`. Size is O(#fragments), not rows.
@@ -315,23 +315,7 @@ impl std::fmt::Debug for RowAddrRemap {
 impl crate::deepsize::DeepSizeOf for RowAddrRemap {
     fn deep_size_of_children(&self, cx: &mut crate::deepsize::Context) -> usize {
         match self {
-            // Bitmaps dominate; roaring is not `DeepSizeOf`, so approximate from its
-            // own serialized size rather than under-report it as zero.
-            Self::Compact(compact) => {
-                compact
-                    .groups
-                    .iter()
-                    .map(|group| {
-                        group
-                            .frags
-                            .values()
-                            .map(|(bitmap, _)| bitmap.serialized_size() + 16)
-                            .sum::<usize>()
-                            + group.new_frag_row_ranges.len() * 16
-                    })
-                    .sum::<usize>()
-                    + compact.frag_to_group.len() * 12
-            }
+            Self::Compact(compact) => compact.deep_size_of_children(cx),
             Self::Direct(map) => map.deep_size_of_children(cx),
         }
     }
@@ -442,6 +426,34 @@ mod tests {
             new_frags: vec![(12, 1), (11, 1)],
         };
         assert!(RowAddrRemap::compact([input]).is_err());
+    }
+
+    #[test]
+    fn test_deep_size_of_reaches_the_bitmaps() {
+        use crate::deepsize::DeepSizeOf;
+
+        // The derived impl has to walk Vec -> HashMap -> tuple -> RoaringBitmap. If any
+        // link stopped short the two remaps below would report the same size, since they
+        // differ only in how many rows their bitmaps hold.
+        let remap_over = |rows: u32| {
+            RowAddrRemap::compact([GroupInput {
+                rewritten_old_row_addrs: RoaringTreemap::from_iter(
+                    (0..rows).map(|offset| addr(0, offset)),
+                ),
+                old_frag_ids: vec![0],
+                new_frags: vec![(10, rows)],
+            }])
+            .unwrap()
+        };
+
+        // 8 values fit an array container; 40k promote to a bitmap container.
+        let small = remap_over(8).deep_size_of();
+        let large = remap_over(40_000).deep_size_of();
+        assert!(small > 0, "a non-empty remap must report a non-zero size");
+        assert!(
+            large > small,
+            "size must grow with bitmap contents, got {large} vs {small}"
+        );
     }
 
     #[test]
