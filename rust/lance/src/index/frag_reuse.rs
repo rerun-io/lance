@@ -72,8 +72,9 @@ pub(crate) async fn open_frag_reuse_index(
     details: &FragReuseIndexDetails,
 ) -> lance_core::Result<FragReuseIndex> {
     // Build the compact form rather than a materialized per-row map. This runs on every
-    // index open and the result is cached, so the map's O(#rows) cost is paid by readers:
-    // one production payload here is 88 MB on disk and 40 GB once expanded.
+    // index open and the result is cached, so a per-row map would charge readers a cost
+    // that grows with the number of rows compaction has touched, rather than with the
+    // number of fragments. Expanding a large reuse history that way can exhaust memory.
     let mut row_addr_maps: Vec<RowAddrRemap> = Vec::with_capacity(details.versions.len());
     for version in &details.versions {
         let mut groups = Vec::with_capacity(version.groups.len());

@@ -274,6 +274,16 @@ impl CompactRowAddrRemap {
         self.groups.is_empty()
     }
 
+    /// Number of rewrite groups held.
+    pub fn num_groups(&self) -> usize {
+        self.groups.len()
+    }
+
+    /// Number of old fragments covered. This is what the structure scales with.
+    pub fn num_fragments(&self) -> usize {
+        self.frag_to_group.len()
+    }
+
     fn fully_deleted_fragments(&self) -> Option<RoaringBitmap> {
         // A group with any rewritten row moved at least one row.
         if self.groups.iter().any(|g| !g.frags.is_empty()) {
@@ -283,11 +293,9 @@ impl CompactRowAddrRemap {
     }
 }
 
-// --- rerun fork additions, not present upstream ---
-//
-// `FragReuseIndex` stores these and is `Debug` + `DeepSizeOf`; upstream does not need
-// either yet because it still holds `Vec<HashMap<u64, Option<u64>>>` there.
-
+// `Debug` is written by hand rather than derived because the payload is bitmaps and
+// hash maps of unbounded size: a derived impl would print the whole remap. The shape
+// and scale are what a caller logging a remap actually wants.
 impl std::fmt::Debug for RowAddrRemap {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -301,18 +309,6 @@ impl std::fmt::Debug for RowAddrRemap {
                 .field("entries", &map.len())
                 .finish(),
         }
-    }
-}
-
-impl CompactRowAddrRemap {
-    /// Number of rewrite groups held.
-    pub fn num_groups(&self) -> usize {
-        self.groups.len()
-    }
-
-    /// Number of old fragments covered. This is what the structure scales with.
-    pub fn num_fragments(&self) -> usize {
-        self.frag_to_group.len()
     }
 }
 

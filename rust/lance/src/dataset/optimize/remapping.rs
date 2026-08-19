@@ -312,11 +312,12 @@ async fn remap_index(dataset: &mut Dataset, index_id: &Uuid) -> Result<()> {
     // bounded by the rows the reuse index touched; addresses this index does not
     // store are simply never looked up.
     //
-    // The compact remap deliberately cannot enumerate its keys: it stores per-fragment
-    // bitmaps, not rows, and treats any unlisted offset in a rewritten fragment as
-    // deleted, so "every key" is not a finite set it knows. Rebuild the per-row maps from
-    // the details here to get the key set. That is O(rows) again, but only on this path,
-    // which no production caller reaches; the cached open path is what mattered.
+    // The compact remap cannot enumerate its keys by design: it stores per-fragment
+    // bitmaps rather than rows, and treats any unlisted offset in a rewritten fragment as
+    // deleted, so its key domain is not a finite set. Rebuild the per-row maps from the
+    // details to recover that key set. This is the one place left whose memory grows with
+    // the number of rows touched rather than the number of fragments; composing the
+    // per-version remaps directly would avoid it.
     let composed_row_id_map: HashMap<u64, Option<u64>> = frag_reuse_index
         .details
         .versions
