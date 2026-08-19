@@ -401,6 +401,61 @@ mod tests {
         );
     }
 
+    #[rstest]
+    #[case::ascending(vec![0, 1, 2])]
+    #[case::descending(vec![2, 1, 0])]
+    #[case::rotated(vec![1, 2, 0])]
+    #[case::sparse_scrambled(vec![9, 0, 4])]
+    #[tokio::test]
+    async fn test_open_follows_old_frag_order_whatever_it_is(#[case] order: Vec<u64>) {
+        // `old_frag_ids` imposes no ordering requirement: positions come from walking the
+        // list, so every permutation has to map correctly and none is rejected. Manifest
+        // fragments are id-sorted in practice, so this guards the relaxed assumption rather
+        // than a reachable input -- and it would fail if the implementation ever started
+        // sorting internally, which a hand-written two-element case would not catch.
+        //
+        // Each fragment keeps offsets 0 and 2 of three rows, so deletions interact with the
+        // ordering, and the output spans two fragments so the range search does too.
+        const KEPT: [u32; 2] = [0, 2];
+        let rewritten: Vec<(u32, u32)> = order
+            .iter()
+            .flat_map(|&frag| KEPT.iter().map(move |&offset| (frag as u32, offset)))
+            .collect();
+        let total = rewritten.len();
+        let split = total / 2;
+        let index = open(&details(vec![vec![group(
+            rewritten,
+            order.iter().map(|&frag| digest(frag, 3)).collect(),
+            vec![digest(20, split), digest(21, total - split)],
+        )]]))
+        .await;
+
+        // Expectations are derived from the contract, not written out: the k-th kept row in
+        // list order occupies the k-th slot across the new fragments in their order.
+        let mut position = 0usize;
+        for &frag in &order {
+            for &offset in &KEPT {
+                let expected = if position < split {
+                    addr(20, position as u32)
+                } else {
+                    addr(21, (position - split) as u32)
+                };
+                assert_eq!(
+                    index.remap_row_id(addr(frag as u32, offset)),
+                    Some(expected),
+                    "fragment {frag} offset {offset} should hold position {position}"
+                );
+                position += 1;
+            }
+            // The hole in each fragment is deleted wherever that fragment sits in the list.
+            assert_eq!(
+                index.remap_row_id(addr(frag as u32, 1)),
+                None,
+                "hole in {frag}"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn test_open_handles_large_run_optimized_bitmaps() {
         // Production payloads span fragments of up to `max_rows_per_file` and are
