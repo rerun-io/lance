@@ -78,11 +78,12 @@ pub(crate) async fn open_frag_reuse_index_with_mode(
     mode: IndexRemapMode,
 ) -> lance_core::Result<FragReuseIndex> {
     if mode == IndexRemapMode::Direct {
-        // The pre-compact behaviour, kept as a fallback. Materializes one entry per rewritten
-        // or deleted row, so its memory grows with the rows compaction has touched -- which is
-        // the cost the compact form exists to avoid. It cannot fail, because pairing rows by
-        // address order silently truncates rather than rejecting a payload whose counts
-        // disagree; see `transpose_row_ids_from_digest`.
+        // The form a reader had before the compact one existed, kept as a fallback.
+        // Materializes one entry per rewritten or deleted row, so its memory grows with the
+        // rows compaction has touched -- the cost the compact form exists to avoid. Unlike
+        // the compact form it accepts a payload whose row counts disagree: pairing rows by
+        // address order truncates silently rather than rejecting; see
+        // `transpose_row_ids_from_digest`. Deserializing the treemap can still fail.
         let mut row_id_maps = Vec::with_capacity(details.versions.len());
         for version in &details.versions {
             let mut row_id_map = std::collections::HashMap::new();
@@ -312,15 +313,15 @@ mod tests {
 
     #[test]
     fn test_builder_default_uses_the_documented_default() {
-        // Two default paths exist -- `ReadParams::default()` and the builder's own field --
-        // and the builder's originally took `IndexRemapMode`'s derived default rather than the
-        // documented one, so the environment variable silently did not apply through the
-        // builder, which is the common way to open a dataset.
+        // The builder holds its own copy of the field, so it must consult the same
+        // environment-aware default `ReadParams` does; `IndexRemapMode`'s derived default
+        // would ignore the environment variable.
         //
-        // Asserted against the builder's own field, not against `ReadParams`: comparing the
-        // two documented defaults to each other passes whether or not the builder consults
-        // either. This also catches the derived default and the documented one drifting apart,
-        // which is what would happen if `IndexRemapMode`'s `#[default]` ever moved.
+        // This is only a wiring check, and a weak one: with the variable unset the two
+        // defaults are the same value, so it cannot tell them apart. What the environment
+        // variable actually does is covered by `test_parse_frag_reuse_remap_mode`, which
+        // tests the parsing directly -- the `OnceLock` in `default_frag_reuse_remap_mode`
+        // reads the environment once per process, so a test cannot vary it.
         let builder = crate::dataset::builder::DatasetBuilder::from_uri("memory://test");
         let expected = crate::dataset::default_frag_reuse_remap_mode();
         assert!(
@@ -565,11 +566,14 @@ mod tests {
     #[case::sparse_scrambled(vec![9, 0, 4])]
     #[tokio::test]
     async fn test_open_follows_old_frag_order_whatever_it_is(#[case] order: Vec<u64>) {
-        // `old_frag_ids` imposes no ordering requirement: positions come from walking the
-        // list, so every permutation has to map correctly and none is rejected. Manifest
-        // fragments are id-sorted in practice, so this guards the relaxed assumption rather
-        // than a reachable input -- and it would fail if the implementation ever started
-        // sorting internally, which a hand-written two-element case would not catch.
+        // `old_frag_ids` is not validated against a read order: positions come from walking
+        // the list, so the list *defines* the order rather than being checked against one.
+        // Every permutation therefore has to map consistently with itself, and none is
+        // rejected. (Passing an order other than the order fragments were actually read
+        // still yields wrong addresses, silently -- see the module docs.) Manifest fragments
+        // are id-sorted in practice, so this guards the absence of validation rather than a
+        // reachable input, and it would fail if the implementation ever started sorting
+        // internally, which a hand-written two-element case would not catch.
         //
         // Each fragment keeps offsets 0 and 2 of three rows, so deletions interact with the
         // ordering, and the output spans two fragments so the range search does too.

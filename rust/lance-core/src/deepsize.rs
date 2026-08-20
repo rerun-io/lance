@@ -341,18 +341,29 @@ mod tests {
 
     #[test]
     fn test_roaring_bitmap_size_counts_containers_and_payload() {
-        // Same cardinality, different container counts: roaring keys containers on the
-        // high 16 bits, so spreading the values across four of them must cost more than
-        // packing them into one. Catches the container allowance being dropped.
+        // Same cardinality, different container counts: roaring keys containers on the high
+        // 16 bits, so spreading the values across four of them costs three extra containers.
+        //
+        // Compare the *gap over serialized size* rather than the totals. A serialized bitmap
+        // already carries a per-container descriptor, so `spread` exceeds `packed` on
+        // `serialized_size()` alone -- an assertion on the totals passes even with the
+        // in-memory container allowance removed entirely, which is the regression this is
+        // here to catch.
         let packed = RoaringBitmap::from_iter(0u32..64);
         let spread =
             RoaringBitmap::from_iter((0..4u32).flat_map(|c| (0..16).map(move |i| c << 16 | i)));
         assert_eq!(packed.len(), spread.len());
+        let mut cx = Context::new();
+        let allowance =
+            |b: &RoaringBitmap, cx: &mut Context| b.deep_size_of_children(cx) - b.serialized_size();
         assert!(
-            spread.deep_size_of() > packed.deep_size_of(),
-            "four containers ({}) should cost more than one ({})",
-            spread.deep_size_of(),
-            packed.deep_size_of()
+            allowance(&spread, &mut cx) > allowance(&packed, &mut cx),
+            "three extra containers should be charged beyond serialized size: \
+             spread {} - {} vs packed {} - {}",
+            spread.deep_size_of_children(&mut cx),
+            spread.serialized_size(),
+            packed.deep_size_of_children(&mut cx),
+            packed.serialized_size()
         );
 
         // Same container count, more payload: an array container grows 2 bytes per value.
