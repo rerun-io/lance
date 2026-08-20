@@ -185,7 +185,14 @@ pub struct Dataset {
     pub(crate) fragment_bitmap: Arc<RoaringBitmap>,
 
     // These are references to session caches, but with the dataset URI as a prefix.
+    /// Index state, which is cached *as translated* through the fragment reuse index, so
+    /// its prefix also carries the remap form. See [`Self::manifest_index_cache`] for the
+    /// entries that must not be partitioned that way.
     pub(crate) index_cache: Arc<DSIndexCache>,
+    /// Entries that come straight from the manifest rather than from translated index
+    /// state, and so are identical under either remap form. Only the manifest's own index
+    /// list lives here; anything the form can change belongs in [`Self::index_cache`].
+    pub(crate) manifest_index_cache: Arc<DSIndexCache>,
     pub(crate) metadata_cache: Arc<DSMetadataCache>,
 
     /// File reader options to use when reading data files.
@@ -883,14 +890,16 @@ impl Dataset {
         );
         let metadata_cache = Arc::new(session.metadata_cache.for_dataset(&uri));
         // Partitioned by remap form: what an index caches is already translated through the
-        // fragment reuse index, and the forms do not translate identically. `load_manifest`
-        // keeps the unpartitioned prefix, since the index metadata it caches there is the
-        // manifest's own list and does not depend on the form.
+        // fragment reuse index, and the forms do not translate identically.
         let index_cache = Arc::new(
             session
                 .index_cache
                 .for_dataset_with_remap_mode(&uri, frag_reuse_remap_mode),
         );
+        // The manifest's own index list is not translated, so it stays on the unpartitioned
+        // prefix -- which is also where `load_manifest` prefetches it, before any form is
+        // known. Partitioning it would put the prefetch out of reach of every reader.
+        let manifest_index_cache = Arc::new(session.index_cache.for_dataset(&uri));
         let fragment_bitmap = Arc::new(manifest.fragments.iter().map(|f| f.id as u32).collect());
         write::log_unregistered_base_scoped_options(
             store_params.as_ref(),
@@ -909,6 +918,7 @@ impl Dataset {
             fragment_bitmap,
             metadata_cache,
             index_cache,
+            manifest_index_cache,
             file_reader_options,
             frag_reuse_remap_mode,
             store_params: store_params.map(Box::new),

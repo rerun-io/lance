@@ -1494,7 +1494,7 @@ impl DatasetIndexExt for Dataset {
             store_identity: &self.object_store.store_prefix,
         };
         let mut indices = self
-            .index_cache
+            .manifest_index_cache
             .get_or_insert_with_key(metadata_key, || async {
                 let mut loaded_indices = read_manifest_indexes(
                     &self.object_store,
@@ -5168,7 +5168,7 @@ mod tests {
             store_identity: &dataset.object_store.store_prefix,
         };
         dataset
-            .index_cache
+            .manifest_index_cache
             .insert_with_key(&metadata_key, Arc::new(indices))
             .await;
         dataset.delete("false").await.unwrap();

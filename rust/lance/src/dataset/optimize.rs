@@ -3654,8 +3654,11 @@ mod tests {
         #[case] second: IndexRemapMode,
     ) {
         use crate::dataset::builder::DatasetBuilder;
+        use crate::index::DatasetIndexInternalExt;
         use crate::session::Session;
+        use lance_core::utils::row_addr_remap::RowAddrRemap;
         use lance_core::utils::tempfile::TempStrDir;
+        use lance_index::metrics::NoOpMetricsCollector;
 
         let test_dir = TempStrDir::default();
         let uri = test_dir.as_str().to_string();
@@ -3707,6 +3710,21 @@ mod tests {
                 .await
                 .unwrap();
             assert_eq!(reopened.frag_reuse_remap_mode, mode);
+            // The assertion that bites. Row counts agree between the forms for any payload a
+            // real writer produces, so they cannot tell whether the cache handed this reader
+            // the other form's state -- only the form of what it was served can.
+            let fri = reopened
+                .open_frag_reuse_index(&NoOpMetricsCollector)
+                .await
+                .unwrap()
+                .expect("the deferred-remap compactions above leave a reuse index");
+            let served_compact = matches!(fri.row_addr_maps[0], RowAddrRemap::Compact(_));
+            assert_eq!(
+                served_compact,
+                mode == IndexRemapMode::Compact,
+                "a shared session served {mode:?} the other form: {:?}",
+                fri.row_addr_maps[0]
+            );
             let total = reopened.count_rows(None).await.unwrap();
             let range = reopened
                 .count_rows(Some("id >= 3000 and id < 4000".to_owned()))
