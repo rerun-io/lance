@@ -11,6 +11,7 @@ use std::sync::{Arc, Mutex, RwLock};
 use arrow_array::{Array, RecordBatch};
 use arrow_buffer::ArrowNativeType;
 use arrow_data::ArrayData;
+use roaring::RoaringBitmap;
 
 pub struct Context {
     seen: HashSet<usize>,
@@ -84,6 +85,41 @@ impl DeepSizeOf for str {
 impl DeepSizeOf for String {
     fn deep_size_of_children(&self, _context: &mut Context) -> usize {
         self.capacity()
+    }
+}
+
+/// Approximated by the serialized size plus an allowance for the container vector.
+///
+/// Roaring lays each container type out the same way in memory as on disk, so the
+/// serialized size covers the payload closely:
+///
+/// | container | in memory | serialized |
+/// |-----------|-----------|------------|
+/// | array  | `Vec<u16>`, 2 bytes per value    | 2 bytes per value |
+/// | bitmap | `Box<[u64; 1024]>`, 8 KiB fixed  | 8 KiB fixed |
+/// | run    | `Vec<Interval>`, 4 bytes per run | 4 bytes per run |
+///
+/// What it does not cover is the `Vec<Container>` those payloads hang off, which costs
+/// tens of bytes per container in memory against a 4-byte serialized descriptor, so that
+/// is added back. The sum deliberately errs high: it double-counts the descriptor, and
+/// for most bitmaps the serialized header also carries a 4-byte offset per container.
+/// Over-charging is the safer direction when the figure feeds a byte-bounded cache.
+///
+/// What remains under-counted is the spare capacity of the array and run containers'
+/// vectors. Roaring does not expose that usefully: `statistics()` reports capacities, but
+/// gives array bytes as `capacity * size_of::<u32>()` for a `Vec<u16>` and bitmap bytes
+/// as a bit count, so relying on those figures would mean relying on the quirks staying
+/// put. Only its container count is used here.
+impl DeepSizeOf for RoaringBitmap {
+    fn deep_size_of_children(&self, _context: &mut Context) -> usize {
+        // Per-container cost of the vector roaring keeps its containers in. `Container` is
+        // `{ key: u16, store: Store }`, and `Store`'s largest variant wraps a `Vec`: 24
+        // bytes of vector, plus a discriminant and the key, rounded for alignment. Written
+        // as a constant because the type is private to roaring, so `size_of` is unavailable.
+        const CONTAINER_BYTES: usize = 40;
+
+        let containers = self.statistics().n_containers as usize;
+        self.serialized_size() + containers * CONTAINER_BYTES
     }
 }
 
@@ -292,6 +328,49 @@ where
 mod tests {
     use super::*;
     use arrow_array::{Int32Array, StringArray, StructArray};
+
+    #[test]
+    fn test_roaring_bitmap_size_counts_containers_and_payload() {
+        // Same cardinality, different container counts: roaring keys containers on the high
+        // 16 bits, so spreading the values across four of them costs three extra containers.
+        //
+        // Compare the *gap over serialized size* rather than the totals. A serialized bitmap
+        // already carries a per-container descriptor, so `spread` exceeds `packed` on
+        // `serialized_size()` alone -- an assertion on the totals passes even with the
+        // in-memory container allowance removed entirely, which is the regression this is
+        // here to catch.
+        let packed = RoaringBitmap::from_iter(0u32..64);
+        let spread =
+            RoaringBitmap::from_iter((0..4u32).flat_map(|c| (0..16).map(move |i| c << 16 | i)));
+        assert_eq!(packed.len(), spread.len());
+        let mut cx = Context::new();
+        let allowance =
+            |b: &RoaringBitmap, cx: &mut Context| b.deep_size_of_children(cx) - b.serialized_size();
+        assert!(
+            allowance(&spread, &mut cx) > allowance(&packed, &mut cx),
+            "three extra containers should be charged beyond serialized size: \
+             spread {} - {} vs packed {} - {}",
+            spread.deep_size_of_children(&mut cx),
+            spread.serialized_size(),
+            packed.deep_size_of_children(&mut cx),
+            packed.serialized_size()
+        );
+
+        // Same container count, more payload: an array container grows 2 bytes per value.
+        let small = RoaringBitmap::from_iter(0u32..64);
+        let large = RoaringBitmap::from_iter(0u32..2048);
+        assert!(
+            large.deep_size_of() > small.deep_size_of(),
+            "more values in one container should cost more"
+        );
+
+        // An empty bitmap has no containers, so only the serialized header is charged.
+        let empty = RoaringBitmap::new();
+        assert!(
+            empty.deep_size_of_children(&mut Context::new()) < 64,
+            "an empty bitmap should be charged almost nothing"
+        );
+    }
     use arrow_schema::{DataType, Field, Fields, Schema};
 
     #[test]

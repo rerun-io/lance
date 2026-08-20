@@ -1072,7 +1072,7 @@ pub(crate) async fn commit_transaction(
                         version: target_version,
                     };
                     dataset
-                        .index_cache
+                        .manifest_index_cache
                         .insert_with_key(&key, Arc::new(indices))
                         .await;
                 }

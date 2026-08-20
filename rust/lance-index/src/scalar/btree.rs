@@ -3333,6 +3333,7 @@ impl ScalarIndexPlugin for BTreeIndexPlugin {
 #[cfg(test)]
 mod tests {
     use lance_core::utils::row_addr_remap::RowAddrRemap;
+    use rstest::rstest;
     use std::sync::atomic::Ordering;
     use std::{collections::HashMap, sync::Arc};
 
@@ -6263,10 +6264,23 @@ mod tests {
         assert!(deserialize_state(buf).is_err());
     }
 
+    /// The remap is expressed both ways: as a materialized map, and as the compact form the
+    /// fragment-reuse index is built with when it is opened from a real dataset. Both must
+    /// thread through `reconstruct` to the rebuilt index identically.
+    ///
+    /// `Compact` cannot express an arbitrary pair, so the two cases move a row differently:
+    /// the direct map sends row 0 to 5000, while the compact form rewrites all 1000 rows of
+    /// fragment 0 into fragment 1, sending row 0 to fragment 1 offset 0. Both land outside
+    /// the original `[0, 1000)` range, so neither collides.
+    #[rstest]
+    #[case::direct(RowAddrRemap::direct(HashMap::from([(0u64, Some(5000u64))])), 5000)]
+    #[case::compact(all_rows_of_frag_zero_move_to_frag_one(), 1u64 << 32)]
     #[tokio::test]
-    async fn test_btree_index_state_reconstruct_applies_frag_reuse_index() {
+    async fn test_btree_index_state_reconstruct_applies_frag_reuse_index(
+        #[case] remap: RowAddrRemap,
+        #[case] expected_row_id: u64,
+    ) {
         use crate::frag_reuse::{FragReuseIndex, FragReuseIndexDetails};
-        use std::collections::HashMap;
         use uuid::Uuid;
 
         let tmpdir = TempObjDir::default();
@@ -6294,12 +6308,11 @@ mod tests {
             ranges_to_files: index.ranges_to_files.clone(),
         };
 
-        // Remap row 0 -> row 5000 (outside the original [0, 1000) range so no collision).
-        // Querying for value == 0 should now return row 5000, confirming reconstruct threaded
-        // the FragReuseIndex through to the rebuilt BTreeIndex.
-        let frag_reuse_index = Arc::new(FragReuseIndex::new(
+        // Querying for value == 0 should now return the remapped address, confirming
+        // reconstruct threaded the FragReuseIndex through to the rebuilt BTreeIndex.
+        let frag_reuse_index = Arc::new(FragReuseIndex::new_from_remaps(
             Uuid::new_v4(),
-            vec![HashMap::from([(0u64, Some(5000u64))])],
+            vec![remap],
             FragReuseIndexDetails { versions: vec![] },
         ));
         let reconstructed = state
@@ -6328,9 +6341,21 @@ mod tests {
         };
         assert_eq!(
             row_ids,
-            vec![5000],
+            vec![expected_row_id],
             "frag_reuse_index remap was not applied"
         );
+    }
+
+    /// Every row of fragment 0 rewritten into fragment 1, preserving order, so row `n`
+    /// becomes fragment 1 offset `n`. The compact analogue of a single-row move: it cannot
+    /// name an arbitrary destination, only a position in a new fragment.
+    fn all_rows_of_frag_zero_move_to_frag_one() -> RowAddrRemap {
+        RowAddrRemap::compact([lance_core::utils::row_addr_remap::GroupInput {
+            rewritten_old_row_addrs: roaring::RoaringTreemap::from_iter(0..1000u64),
+            old_frag_ids: vec![0],
+            new_frags: vec![(1, 1000)],
+        }])
+        .unwrap()
     }
 
     #[tokio::test]

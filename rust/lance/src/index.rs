@@ -88,7 +88,7 @@ use crate::dataset::optimize::RemappedIndex;
 use crate::dataset::optimize::remapping::RemapResult;
 use crate::dataset::transaction::{Operation, Transaction, TransactionBuilder};
 pub use crate::index::api::{DatasetIndexExt, IndexSegment, IntoIndexSegment};
-use crate::index::frag_reuse::{load_frag_reuse_index_details, open_frag_reuse_index};
+use crate::index::frag_reuse::{load_frag_reuse_index_details, open_frag_reuse_index_with_mode};
 use crate::index::mem_wal::open_mem_wal_index;
 pub use crate::index::prefilter::{FilterLoader, PreFilter};
 use crate::index::scalar::{IndexDetails, fetch_index_details, load_training_data};
@@ -1062,7 +1062,7 @@ impl DatasetIndexExt for Dataset {
         let metadata_key = IndexMetadataKey {
             version: self.version().version,
         };
-        let mut indices = match self.index_cache.get_with_key(&metadata_key).await {
+        let mut indices = match self.manifest_index_cache.get_with_key(&metadata_key).await {
             Some(indices) => indices,
             None => {
                 let mut loaded_indices = read_manifest_indexes(
@@ -1073,7 +1073,7 @@ impl DatasetIndexExt for Dataset {
                 .await?;
                 retain_supported_indices(&mut loaded_indices);
                 let loaded_indices = Arc::new(loaded_indices);
-                self.index_cache
+                self.manifest_index_cache
                     .insert_with_key(&metadata_key, loaded_indices.clone())
                     .await;
                 loaded_indices
@@ -1097,6 +1097,9 @@ impl DatasetIndexExt for Dataset {
         if let Some(frag_reuse_index_meta) =
             indices.iter().find(|idx| idx.name == FRAG_REUSE_INDEX_NAME)
         {
+            // Isolation between the two forms comes from the cache's own prefix, which the
+            // dataset built with its remap mode, so the key itself needs only the uuid.
+            let mode = self.frag_reuse_remap_mode;
             let fri_key = FragReuseIndexKey {
                 uuid: &frag_reuse_index_meta.uuid,
             };
@@ -1108,7 +1111,12 @@ impl DatasetIndexExt for Dataset {
                     // the waiter's write lock across the init future).
                     let index_details =
                         load_frag_reuse_index_details(self, frag_reuse_index_meta).await?;
-                    open_frag_reuse_index(frag_reuse_index_meta.uuid, index_details.as_ref()).await
+                    open_frag_reuse_index_with_mode(
+                        frag_reuse_index_meta.uuid,
+                        index_details.as_ref(),
+                        mode,
+                    )
+                    .await
                 })
                 .await?;
             let mut indices = indices.as_ref().clone();
@@ -2229,6 +2237,7 @@ impl DatasetIndexInternalExt for Dataset {
     ) -> Result<Option<Arc<FragReuseIndex>>> {
         if let Some(frag_reuse_index_meta) = self.load_index_by_name(FRAG_REUSE_INDEX_NAME).await? {
             let frag_reuse_uuid = frag_reuse_index_meta.uuid;
+            let mode = self.frag_reuse_remap_mode;
             let frag_reuse_key = FragReuseIndexKey {
                 uuid: &frag_reuse_uuid,
             };
@@ -2246,9 +2255,12 @@ impl DatasetIndexInternalExt for Dataset {
                     // mirroring the loader in `load_indices()`.
                     let index_details =
                         load_frag_reuse_index_details(self, &frag_reuse_index_meta).await?;
-                    let index =
-                        open_frag_reuse_index(frag_reuse_index_meta.uuid, index_details.as_ref())
-                            .await?;
+                    let index = open_frag_reuse_index_with_mode(
+                        frag_reuse_index_meta.uuid,
+                        index_details.as_ref(),
+                        mode,
+                    )
+                    .await?;
 
                     info!(target: TRACE_IO_EVENTS, index_uuid=%frag_reuse_uuid, r#type=IO_TYPE_OPEN_FRAG_REUSE);
                     metrics.record_index_load();
@@ -4091,8 +4103,15 @@ mod tests {
         assert_eq!(indices2.len(), 1);
     }
 
+    /// Both forms of an all-rows-deleted remap. This is the one place `fully_deleted_fragments`
+    /// decides the outcome -- `remap_index` returns `Keep` when it equals the index's fragment
+    /// bitmap -- and the two arms compute it differently: `Direct` infers the set from whichever
+    /// keys are present, `Compact` reads it off the fragments the groups cover.
+    #[rstest]
+    #[case::direct(all_deleted_direct())]
+    #[case::compact(all_deleted_compact())]
     #[tokio::test]
-    async fn test_remap_empty() {
+    async fn test_remap_empty(#[case] remap: RowAddrRemap) {
         let data = gen_batch()
             .col("int", array::step::<Int32Type>())
             .col(
@@ -4108,14 +4127,29 @@ mod tests {
             .await
             .unwrap();
 
+        // The remaps below name fragment 0 and its 256 rows; keep that honest.
+        assert_eq!(dataset.count_all_rows().await.unwrap(), 256);
+        assert_eq!(dataset.get_fragments().len(), 1);
+
         let index_uuid = dataset.load_indices().await.unwrap()[0].uuid;
-        let remap_to_empty = (0..dataset.count_all_rows().await.unwrap())
-            .map(|i| (i as u64, None))
-            .collect::<HashMap<_, _>>();
-        let new_uuid = remap_index(&dataset, &index_uuid, &RowAddrRemap::direct(remap_to_empty))
-            .await
-            .unwrap();
+        let new_uuid = remap_index(&dataset, &index_uuid, &remap).await.unwrap();
         assert_eq!(new_uuid, RemapResult::Keep(index_uuid));
+    }
+
+    /// Every row of the single fragment mapped to deleted, enumerated.
+    fn all_deleted_direct() -> RowAddrRemap {
+        RowAddrRemap::direct((0..256u64).map(|row| (row, None)).collect())
+    }
+
+    /// The same thing said structurally: fragment 0 covered, nothing rewritten out of it, so
+    /// every address it holds is deleted without enumerating any of them.
+    fn all_deleted_compact() -> RowAddrRemap {
+        RowAddrRemap::compact([lance_core::utils::row_addr_remap::GroupInput {
+            rewritten_old_row_addrs: roaring::RoaringTreemap::new(),
+            old_frag_ids: vec![0],
+            new_frags: vec![],
+        }])
+        .unwrap()
     }
 
     #[tokio::test]
@@ -4479,7 +4513,7 @@ mod tests {
             version: dataset.version().version,
         };
         dataset
-            .index_cache
+            .manifest_index_cache
             .insert_with_key(&metadata_key, Arc::new(indices))
             .await;
         dataset.delete("false").await.unwrap();

@@ -64,7 +64,7 @@ use std::fmt::Debug;
 use std::num::NonZero;
 use std::ops::Range;
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use tracing::{info, instrument};
 
 pub(crate) mod blob;
@@ -104,6 +104,7 @@ use self::transaction::{Operation, Transaction, TransactionBuilder, UpdateMapEnt
 use self::write::{cleanup_data_fragments, write_fragments_internal};
 use crate::dataset::branch_location::BranchLocation;
 use crate::dataset::cleanup::{CleanupOperation, CleanupPolicy, CleanupPolicyBuilder};
+use crate::dataset::optimize::IndexRemapMode;
 use crate::dataset::refs::{BranchContents, BranchIdentifier, Branches, Tags};
 use crate::dataset::sql::SqlQueryBuilder;
 use crate::datatypes::Schema;
@@ -178,11 +179,22 @@ pub struct Dataset {
     pub(crate) fragment_bitmap: Arc<RoaringBitmap>,
 
     // These are references to session caches, but with the dataset URI as a prefix.
+    /// Index state, which is cached *as translated* through the fragment reuse index, so
+    /// its prefix also carries the remap form. See [`Self::manifest_index_cache`] for the
+    /// entries that must not be partitioned that way.
     pub(crate) index_cache: Arc<DSIndexCache>,
+    /// Entries that come straight from the manifest rather than from translated index
+    /// state, and so are identical under either remap form. Only the manifest's own index
+    /// list lives here; anything the form can change belongs in [`Self::index_cache`].
+    pub(crate) manifest_index_cache: Arc<DSIndexCache>,
     pub(crate) metadata_cache: Arc<DSMetadataCache>,
 
     /// File reader options to use when reading data files.
     pub(crate) file_reader_options: Option<FileReaderOptions>,
+
+    /// How to expand the fragment reuse index when opening an index. See
+    /// [`ReadParams::frag_reuse_remap_mode`].
+    pub(crate) frag_reuse_remap_mode: IndexRemapMode,
 
     /// Object store parameters used when opening this dataset.
     /// These are used when creating object stores for additional base paths.
@@ -270,6 +282,23 @@ pub struct ReadParams {
     /// per-scan basis via [`Scanner::batch_size_bytes`](crate::dataset::scanner::Scanner::batch_size_bytes) or
     /// [`Scanner::with_file_reader_options`](crate::dataset::scanner::Scanner::with_file_reader_options).
     pub file_reader_options: Option<FileReaderOptions>,
+
+    /// How the fragment reuse index expands its payload when an index is opened.
+    ///
+    /// Compaction chooses between the same two forms via
+    /// [`CompactionOptions::index_remap_mode`](crate::dataset::optimize::CompactionOptions);
+    /// this is the reader's equivalent.
+    ///
+    /// [`IndexRemapMode::Direct`] materializes one entry per rewritten or deleted row, so its
+    /// memory grows with the rows compaction has touched. [`IndexRemapMode::Compact`] stores
+    /// per-fragment bitmaps instead, so it grows with the number of fragments, at the cost of
+    /// more work per lookup. A dataset with a long reuse history can make the materialized
+    /// form large enough to exhaust memory when an index is opened.
+    ///
+    /// This defaults to the `LANCE_FRAG_REUSE_REMAP_MODE` environment variable when present,
+    /// accepting `"direct"` or `"compact"`, and to [`IndexRemapMode::Direct`] otherwise. The
+    /// env var is read once per process.
+    pub frag_reuse_remap_mode: IndexRemapMode,
 }
 
 impl ReadParams {
@@ -317,6 +346,14 @@ impl ReadParams {
         self.commit_handler = Some(Arc::new(lock));
     }
 
+    /// Choose how the fragment reuse index expands its payload when an index is opened.
+    ///
+    /// See [`Self::frag_reuse_remap_mode`] for what the two forms cost.
+    pub fn frag_reuse_remap_mode(&mut self, mode: IndexRemapMode) -> &mut Self {
+        self.frag_reuse_remap_mode = mode;
+        self
+    }
+
     /// Set the file reader options.
     pub fn file_reader_options(&mut self, options: FileReaderOptions) -> &mut Self {
         self.file_reader_options = Some(options);
@@ -333,7 +370,64 @@ impl Default for ReadParams {
             store_options: None,
             commit_handler: None,
             file_reader_options: None,
+            frag_reuse_remap_mode: default_frag_reuse_remap_mode(),
         }
+    }
+}
+
+const ENV_LANCE_FRAG_REUSE_REMAP_MODE: &str = "LANCE_FRAG_REUSE_REMAP_MODE";
+
+/// The reuse-remap form a reader uses unless told otherwise, from the environment if set.
+///
+/// Read once per process, so a deployment sets it before opening datasets rather than
+/// expecting a running process to notice a change.
+pub(crate) fn default_frag_reuse_remap_mode() -> IndexRemapMode {
+    static MODE: OnceLock<IndexRemapMode> = OnceLock::new();
+    *MODE.get_or_init(|| {
+        parse_frag_reuse_remap_mode(
+            std::env::var(ENV_LANCE_FRAG_REUSE_REMAP_MODE)
+                .ok()
+                .as_deref(),
+        )
+    })
+}
+
+/// The parsing half of [`default_frag_reuse_remap_mode`], split out so it can be tested:
+/// the `OnceLock` above reads the environment once per process, which a test cannot vary.
+fn parse_frag_reuse_remap_mode(raw: Option<&str>) -> IndexRemapMode {
+    match raw {
+        None => IndexRemapMode::Direct,
+        Some(raw) => IndexRemapMode::try_from(raw).unwrap_or_else(|_| {
+            tracing::warn!(
+                "Ignoring {ENV_LANCE_FRAG_REUSE_REMAP_MODE}='{raw}': expected \"direct\" or \
+                 \"compact\". Using direct."
+            );
+            IndexRemapMode::Direct
+        }),
+    }
+}
+
+#[cfg(test)]
+mod frag_reuse_remap_mode_tests {
+    use super::*;
+    use rstest::rstest;
+
+    /// What `LANCE_FRAG_REUSE_REMAP_MODE` accepts, including the value that is neither.
+    /// An unparseable setting must warn and fall back rather than fail an open, since it
+    /// reaches every reader in a deployment at once.
+    #[rstest]
+    #[case::unset(None, IndexRemapMode::Direct)]
+    #[case::compact(Some("compact"), IndexRemapMode::Compact)]
+    #[case::direct(Some("direct"), IndexRemapMode::Direct)]
+    #[case::upper_case(Some("COMPACT"), IndexRemapMode::Compact)]
+    #[case::mixed_case(Some("Compact"), IndexRemapMode::Compact)]
+    #[case::unparseable(Some("nonsense"), IndexRemapMode::Direct)]
+    #[case::empty(Some(""), IndexRemapMode::Direct)]
+    fn test_parse_frag_reuse_remap_mode(
+        #[case] raw: Option<&str>,
+        #[case] expected: IndexRemapMode,
+    ) {
+        assert_eq!(parse_frag_reuse_remap_mode(raw), expected);
     }
 }
 
@@ -622,6 +716,7 @@ impl Dataset {
             self.session.clone(),
             self.commit_handler.clone(),
             self.file_reader_options.clone(),
+            self.frag_reuse_remap_mode,
             self.store_params.as_deref().cloned(),
             self.base_store_params.clone(),
         )
@@ -741,6 +836,7 @@ impl Dataset {
         session: Arc<Session>,
         commit_handler: Arc<dyn CommitHandler>,
         file_reader_options: Option<FileReaderOptions>,
+        frag_reuse_remap_mode: IndexRemapMode,
         store_params: Option<ObjectStoreParams>,
         base_store_params: Option<Arc<HashMap<String, ObjectStoreParams>>>,
     ) -> Result<Self> {
@@ -754,7 +850,17 @@ impl Dataset {
             },
         );
         let metadata_cache = Arc::new(session.metadata_cache.for_dataset(&uri));
-        let index_cache = Arc::new(session.index_cache.for_dataset(&uri));
+        // Partitioned by remap form: what an index caches is already translated through the
+        // fragment reuse index, and the forms do not translate identically.
+        let index_cache = Arc::new(
+            session
+                .index_cache
+                .for_dataset_with_remap_mode(&uri, frag_reuse_remap_mode),
+        );
+        // The manifest's own index list is not translated, so it stays on the unpartitioned
+        // prefix -- which is also where `load_manifest` prefetches it, before any form is
+        // known. Partitioning it would put the prefetch out of reach of every reader.
+        let manifest_index_cache = Arc::new(session.index_cache.for_dataset(&uri));
         let fragment_bitmap = Arc::new(manifest.fragments.iter().map(|f| f.id as u32).collect());
         Ok(Self {
             object_store,
@@ -768,7 +874,9 @@ impl Dataset {
             fragment_bitmap,
             metadata_cache,
             index_cache,
+            manifest_index_cache,
             file_reader_options,
+            frag_reuse_remap_mode,
             store_params: store_params.map(Box::new),
             base_store_params,
         })
@@ -2957,6 +3065,7 @@ pub(crate) fn load_new_transactions(dataset: &Dataset) -> NewTransactionResult<'
                         dataset.session(),
                         dataset.commit_handler.clone(),
                         dataset.file_reader_options.clone(),
+                        dataset.frag_reuse_remap_mode,
                         dataset.store_params.as_deref().cloned(),
                         dataset.base_store_params.clone(),
                     )?;
@@ -2989,6 +3098,7 @@ pub(crate) fn load_new_transactions(dataset: &Dataset) -> NewTransactionResult<'
                 dataset.session(),
                 dataset.commit_handler.clone(),
                 dataset.file_reader_options.clone(),
+                dataset.frag_reuse_remap_mode,
                 dataset.store_params.as_deref().cloned(),
                 dataset.base_store_params.clone(),
             )
