@@ -1062,7 +1062,7 @@ impl DatasetIndexExt for Dataset {
         let metadata_key = IndexMetadataKey {
             version: self.version().version,
         };
-        let mut indices = match self.index_cache.get_with_key(&metadata_key).await {
+        let mut indices = match self.manifest_index_cache.get_with_key(&metadata_key).await {
             Some(indices) => indices,
             None => {
                 let mut loaded_indices = read_manifest_indexes(
@@ -1073,7 +1073,7 @@ impl DatasetIndexExt for Dataset {
                 .await?;
                 retain_supported_indices(&mut loaded_indices);
                 let loaded_indices = Arc::new(loaded_indices);
-                self.index_cache
+                self.manifest_index_cache
                     .insert_with_key(&metadata_key, loaded_indices.clone())
                     .await;
                 loaded_indices
@@ -4513,7 +4513,7 @@ mod tests {
             version: dataset.version().version,
         };
         dataset
-            .index_cache
+            .manifest_index_cache
             .insert_with_key(&metadata_key, Arc::new(indices))
             .await;
         dataset.delete("false").await.unwrap();
