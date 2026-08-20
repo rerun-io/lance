@@ -3745,6 +3745,109 @@ mod tests {
         }
     }
 
+    /// The deferred-remap catch-up, run against a reader that chose each form.
+    ///
+    /// This is the production sequence the compact form exists for: open `Compact` so the
+    /// reuse index does not cost `O(#rows)`, then let maintenance rewrite the index and trim
+    /// the reuse index away. Every other test that reaches `remap_column_index` runs at the
+    /// default `Direct`, so without this the half of the change that exists *for* `Compact`
+    /// is never executed.
+    ///
+    /// The final assertion is the one that matters. Trimming the reuse index to zero versions
+    /// only says maintenance ran; it stays true even if the remap wrote a wrong index, because
+    /// the trimming is driven by index metadata rather than by index contents. A reader opened
+    /// *after* the trim has no reuse index left to translate through, so it can only answer
+    /// correctly if the rewritten index really holds current addresses.
+    #[rstest]
+    #[case::direct(IndexRemapMode::Direct)]
+    #[case::compact(IndexRemapMode::Compact)]
+    #[tokio::test]
+    async fn test_catch_up_rewrites_the_index_under_either_form(#[case] mode: IndexRemapMode) {
+        use crate::dataset::builder::DatasetBuilder;
+        use crate::dataset::index::frag_reuse::cleanup_frag_reuse_index;
+        use lance_core::utils::tempfile::TempStrDir;
+
+        let test_dir = TempStrDir::default();
+        let uri = test_dir.as_str().to_string();
+        let mut dataset = lance_datagen::gen_batch()
+            .col("id", lance_datagen::array::step::<Int32Type>())
+            .into_dataset(&uri, FragmentCount::from(4), FragmentRowCount::from(1_000))
+            .await
+            .unwrap();
+        dataset
+            .create_index(
+                &["id"],
+                IndexType::BTree,
+                Some("id_idx".into()),
+                &ScalarIndexParams::default(),
+                false,
+            )
+            .await
+            .unwrap();
+
+        let options = CompactionOptions {
+            target_rows_per_fragment: 2_000,
+            defer_index_remap: true,
+            ..Default::default()
+        };
+        for round in 0..3 {
+            dataset
+                .delete(&format!("id % 10 == {round}"))
+                .await
+                .unwrap();
+            compact_files(&mut dataset, options.clone(), None)
+                .await
+                .unwrap();
+        }
+        let expected_range = dataset
+            .count_rows(Some("id >= 1500 and id < 2500".to_owned()))
+            .await
+            .unwrap();
+        assert!(
+            expected_range > 0,
+            "the range must select rows to be a test"
+        );
+
+        // Catch the index up as a reader that asked for this form.
+        let mut reader = DatasetBuilder::from_uri(&uri)
+            .with_frag_reuse_remap_mode(mode)
+            .load()
+            .await
+            .unwrap();
+        assert_eq!(reader.frag_reuse_remap_mode, mode);
+        remapping::remap_column_index(&mut reader, &["id"], Some("id_idx".into()))
+            .await
+            .unwrap();
+        cleanup_frag_reuse_index(&mut reader).await.unwrap();
+
+        // The reuse index is gone, so nothing translates addresses any more.
+        reader.checkout_latest().await.unwrap();
+        let frag_reuse_index_meta = reader
+            .load_index_by_name(FRAG_REUSE_INDEX_NAME)
+            .await
+            .unwrap()
+            .expect("the reuse index survives cleanup, trimmed to zero versions");
+        let details = load_frag_reuse_index_details(&reader, &frag_reuse_index_meta)
+            .await
+            .unwrap();
+        assert_eq!(
+            details.versions.len(),
+            0,
+            "{mode:?}: maintenance did not trim the reuse index"
+        );
+
+        // A reader opening now has only the rewritten index to go on.
+        let fresh = DatasetBuilder::from_uri(&uri).load().await.unwrap();
+        assert_eq!(
+            fresh
+                .count_rows(Some("id >= 1500 and id < 2500".to_owned()))
+                .await
+                .unwrap(),
+            expected_range,
+            "{mode:?}: the index no longer answers correctly once the reuse index is trimmed"
+        );
+    }
+
     /// The reason the compact form exists, measured rather than argued: open the same
     /// dataset each way and compare what the reuse index costs the cache.
     ///
