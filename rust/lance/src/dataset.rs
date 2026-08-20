@@ -346,15 +346,15 @@ impl ReadParams {
         self.commit_handler = Some(Arc::new(lock));
     }
 
-    /// Set the file reader options.
     /// Choose how the fragment reuse index expands its payload when an index is opened.
     ///
-    /// See [`ReadParams::frag_reuse_remap_mode`] for what the two forms cost.
+    /// See [`Self::frag_reuse_remap_mode`] for what the two forms cost.
     pub fn frag_reuse_remap_mode(&mut self, mode: IndexRemapMode) -> &mut Self {
         self.frag_reuse_remap_mode = mode;
         self
     }
 
+    /// Set the file reader options.
     pub fn file_reader_options(&mut self, options: FileReaderOptions) -> &mut Self {
         self.file_reader_options = Some(options);
         self
@@ -383,16 +383,52 @@ const ENV_LANCE_FRAG_REUSE_REMAP_MODE: &str = "LANCE_FRAG_REUSE_REMAP_MODE";
 /// expecting a running process to notice a change.
 pub(crate) fn default_frag_reuse_remap_mode() -> IndexRemapMode {
     static MODE: OnceLock<IndexRemapMode> = OnceLock::new();
-    *MODE.get_or_init(|| match std::env::var(ENV_LANCE_FRAG_REUSE_REMAP_MODE) {
-        Err(_) => IndexRemapMode::Direct,
-        Ok(raw) => IndexRemapMode::try_from(raw.as_str()).unwrap_or_else(|_| {
-            log::warn!(
+    *MODE.get_or_init(|| {
+        parse_frag_reuse_remap_mode(
+            std::env::var(ENV_LANCE_FRAG_REUSE_REMAP_MODE)
+                .ok()
+                .as_deref(),
+        )
+    })
+}
+
+/// The parsing half of [`default_frag_reuse_remap_mode`], split out so it can be tested:
+/// the `OnceLock` above reads the environment once per process, which a test cannot vary.
+fn parse_frag_reuse_remap_mode(raw: Option<&str>) -> IndexRemapMode {
+    match raw {
+        None => IndexRemapMode::Direct,
+        Some(raw) => IndexRemapMode::try_from(raw).unwrap_or_else(|_| {
+            tracing::warn!(
                 "Ignoring {ENV_LANCE_FRAG_REUSE_REMAP_MODE}='{raw}': expected \"direct\" or \
                  \"compact\". Using direct."
             );
             IndexRemapMode::Direct
         }),
-    })
+    }
+}
+
+#[cfg(test)]
+mod frag_reuse_remap_mode_tests {
+    use super::*;
+    use rstest::rstest;
+
+    /// What `LANCE_FRAG_REUSE_REMAP_MODE` accepts, including the value that is neither.
+    /// An unparseable setting must warn and fall back rather than fail an open, since it
+    /// reaches every reader in a deployment at once.
+    #[rstest]
+    #[case::unset(None, IndexRemapMode::Direct)]
+    #[case::compact(Some("compact"), IndexRemapMode::Compact)]
+    #[case::direct(Some("direct"), IndexRemapMode::Direct)]
+    #[case::upper_case(Some("COMPACT"), IndexRemapMode::Compact)]
+    #[case::mixed_case(Some("Compact"), IndexRemapMode::Compact)]
+    #[case::unparseable(Some("nonsense"), IndexRemapMode::Direct)]
+    #[case::empty(Some(""), IndexRemapMode::Direct)]
+    fn test_parse_frag_reuse_remap_mode(
+        #[case] raw: Option<&str>,
+        #[case] expected: IndexRemapMode,
+    ) {
+        assert_eq!(parse_frag_reuse_remap_mode(raw), expected);
+    }
 }
 
 #[derive(Debug, Clone)]

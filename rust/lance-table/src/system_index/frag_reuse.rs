@@ -206,10 +206,11 @@ pub struct FragReuseIndex {
     /// One remap per reuse version, oldest first. Order is load-bearing: each version is
     /// applied to the previous version's output.
     ///
-    /// Built as [`RowAddrRemap::Compact`] when the index is opened. A materialized map
-    /// holds one entry per rewritten or deleted row, so it scales with the number of rows
-    /// compaction has touched; the compact form scales with fragment count instead. The
-    /// index is opened on the read path and the result cached, so readers pay that cost.
+    /// Built by the open path in whichever form the reader asked for, defaulting to
+    /// [`RowAddrRemap::Direct`]. A materialized map holds one entry per rewritten or deleted
+    /// row, so it scales with the number of rows compaction has touched;
+    /// [`RowAddrRemap::Compact`] scales with fragment count instead. The index is opened on
+    /// the read path and the result cached, so readers pay whichever cost.
     pub row_addr_maps: Vec<RowAddrRemap>,
     pub details: FragReuseIndexDetails,
 }

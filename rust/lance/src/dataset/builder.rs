@@ -475,7 +475,6 @@ impl DatasetBuilder {
         self
     }
 
-    /// Set options based on [ReadParams].
     /// Choose how the fragment reuse index is expanded when an index is opened.
     ///
     /// See [`ReadParams::frag_reuse_remap_mode`] for what the two forms cost.
@@ -484,6 +483,7 @@ impl DatasetBuilder {
         self
     }
 
+    /// Set options based on [ReadParams].
     pub fn with_read_params(mut self, read_params: ReadParams) -> Self {
         self = self
             .with_index_cache_size_bytes(read_params.index_cache_size_bytes)
