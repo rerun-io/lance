@@ -74,5 +74,10 @@ harness = false
 name = "manifest_intern"
 harness = false
 
+[[bench]]
+name = "frag_reuse_remap"
+path = "benches/frag_reuse_remap/frag_reuse_remap.rs"
+harness = false
+
 [lints]
 workspace = true
