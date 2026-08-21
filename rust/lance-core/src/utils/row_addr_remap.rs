@@ -139,6 +139,38 @@ struct GroupRemap {
     new_frag_row_ranges: Vec<(u32, u64, u32)>,
 }
 
+/// Average runs per run container above which run encoding costs more to `rank` than it
+/// saves. A container holding a single run ranks as cheaply as a cached `len()` read and
+/// is far smaller, so it is worth keeping; beyond a handful the interval rescan dominates.
+///
+/// Deliberately at the low end: the error is asymmetric. Keeping runs that should be
+/// stripped costs a term that grows with fragment width, while stripping runs that should
+/// be kept costs a small constant.
+const MAX_RUNS_PER_CONTAINER: u64 = 4;
+
+/// Bytes roaring spends per run when serializing a run container: an `Interval` is two
+/// `u16`. Needed because `statistics()` reports run bytes but not a run count.
+const RUN_BYTES: u64 = 4;
+
+/// Bytes of run count roaring writes per run container.
+const RUN_COUNT_BYTES: u64 = 2;
+
+/// Whether stripping run encoding from `bitmap` would make `get` cheaper.
+///
+/// `RoaringBitmap::rank` sums `len()` over every container below the target. That is a
+/// cached field for bitmap containers and an interval rescan for run containers, so the
+/// encoding chosen for the *serialized* payload (which `optimize` picks by size) can be
+/// the wrong one to keep resident.
+fn should_strip_runs(bitmap: &RoaringBitmap) -> bool {
+    let stats = bitmap.statistics();
+    // `n_bytes_run_containers` is `sum(RUN_COUNT_BYTES + RUN_BYTES * runs)` over the run
+    // containers, so recover the run count from it. With no run containers both terms are
+    // zero and this answers false, which is the right answer -- there is nothing to strip.
+    let run_containers = stats.n_run_containers as u64;
+    let runs = (stats.n_bytes_run_containers - RUN_COUNT_BYTES * run_containers) / RUN_BYTES;
+    runs > MAX_RUNS_PER_CONTAINER * run_containers
+}
+
 impl GroupRemap {
     fn new(input: GroupInput) -> Result<Self> {
         // Note the asymmetry between the two fragment lists. `old_frag_ids` carries no
@@ -172,10 +204,32 @@ impl GroupRemap {
         }
         let total_new_rows = rewritten_rows_before;
 
+        // Choose the encoding we keep resident, rather than inheriting the payload's.
+        //
+        // Compaction run-optimizes the address set before serializing it, which makes the
+        // payload dramatically smaller on disk and is worth keeping. But `get` reaches
+        // `RoaringBitmap::rank`, which sums `len()` over every container below the target,
+        // and that is O(1) for bitmap and array containers while for run containers it
+        // rescans the interval list. So a payload of many short runs -- what deletion
+        // holes produce -- would make each lookup O(#containers x #runs), scaling with
+        // fragment width in rows, when this structure exists to be bounded by fragment
+        // count.
+        //
+        // Stripping unconditionally is not right either: a fragment rewritten whole is one
+        // contiguous run per container, which ranks as cheaply as a cached read and costs
+        // six bytes against a bitmap container's fixed 8 KiB. Hence the per-bitmap choice.
+        //
+        // Serialization is unaffected either way; this only changes what stays resident.
         let mut per_frag: HashMap<u32, RoaringBitmap> = input
             .rewritten_old_row_addrs
             .bitmaps()
-            .map(|(frag_id, bitmap)| (frag_id, bitmap.clone()))
+            .map(|(frag_id, bitmap)| {
+                let mut bitmap = bitmap.clone();
+                if should_strip_runs(&bitmap) {
+                    bitmap.remove_run_compression();
+                }
+                (frag_id, bitmap)
+            })
             .collect();
         let mut frags = HashMap::new();
         let mut rewritten_rows_before = 0u64;
@@ -431,6 +485,135 @@ mod tests {
             new_frags: vec![(12, 1), (11, 1)],
         };
         assert!(RowAddrRemap::compact([input]).is_err());
+    }
+
+    #[test]
+    fn test_resident_bitmaps_are_not_run_encoded() {
+        // Compaction run-optimizes the address set before writing it, so what arrives
+        // here is run-encoded. Keeping that encoding resident makes `get` O(#containers x
+        // #runs), because `RoaringBitmap::rank` sums `len()` over preceding containers and
+        // `len()` rescans the interval list for run containers. Two fragments wide enough
+        // to span several containers, with periodic holes so run-encoding is what
+        // `optimize` picks.
+        let mut rewritten = RoaringTreemap::new();
+        let mut kept = 0u32;
+        for frag in 0..2u32 {
+            for offset in 0..200_000u32 {
+                if offset % 128 < 125 {
+                    rewritten.insert(addr(frag, offset));
+                    kept += 1;
+                }
+            }
+        }
+        assert!(rewritten.optimize(), "payload should be run-encodable");
+        for (frag_id, bitmap) in rewritten.bitmaps() {
+            assert!(
+                bitmap.statistics().n_run_containers > 0,
+                "fragment {frag_id} should arrive run-encoded, or this test proves nothing"
+            );
+        }
+
+        let remap = CompactRowAddrRemap::new([GroupInput {
+            rewritten_old_row_addrs: rewritten,
+            old_frag_ids: vec![0, 1],
+            new_frags: vec![(10, kept)],
+        }])
+        .unwrap();
+
+        for group in &remap.groups {
+            for (frag_id, (bitmap, _)) in &group.frags {
+                let stats = bitmap.statistics();
+                assert_eq!(
+                    stats.n_run_containers, 0,
+                    "fragment {frag_id} kept {} run containers; `rank` would pay \
+                     O(containers x runs) per lookup",
+                    stats.n_run_containers
+                );
+                assert!(
+                    stats.n_containers > 1,
+                    "test needs a multi-container bitmap"
+                );
+            }
+        }
+
+        // Stripping the encoding must not move any address.
+        assert_eq!(remap.get(addr(0, 0)), Some(Some(addr(10, 0))));
+        assert_eq!(remap.get(addr(0, 124)), Some(Some(addr(10, 124))));
+        assert_eq!(remap.get(addr(0, 125)), Some(None), "hole in the pattern");
+        assert_eq!(remap.get(addr(0, 128)), Some(Some(addr(10, 125))));
+        // First surviving offset of fragment 1 follows all of fragment 0's survivors.
+        assert_eq!(remap.get(addr(1, 0)), Some(Some(addr(10, kept / 2))));
+    }
+
+    #[test]
+    fn test_no_run_containers_needs_no_special_case() {
+        // `should_strip_runs` has no zero guard: with no run containers both terms of the
+        // comparison are zero. Pins that, since without it the byte arithmetic would be a
+        // subtraction waiting to underflow.
+        let scattered: Vec<u64> = (0..500u32).map(|i| addr(0, i * 977)).collect();
+        let mut rewritten = RoaringTreemap::from_iter(scattered.iter().copied());
+        rewritten.optimize();
+        for (_, bitmap) in rewritten.bitmaps() {
+            assert_eq!(
+                bitmap.statistics().n_run_containers,
+                0,
+                "a scattered set should not be run-encoded, or this test proves nothing"
+            );
+            assert!(!should_strip_runs(bitmap), "nothing to strip");
+        }
+
+        let remap = CompactRowAddrRemap::new([GroupInput {
+            rewritten_old_row_addrs: rewritten,
+            old_frag_ids: vec![0],
+            new_frags: vec![(10, scattered.len() as u32)],
+        }])
+        .unwrap();
+        assert_eq!(remap.get(scattered[0]), Some(Some(addr(10, 0))));
+        assert_eq!(remap.get(scattered[499]), Some(Some(addr(10, 499))));
+        assert_eq!(
+            remap.get(addr(0, 1)),
+            Some(None),
+            "not in the scattered set"
+        );
+    }
+
+    #[test]
+    fn test_run_encoding_kept_when_runs_are_few() {
+        // The other side of `should_strip_runs`. A fragment rewritten whole is one
+        // contiguous run per container, which ranks as cheaply as a cached `len()` read
+        // and costs 6 bytes against a bitmap container's fixed 8 KiB. Stripping that
+        // would be a regression on both axes, so it must be left alone.
+        let rows = 200_000u32;
+        let mut rewritten = RoaringTreemap::new();
+        for offset in 0..rows {
+            rewritten.insert(addr(0, offset));
+        }
+        assert!(rewritten.optimize());
+
+        let remap = CompactRowAddrRemap::new([GroupInput {
+            rewritten_old_row_addrs: rewritten,
+            old_frag_ids: vec![0],
+            new_frags: vec![(10, rows)],
+        }])
+        .unwrap();
+
+        for group in &remap.groups {
+            for (frag_id, (bitmap, _)) in &group.frags {
+                let stats = bitmap.statistics();
+                assert!(
+                    stats.n_containers > 1,
+                    "test needs a multi-container bitmap"
+                );
+                assert_eq!(
+                    stats.n_run_containers, stats.n_containers,
+                    "fragment {frag_id} should stay run-encoded: one run per container is \
+                     both cheaper to rank and far smaller"
+                );
+            }
+        }
+
+        assert_eq!(remap.get(addr(0, 0)), Some(Some(addr(10, 0))));
+        assert_eq!(remap.get(addr(0, rows - 1)), Some(Some(addr(10, rows - 1))));
     }
 
     #[test]
