@@ -320,7 +320,9 @@ pub struct ReadParams {
     ///
     /// This defaults to the `LANCE_FRAG_REUSE_REMAP_MODE` environment variable when present,
     /// accepting `"direct"` or `"compact"`, and to [`IndexRemapMode::Direct`] otherwise. The
-    /// env var is read once per process.
+    /// env var is read once per process, and is also what
+    /// [`CompactionOptions::index_remap_mode`](crate::dataset::optimize::CompactionOptions)
+    /// defaults to, so one setting moves both sides.
     pub frag_reuse_remap_mode: IndexRemapMode,
 }
 
