@@ -173,6 +173,16 @@ pub enum IndexRemapMode {
     Direct,
 }
 
+impl IndexRemapMode {
+    /// The spelling this form parses from, for messages that name a form back to the user.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Compact => "compact",
+            Self::Direct => "direct",
+        }
+    }
+}
+
 impl TryFrom<&str> for IndexRemapMode {
     type Error = Error;
 
@@ -1964,6 +1974,13 @@ pub async fn commit_compaction(
 
     // If we aren't using stable row ids, then we need to remap indices.
     let needs_remapping = !dataset.manifest.uses_stable_row_ids() && !options.defer_index_remap;
+
+    // Only assert where the mode is actually consulted. A stable-row-id or deferred
+    // compaction never builds a remap, so its mode is inert and asserting on it would
+    // report configuration that costs nothing.
+    if needs_remapping {
+        crate::dataset::assert_frag_reuse_remap_mode(options.index_remap_mode);
+    }
 
     // Determine the earliest version at which compaction tasks were planned/executed.
     //
