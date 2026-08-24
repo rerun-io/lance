@@ -298,6 +298,10 @@ pub struct ReadParams {
     /// This defaults to the `LANCE_FRAG_REUSE_REMAP_MODE` environment variable when present,
     /// accepting `"direct"` or `"compact"`, and to [`IndexRemapMode::Direct`] otherwise. The
     /// env var is read once per process.
+    ///
+    /// The spelling `"assert(<mode>)"` -- for example `"assert(compact)"` -- additionally
+    /// panics if any code path opens a dataset, opens the fragment reuse index, or compacts
+    /// with the other form, so a deployment can find what still picks it.
     pub frag_reuse_remap_mode: IndexRemapMode,
 }
 
@@ -377,33 +381,88 @@ impl Default for ReadParams {
 
 const ENV_LANCE_FRAG_REUSE_REMAP_MODE: &str = "LANCE_FRAG_REUSE_REMAP_MODE";
 
-/// The reuse-remap form a reader uses unless told otherwise, from the environment if set.
+/// What `LANCE_FRAG_REUSE_REMAP_MODE` asks of a process: which reuse-remap form to default to,
+/// and whether any other form is a bug rather than a choice.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct FragReuseRemapSetting {
+    mode: IndexRemapMode,
+    /// Set by the `assert(<mode>)` spelling. A deployment moving off one form uses it to find
+    /// the code paths that still pick the other, as a panic with a backtrace rather than as the
+    /// memory blowup that form eventually causes.
+    asserted: bool,
+}
+
+/// The reuse-remap setting a process runs under, from the environment if set.
 ///
 /// Read once per process, so a deployment sets it before opening datasets rather than
 /// expecting a running process to notice a change.
-pub(crate) fn default_frag_reuse_remap_mode() -> IndexRemapMode {
-    static MODE: OnceLock<IndexRemapMode> = OnceLock::new();
-    *MODE.get_or_init(|| {
-        parse_frag_reuse_remap_mode(
+fn frag_reuse_remap_setting() -> FragReuseRemapSetting {
+    static SETTING: OnceLock<FragReuseRemapSetting> = OnceLock::new();
+    *SETTING.get_or_init(|| {
+        let setting = parse_frag_reuse_remap_mode(
             std::env::var(ENV_LANCE_FRAG_REUSE_REMAP_MODE)
                 .ok()
                 .as_deref(),
-        )
+        );
+        if setting.asserted {
+            // Announced once, on the read that fixes the setting for the process, so an
+            // operator can tell a later panic apart from an unrelated crash.
+            tracing::warn!(
+                "{ENV_LANCE_FRAG_REUSE_REMAP_MODE}=assert({}): this process will PANIC if any \
+                 code path uses another fragment reuse remap form.",
+                setting.mode.as_str(),
+            );
+        }
+        setting
     })
 }
 
-/// The parsing half of [`default_frag_reuse_remap_mode`], split out so it can be tested:
+/// The reuse-remap form a reader uses unless told otherwise.
+pub(crate) fn default_frag_reuse_remap_mode() -> IndexRemapMode {
+    frag_reuse_remap_setting().mode
+}
+
+/// Panic if `LANCE_FRAG_REUSE_REMAP_MODE=assert(<mode>)` is set and `mode` is a different form.
+///
+/// Deliberately a plain `assert!`: the point is to catch the offending code path in a release
+/// build of a deployment that has already committed to one form.
+pub(crate) fn assert_frag_reuse_remap_mode(mode: IndexRemapMode) {
+    let setting = frag_reuse_remap_setting();
+    assert!(
+        !setting.asserted || mode == setting.mode,
+        "{ENV_LANCE_FRAG_REUSE_REMAP_MODE}=assert({}) but this code path uses {}",
+        setting.mode.as_str(),
+        mode.as_str(),
+    );
+}
+
+/// The parsing half of [`frag_reuse_remap_setting`], split out so it can be tested:
 /// the `OnceLock` above reads the environment once per process, which a test cannot vary.
-fn parse_frag_reuse_remap_mode(raw: Option<&str>) -> IndexRemapMode {
-    match raw {
-        None => IndexRemapMode::Direct,
-        Some(raw) => IndexRemapMode::try_from(raw).unwrap_or_else(|_| {
+fn parse_frag_reuse_remap_mode(raw: Option<&str>) -> FragReuseRemapSetting {
+    let unset = FragReuseRemapSetting {
+        mode: IndexRemapMode::Direct,
+        asserted: false,
+    };
+    let Some(raw) = raw else {
+        return unset;
+    };
+    let lowered = raw.trim().to_lowercase();
+    let (body, asserted) = match lowered
+        .strip_prefix("assert(")
+        .and_then(|inner| inner.strip_suffix(')'))
+    {
+        Some(inner) => (inner.trim(), true),
+        None => (lowered.as_str(), false),
+    };
+    match IndexRemapMode::try_from(body) {
+        Ok(mode) => FragReuseRemapSetting { mode, asserted },
+        Err(_) => {
             tracing::warn!(
-                "Ignoring {ENV_LANCE_FRAG_REUSE_REMAP_MODE}='{raw}': expected \"direct\" or \
-                 \"compact\". Using direct."
+                "Ignoring {ENV_LANCE_FRAG_REUSE_REMAP_MODE}='{raw}': expected \"direct\", \
+                 \"compact\", or \"assert(<mode>)\". Using direct."
             );
-            IndexRemapMode::Direct
-        }),
+            unset
+        }
     }
 }
 
@@ -412,22 +471,35 @@ mod frag_reuse_remap_mode_tests {
     use super::*;
     use rstest::rstest;
 
-    /// What `LANCE_FRAG_REUSE_REMAP_MODE` accepts, including the value that is neither.
+    /// What `LANCE_FRAG_REUSE_REMAP_MODE` accepts, including the values that are neither.
     /// An unparseable setting must warn and fall back rather than fail an open, since it
     /// reaches every reader in a deployment at once.
     #[rstest]
-    #[case::unset(None, IndexRemapMode::Direct)]
-    #[case::compact(Some("compact"), IndexRemapMode::Compact)]
-    #[case::direct(Some("direct"), IndexRemapMode::Direct)]
-    #[case::upper_case(Some("COMPACT"), IndexRemapMode::Compact)]
-    #[case::mixed_case(Some("Compact"), IndexRemapMode::Compact)]
-    #[case::unparseable(Some("nonsense"), IndexRemapMode::Direct)]
-    #[case::empty(Some(""), IndexRemapMode::Direct)]
+    #[case::unset(None, IndexRemapMode::Direct, false)]
+    #[case::compact(Some("compact"), IndexRemapMode::Compact, false)]
+    #[case::direct(Some("direct"), IndexRemapMode::Direct, false)]
+    #[case::upper_case(Some("COMPACT"), IndexRemapMode::Compact, false)]
+    #[case::mixed_case(Some("Compact"), IndexRemapMode::Compact, false)]
+    #[case::unparseable(Some("nonsense"), IndexRemapMode::Direct, false)]
+    #[case::empty(Some(""), IndexRemapMode::Direct, false)]
+    #[case::assert_compact(Some("assert(compact)"), IndexRemapMode::Compact, true)]
+    #[case::assert_direct(Some("assert(direct)"), IndexRemapMode::Direct, true)]
+    #[case::assert_upper_case(Some("ASSERT(COMPACT)"), IndexRemapMode::Compact, true)]
+    #[case::assert_padded(Some("  assert( compact )  "), IndexRemapMode::Compact, true)]
+    #[case::assert_unparseable(Some("assert(nonsense)"), IndexRemapMode::Direct, false)]
+    #[case::assert_unterminated(Some("assert(compact"), IndexRemapMode::Direct, false)]
     fn test_parse_frag_reuse_remap_mode(
         #[case] raw: Option<&str>,
-        #[case] expected: IndexRemapMode,
+        #[case] expected_mode: IndexRemapMode,
+        #[case] expected_asserted: bool,
     ) {
-        assert_eq!(parse_frag_reuse_remap_mode(raw), expected);
+        assert_eq!(
+            parse_frag_reuse_remap_mode(raw),
+            FragReuseRemapSetting {
+                mode: expected_mode,
+                asserted: expected_asserted,
+            }
+        );
     }
 }
 
@@ -840,6 +912,7 @@ impl Dataset {
         store_params: Option<ObjectStoreParams>,
         base_store_params: Option<Arc<HashMap<String, ObjectStoreParams>>>,
     ) -> Result<Self> {
+        assert_frag_reuse_remap_mode(frag_reuse_remap_mode);
         let refs = Refs::new(
             object_store.clone(),
             commit_handler.clone(),

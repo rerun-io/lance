@@ -77,6 +77,7 @@ pub(crate) async fn open_frag_reuse_index_with_mode(
     details: &FragReuseIndexDetails,
     mode: IndexRemapMode,
 ) -> lance_core::Result<FragReuseIndex> {
+    crate::dataset::assert_frag_reuse_remap_mode(mode);
     if mode == IndexRemapMode::Direct {
         // The form a reader had before the compact one existed, kept as a fallback.
         // Materializes one entry per rewritten or deleted row, so its memory grows with the
