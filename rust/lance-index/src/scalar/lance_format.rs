@@ -260,7 +260,10 @@ impl IndexReader for current_reader::FileReader {
                 projection,
             )?
         } else {
-            ReaderProjection::from_whole_schema(self.schema(), self.metadata().version())
+            ReaderProjection::from_whole_schema_arc(
+                self.schema().clone(),
+                self.metadata().version(),
+            )
         };
         let batches = self
             .read_stream_projected(
@@ -297,7 +300,10 @@ impl IndexReader for current_reader::FileReader {
                 projection,
             )?
         } else {
-            ReaderProjection::from_whole_schema(self.schema(), self.metadata().version())
+            ReaderProjection::from_whole_schema_arc(
+                self.schema().clone(),
+                self.metadata().version(),
+            )
         };
         // `DecodeBatchScheduler::schedule_ranges` requires sorted,
         // non-overlapping ranges; sort internally and permute the
@@ -374,7 +380,10 @@ impl IndexReader for current_reader::FileReader {
                 projection,
             )?
         } else {
-            ReaderProjection::from_whole_schema(self.schema(), self.metadata().version())
+            ReaderProjection::from_whole_schema_arc(
+                self.schema().clone(),
+                self.metadata().version(),
+            )
         };
         self.read_stream_projected(
             ReadBatchParams::Range(range),
@@ -395,8 +404,10 @@ impl IndexReader for current_reader::FileReader {
         if self.num_rows() == 0 {
             return Ok(None);
         }
-        let projection =
-            ReaderProjection::from_whole_schema(self.schema(), self.metadata().version());
+        let projection = ReaderProjection::from_whole_schema_arc(
+            self.schema().clone(),
+            self.metadata().version(),
+        );
         let stream = self
             .read_stream_projected(
                 ReadBatchParams::RangeFull,
