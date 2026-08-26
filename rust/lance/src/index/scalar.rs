@@ -33,7 +33,7 @@ use itertools::Itertools;
 use lance_core::datatypes::Field;
 use lance_core::utils::tracing::{IO_TYPE_OPEN_SCALAR, TRACE_IO_EVENTS};
 use lance_core::{Error, ROW_ADDR, ROW_ID, Result};
-use lance_datafusion::exec::LanceExecutionOptions;
+use lance_datafusion::exec::{LanceExecutionOptions, MemoryPoolKind};
 use lance_index::metrics::{MetricsCollector, NoOpMetricsCollector};
 use lance_index::pbold::{
     BTreeIndexDetails, BitmapIndexDetails, InvertedIndexDetails, LabelListIndexDetails,
@@ -157,6 +157,7 @@ pub(crate) async fn scan_training_data(
     let batches = scan
         .try_into_dfstream(LanceExecutionOptions {
             use_spilling: true,
+            mem_pool_kind: MemoryPoolKind::IndexTraining,
             ..Default::default()
         })
         .await?;

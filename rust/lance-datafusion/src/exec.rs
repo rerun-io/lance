@@ -282,10 +282,33 @@ impl ExecutionPlan for TracedExec {
 /// Callback for reporting statistics after a scan
 pub type ExecutionStatsCallback = Arc<dyn Fn(&ExecutionSummaryCounts) + Send + Sync>;
 
+/// Selects which spill memory pool an execution draws from.
+///
+/// Contexts are cached per pool kind, so two kinds never share a
+/// [`FairSpillPool`] even when their configured sizes coincide.
+#[derive(Default, Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum MemoryPoolKind {
+    /// The pool shared by scans, merge-insert and index maintenance.
+    #[default]
+    Shared,
+    /// A pool used only by the scalar-index training scan.
+    IndexTraining,
+}
+
+impl MemoryPoolKind {
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::Shared => "shared",
+            Self::IndexTraining => "index_training",
+        }
+    }
+}
+
 #[derive(Default, Clone)]
 pub struct LanceExecutionOptions {
     pub use_spilling: bool,
     pub mem_pool_size: Option<u64>,
+    pub mem_pool_kind: MemoryPoolKind,
     pub max_temp_directory_size: Option<u64>,
     pub batch_size: Option<usize>,
     pub target_partition: Option<usize>,
@@ -298,6 +321,7 @@ impl std::fmt::Debug for LanceExecutionOptions {
         f.debug_struct("LanceExecutionOptions")
             .field("use_spilling", &self.use_spilling)
             .field("mem_pool_size", &self.mem_pool_size)
+            .field("mem_pool_kind", &self.mem_pool_kind)
             .field("max_temp_directory_size", &self.max_temp_directory_size)
             .field("batch_size", &self.batch_size)
             .field("target_partition", &self.target_partition)
@@ -312,21 +336,48 @@ impl std::fmt::Debug for LanceExecutionOptions {
 
 const DEFAULT_LANCE_MEM_POOL_SIZE_PER_PARTITION: u64 = 100 * 1024 * 1024;
 const DEFAULT_LANCE_MAX_TEMP_DIRECTORY_SIZE: u64 = 100 * 1024 * 1024 * 1024; // 100GB
+const DEFAULT_LANCE_INDEX_TRAINING_MEM_POOL_SIZE: u64 = 8 * 1024 * 1024 * 1024; // 8GiB
+
+/// Size of the pool dedicated to the scalar-index training scan.
+pub fn index_training_mem_pool_size() -> u64 {
+    static SIZE: OnceLock<u64> = OnceLock::new();
+    *SIZE.get_or_init(|| {
+        let size = match std::env::var("LANCE_INDEX_TRAINING_MEM_POOL_SIZE") {
+            Ok(s) => match s.parse::<u64>() {
+                Ok(v) => v,
+                Err(e) => {
+                    warn!(
+                        "Failed to parse LANCE_INDEX_TRAINING_MEM_POOL_SIZE: {}, using default",
+                        e
+                    );
+                    DEFAULT_LANCE_INDEX_TRAINING_MEM_POOL_SIZE
+                }
+            },
+            Err(_) => DEFAULT_LANCE_INDEX_TRAINING_MEM_POOL_SIZE,
+        };
+        info!("Index training memory pool size is {} bytes", size);
+        size
+    })
+}
 
 impl LanceExecutionOptions {
     pub fn mem_pool_size(&self) -> u64 {
+        if let Some(size) = self.mem_pool_size {
+            return size;
+        }
+        if self.mem_pool_kind == MemoryPoolKind::IndexTraining {
+            return index_training_mem_pool_size();
+        }
         let num_partitions = self.target_partition.unwrap_or(1) as u64;
-        self.mem_pool_size.unwrap_or_else(|| {
-            std::env::var("LANCE_MEM_POOL_SIZE")
-                .map(|s| match s.parse::<u64>() {
-                    Ok(v) => v,
-                    Err(e) => {
-                        warn!("Failed to parse LANCE_MEM_POOL_SIZE: {}, using default", e);
-                        DEFAULT_LANCE_MEM_POOL_SIZE_PER_PARTITION * num_partitions
-                    }
-                })
-                .unwrap_or(DEFAULT_LANCE_MEM_POOL_SIZE_PER_PARTITION * num_partitions)
-        })
+        std::env::var("LANCE_MEM_POOL_SIZE")
+            .map(|s| match s.parse::<u64>() {
+                Ok(v) => v,
+                Err(e) => {
+                    warn!("Failed to parse LANCE_MEM_POOL_SIZE: {}, using default", e);
+                    DEFAULT_LANCE_MEM_POOL_SIZE_PER_PARTITION * num_partitions
+                }
+            })
+            .unwrap_or(DEFAULT_LANCE_MEM_POOL_SIZE_PER_PARTITION * num_partitions)
     }
 
     pub fn max_temp_directory_size(&self) -> u64 {
@@ -386,6 +437,7 @@ pub fn new_session_context(options: &LanceExecutionOptions) -> SessionContext {
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 struct SessionContextCacheKey {
     mem_pool_size: u64,
+    mem_pool_kind: MemoryPoolKind,
     max_temp_directory_size: u64,
     target_partition: Option<usize>,
     use_spilling: bool,
@@ -393,11 +445,18 @@ struct SessionContextCacheKey {
 
 impl SessionContextCacheKey {
     fn from_options(options: &LanceExecutionOptions) -> Self {
+        let use_spilling = options.use_spilling();
         Self {
             mem_pool_size: options.mem_pool_size(),
+            // Without spilling there is no pool to isolate, so don't spend a cache slot on the kind.
+            mem_pool_kind: if use_spilling {
+                options.mem_pool_kind
+            } else {
+                MemoryPoolKind::default()
+            },
             max_temp_directory_size: options.max_temp_directory_size(),
             target_partition: options.target_partition,
-            use_spilling: options.use_spilling(),
+            use_spilling,
         }
     }
 }
@@ -1121,6 +1180,67 @@ mod tests {
             let cache_guard = cache.lock().unwrap();
             assert_eq!(cache_guard.len(), 2);
         }
+    }
+
+    #[test]
+    fn test_index_training_pool_is_distinct_from_shared() {
+        let _lock = CACHE_TEST_LOCK.lock().unwrap();
+        let cache = get_session_cache();
+        cache.lock().unwrap().clear();
+
+        // Same size on purpose: isolation must not depend on the sizes differing.
+        let size = Some(64 * 1024 * 1024);
+        let shared = LanceExecutionOptions {
+            use_spilling: true,
+            mem_pool_size: size,
+            ..Default::default()
+        };
+        let training = LanceExecutionOptions {
+            use_spilling: true,
+            mem_pool_size: size,
+            mem_pool_kind: MemoryPoolKind::IndexTraining,
+            ..Default::default()
+        };
+        assert_eq!(shared.mem_pool_size(), training.mem_pool_size());
+        assert_ne!(
+            SessionContextCacheKey::from_options(&shared),
+            SessionContextCacheKey::from_options(&training)
+        );
+
+        let shared_ctx = get_session_context(&shared);
+        let training_ctx = get_session_context(&training);
+        assert_eq!(cache.lock().unwrap().len(), 2);
+        assert!(!Arc::ptr_eq(
+            &shared_ctx.runtime_env().memory_pool,
+            &training_ctx.runtime_env().memory_pool,
+        ));
+
+        // Without spilling there is no pool, so the kind must not consume a cache slot.
+        let no_spill_shared = LanceExecutionOptions {
+            mem_pool_size: size,
+            ..Default::default()
+        };
+        let no_spill_training = LanceExecutionOptions {
+            mem_pool_size: size,
+            mem_pool_kind: MemoryPoolKind::IndexTraining,
+            ..Default::default()
+        };
+        assert_eq!(
+            SessionContextCacheKey::from_options(&no_spill_shared),
+            SessionContextCacheKey::from_options(&no_spill_training)
+        );
+    }
+
+    #[test]
+    fn test_index_training_pool_size_default() {
+        assert_eq!(
+            LanceExecutionOptions {
+                mem_pool_kind: MemoryPoolKind::IndexTraining,
+                ..Default::default()
+            }
+            .mem_pool_size(),
+            index_training_mem_pool_size()
+        );
     }
 
     #[test]
