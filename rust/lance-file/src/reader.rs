@@ -341,7 +341,12 @@ impl ReaderProjection {
     /// the whole struct has one column index.
     /// To support nested `packed-struct encoding`, this method need to be further adjusted.
     pub fn from_whole_schema(schema: &Schema, version: LanceFileVersion) -> Self {
-        let schema = Arc::new(schema.clone());
+        Self::from_whole_schema_arc(Arc::new(schema.clone()), version)
+    }
+
+    /// Same as [`Self::from_whole_schema`] but shares an already-`Arc`d schema
+    /// instead of deep-cloning it.
+    pub fn from_whole_schema_arc(schema: Arc<Schema>, version: LanceFileVersion) -> Self {
         let is_structural = version >= LanceFileVersion::V2_1;
         let mut column_indices = vec![];
         let mut curr_column_idx = 0;
@@ -954,10 +959,12 @@ impl FileReader {
         let num_rows = file_metadata.num_rows;
         Ok(Self {
             scheduler,
-            base_projection: base_projection.unwrap_or(ReaderProjection::from_whole_schema(
-                file_metadata.file_schema.as_ref(),
-                file_metadata.version(),
-            )),
+            base_projection: base_projection.unwrap_or_else(|| {
+                ReaderProjection::from_whole_schema_arc(
+                    file_metadata.file_schema.clone(),
+                    file_metadata.version(),
+                )
+            }),
             num_rows,
             metadata: file_metadata,
             decoder_plugins,
@@ -1749,6 +1756,44 @@ mod tests {
     use crate::testing::{FsFixture, WrittenFile, test_cache, write_lance_file};
     use crate::writer::{EncodedBatchWriteExt, FileWriter, FileWriterOptions};
     use lance_encoding::decoder::DecoderConfig;
+
+    #[rstest]
+    fn test_from_whole_schema_arc_matches_deep_clone(
+        #[values(LanceFileVersion::V2_0, LanceFileVersion::V2_1)] version: LanceFileVersion,
+    ) {
+        let arrow_schema = ArrowSchema::new(vec![
+            Field::new("x", DataType::Int32, true),
+            Field::new(
+                "y",
+                DataType::Struct(Fields::from(vec![
+                    Field::new("z", DataType::Int32, true),
+                    Field::new("w", DataType::Utf8, true),
+                ])),
+                true,
+            ),
+            Field::new(
+                "l",
+                DataType::List(Arc::new(Field::new("item", DataType::Int32, true))),
+                true,
+            ),
+            Field::new(
+                "fsl",
+                DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Float64, true)), 4),
+                true,
+            ),
+        ]);
+        let schema = Schema::try_from(&arrow_schema).unwrap();
+        let shared = Arc::new(schema.clone());
+
+        let cloned = ReaderProjection::from_whole_schema(&schema, version);
+        let arc = ReaderProjection::from_whole_schema_arc(shared.clone(), version);
+
+        assert_eq!(cloned.column_indices, arc.column_indices);
+        assert_eq!(cloned.schema.as_ref(), arc.schema.as_ref());
+        // The Arc form shares the caller's schema rather than deep-cloning it.
+        assert!(Arc::ptr_eq(&shared, &arc.schema));
+        assert!(!Arc::ptr_eq(&shared, &cloned.schema));
+    }
 
     async fn create_some_file(fs: &FsFixture, version: LanceFileVersion) -> WrittenFile {
         let location_type = DataType::Struct(Fields::from(vec![
