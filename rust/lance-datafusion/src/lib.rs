@@ -8,6 +8,7 @@ pub mod datagen;
 pub mod exec;
 pub mod expr;
 pub mod logical_expr;
+pub mod mem_pool;
 pub mod planner;
 pub mod projection;
 pub mod pb {

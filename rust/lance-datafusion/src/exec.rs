@@ -51,6 +51,7 @@ use lance_core::{
 use log::{debug, info, warn};
 use tracing::{Span, instrument};
 
+use crate::mem_pool::InstrumentedMemoryPool;
 use crate::udf::register_functions;
 use crate::{
     chunker::StrictBatchSizeStream,
@@ -419,10 +420,12 @@ pub fn new_session_context(options: &LanceExecutionOptions) -> SessionContext {
     if options.use_spilling() {
         let disk_manager_builder = DiskManagerBuilder::default()
             .with_max_temp_directory_size(options.max_temp_directory_size());
+        let pool = FairSpillPool::new(options.mem_pool_size() as usize);
         runtime_env_builder = runtime_env_builder
             .with_disk_manager_builder(disk_manager_builder)
-            .with_memory_pool(Arc::new(FairSpillPool::new(
-                options.mem_pool_size() as usize
+            .with_memory_pool(Arc::new(InstrumentedMemoryPool::new(
+                options.mem_pool_kind.label(),
+                Arc::new(pool),
             )));
     }
     let runtime_env = runtime_env_builder.build_arc().unwrap();
