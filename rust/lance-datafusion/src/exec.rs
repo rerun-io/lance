@@ -457,6 +457,40 @@ pub fn get_session_context(options: &LanceExecutionOptions) -> SessionContext {
     context
 }
 
+/// Point-in-time memory-pool statistics for one entry in the process-wide
+/// session-context cache.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionMemoryPoolStats {
+    /// The configured memory-pool capacity, in bytes.
+    ///
+    /// Only enforced when `use_spilling` is true; a non-spilling session uses
+    /// DataFusion's default unbounded pool and this value is not a limit.
+    pub mem_pool_size: u64,
+    /// Bytes currently reserved from the session's memory pool.
+    pub reserved_bytes: usize,
+    /// The `target_partition` component of the session cache key.
+    pub target_partition: Option<usize>,
+    /// Whether this session enforces the pool (spilling enabled).
+    pub use_spilling: bool,
+}
+
+/// Memory-pool statistics for every session currently in the process-wide
+/// session-context cache, e.g. for exporting pool usage as metrics.
+pub fn session_memory_pool_stats() -> Vec<SessionMemoryPoolStats> {
+    let cache = get_session_cache()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    cache
+        .iter()
+        .map(|(key, entry)| SessionMemoryPoolStats {
+            mem_pool_size: key.mem_pool_size,
+            reserved_bytes: entry.context.runtime_env().memory_pool.reserved(),
+            target_partition: key.target_partition,
+            use_spilling: key.use_spilling,
+        })
+        .collect()
+}
+
 fn get_task_context(
     session_ctx: &SessionContext,
     options: &LanceExecutionOptions,
@@ -1121,6 +1155,41 @@ mod tests {
             let cache_guard = cache.lock().unwrap();
             assert_eq!(cache_guard.len(), 2);
         }
+    }
+
+    #[test]
+    fn test_session_memory_pool_stats() {
+        use datafusion::execution::memory_pool::MemoryConsumer;
+
+        let _lock = CACHE_TEST_LOCK.lock().unwrap();
+        let cache = get_session_cache();
+
+        // Clear any existing entries from other tests
+        cache.lock().unwrap().clear();
+
+        let opts = LanceExecutionOptions {
+            use_spilling: true,
+            mem_pool_size: Some(64 * 1024 * 1024),
+            ..Default::default()
+        };
+        let ctx = get_session_context(&opts);
+
+        let stats = session_memory_pool_stats();
+        assert_eq!(stats.len(), 1);
+        assert_eq!(stats[0].mem_pool_size, 64 * 1024 * 1024);
+        assert!(stats[0].use_spilling);
+        assert_eq!(stats[0].reserved_bytes, 0);
+
+        // A reservation from the session's pool shows up in the stats and
+        // disappears when released.
+        let mut reservation = MemoryConsumer::new("test").register(&ctx.runtime_env().memory_pool);
+        reservation.grow(1024 * 1024);
+        let stats = session_memory_pool_stats();
+        assert_eq!(stats[0].reserved_bytes, 1024 * 1024);
+
+        drop(reservation);
+        let stats = session_memory_pool_stats();
+        assert_eq!(stats[0].reserved_bytes, 0);
     }
 
     #[test]
