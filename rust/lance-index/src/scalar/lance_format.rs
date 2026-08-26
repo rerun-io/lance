@@ -77,6 +77,11 @@ impl LanceIndexStore {
         metadata_cache: Arc<LanceCache>,
         format_version: LanceFileVersion,
     ) -> Self {
+        // Deliberately not consulting any process-wide buffer-size env var here: this
+        // constructor is on the query path too (`open_scalar_index` builds one per scalar
+        // index a scan opens), so a knob set for one workload would silently retune the
+        // other. Callers that need a smaller budget ask for it explicitly, via
+        // `IndexStore::with_io_buffer_size`.
         let scheduler = ScanScheduler::new(
             object_store.clone(),
             SchedulerConfig::max_bandwidth(&object_store),
@@ -98,6 +103,12 @@ impl LanceIndexStore {
     pub fn with_file_sizes(mut self, file_sizes: HashMap<String, u64>) -> Self {
         self.file_sizes = file_sizes;
         self
+    }
+
+    /// The scheduler backing this store, for tests and diagnostics that need to observe
+    /// how much prefetch the store actually held (see `ScanScheduler::backpressure_stats`).
+    pub fn scheduler(&self) -> &Arc<ScanScheduler> {
+        &self.scheduler
     }
 
     fn index_file_path(&self, name: &str) -> Result<Path> {
@@ -375,6 +386,29 @@ impl IndexReader for current_reader::FileReader {
         .await
     }
 
+    /// Single decode plan for the whole file — see [`IndexReader::whole_file_stream`].
+    async fn whole_file_stream(
+        &self,
+        batch_size: u32,
+        batch_readahead: u32,
+    ) -> Result<Option<Pin<Box<dyn lance_io::stream::RecordBatchStream>>>> {
+        if self.num_rows() == 0 {
+            return Ok(None);
+        }
+        let projection =
+            ReaderProjection::from_whole_schema(self.schema(), self.metadata().version());
+        let stream = self
+            .read_stream_projected(
+                ReadBatchParams::RangeFull,
+                batch_size,
+                batch_readahead,
+                projection,
+                FilterExpression::no_filter(),
+            )
+            .await?;
+        Ok(Some(stream))
+    }
+
     // V2 format has removed the row group concept,
     // so here we assume each batch is with 4096 rows.
     async fn num_batches(&self, batch_size: u64) -> u32 {
@@ -408,6 +442,16 @@ impl IndexStore for LanceIndexStore {
 
     fn io_parallelism(&self) -> usize {
         self.object_store.io_parallelism()
+    }
+
+    fn with_io_buffer_size(&self, bytes: u64) -> Arc<dyn IndexStore> {
+        // The metadata cache is shared with the original store, so files already opened
+        // through it stay cached; only the scheduler, and therefore the prefetch budget,
+        // is private to the returned store.
+        let mut scoped = self.clone();
+        scoped.scheduler =
+            ScanScheduler::new(self.object_store.clone(), SchedulerConfig::new(bytes));
+        Arc::new(scoped)
     }
 
     async fn new_index_file(
