@@ -660,13 +660,21 @@ pub async fn merge_indices_with_unindexed_frags<'a>(
             ))
         }
     } else {
-        let mut indices = Vec::with_capacity(old_indices.len());
-        for idx in old_indices {
+        // Append-only mode (`num_indices_to_merge: 0`) never touches the old deltas, so
+        // opening all of them just to type-check costs O(segments) of sequential reads
+        // per call — measured dominating tail-of-write index appends once deltas
+        // accumulate. Open a single delta for type dispatch and check the rest from
+        // segment metadata. Consolidating calls keep the full open pass: it doubles as
+        // a can-open health check for the segments about to be merged, whose failure
+        // downgrades the merge to a warn + skip.
+        let append_only = options.num_indices_to_merge == Some(0);
+        let index_type = if append_only {
+            let last_idx = old_indices[old_indices.len() - 1];
             match dataset
-                .open_generic_index(&field_path, &idx.uuid, &NoOpMetricsCollector)
+                .open_generic_index(&field_path, &last_idx.uuid, &NoOpMetricsCollector)
                 .await
             {
-                Ok(index) => indices.push(index),
+                Ok(index) => index.index_type(),
                 Err(e) => {
                     log::warn!(
                         "Cannot open index on column '{}': {}. \
@@ -677,19 +685,61 @@ pub async fn merge_indices_with_unindexed_frags<'a>(
                     return Ok(None);
                 }
             }
+        } else {
+            let mut indices = Vec::with_capacity(old_indices.len());
+            for idx in old_indices {
+                match dataset
+                    .open_generic_index(&field_path, &idx.uuid, &NoOpMetricsCollector)
+                    .await
+                {
+                    Ok(index) => indices.push(index),
+                    Err(e) => {
+                        log::warn!(
+                            "Cannot open index on column '{}': {}. \
+                             Skipping index merge for this column.",
+                            field_path,
+                            e
+                        );
+                        return Ok(None);
+                    }
+                }
+            }
+
+            if indices
+                .windows(2)
+                .any(|w| w[0].index_type() != w[1].index_type())
+            {
+                return Err(Error::index(format!(
+                    "Append index: invalid index deltas: {:?}",
+                    old_indices
+                )));
+            }
+
+            indices[0].index_type()
+        };
+
+        if append_only {
+            // Metadata-level consistency: mixed detail types across deltas are invalid.
+            // Legacy detail-less segments are exempt here; the next consolidating pass
+            // still opens and checks them.
+            let mut type_url = None::<&str>;
+            for idx in old_indices {
+                let Some(details) = idx.index_details.as_ref() else {
+                    continue;
+                };
+                match type_url {
+                    Some(expected) if expected != details.type_url.as_str() => {
+                        return Err(Error::index(format!(
+                            "Append index: invalid index deltas: {:?}",
+                            old_indices
+                        )));
+                    }
+                    None => type_url = Some(details.type_url.as_str()),
+                    Some(_) => {}
+                }
+            }
         }
 
-        if indices
-            .windows(2)
-            .any(|w| w[0].index_type() != w[1].index_type())
-        {
-            return Err(Error::index(format!(
-                "Append index: invalid index deltas: {:?}",
-                old_indices
-            )));
-        }
-
-        let index_type = indices[0].index_type();
         match index_type {
             IndexType::Inverted => {
                 let selected_old_indices =
@@ -839,7 +889,7 @@ pub async fn merge_indices_with_unindexed_frags<'a>(
             }
             _ => Err(Error::index(format!(
                 "Append index: invalid index type: {:?}",
-                indices[0].index_type()
+                index_type
             ))),
         }
     }?;
