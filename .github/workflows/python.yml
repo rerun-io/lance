@@ -5,10 +5,12 @@ on:
     branches:
       - main
       - release/**
+      - release-*
   pull_request:
     branches:
       - main
       - release/**
+      - release-*
     paths:
       - Cargo.*
       - python/**
@@ -40,7 +42,15 @@ env:
   CACHE_PREFIX: "2"
 
 jobs:
+  # Rerun fork: jobs carrying `if: github.repository != 'rerun-io/lance'` request larger runners
+  # (`*-4x`, `*-arm64-4x`, `warp-macos-*`, `windows-latest-4x`) that exist only in the upstream
+  # org; a job asking for a label that never resolves sits queued for 24h and is then cancelled.
+  # See rust.yml. `compat` is left unguarded but skips anyway, since it needs `linux-wheel`.
+  #
+  # Consequence: only `linux-memtest` runs here today. These guards come off once matching
+  # runner labels exist in this org.
   lint:
+    if: github.repository != 'rerun-io/lance'
     timeout-minutes: 45
     runs-on: "ubuntu-24.04-4x"
     defaults:
@@ -94,6 +104,7 @@ jobs:
           source venv/bin/activate
           pytest --doctest-modules python/lance
   linux-wheel:
+    if: github.repository != 'rerun-io/lance'
     timeout-minutes: 45
     name: Python Linux x86_64 wheel
     runs-on: "ubuntu-24.04-4x"
@@ -148,6 +159,7 @@ jobs:
           if-no-files-found: error
 
   linux:
+    if: github.repository != 'rerun-io/lance'
     needs: [linux-wheel, linux-memtest]
     timeout-minutes: 45
     strategy:
@@ -215,6 +227,7 @@ jobs:
           COMPAT_TEMP_VENV: 1
 
   linux-arm:
+    if: github.repository != 'rerun-io/lance'
     timeout-minutes: 45
     runs-on: ubuntu-24.04-arm64-4x
     name: Python Linux 3.14 ARM
@@ -246,6 +259,7 @@ jobs:
           sudo apt install -y libhdf5-dev
       - uses: ./.github/workflows/run_tests
   mac:
+    if: github.repository != 'rerun-io/lance'
     timeout-minutes: 45
     name: Python macOS 3.14 ARM
     runs-on: "warp-macos-14-arm64-6x"
@@ -274,6 +288,7 @@ jobs:
           skip-torch: "true"
 
   windows:
+    if: github.repository != 'rerun-io/lance'
     runs-on: windows-latest-4x
     timeout-minutes: 90
     defaults:
@@ -294,6 +309,7 @@ jobs:
           args: "--profile ci"
       - uses: ./.github/workflows/run_tests
   aws-integtest:
+    if: github.repository != 'rerun-io/lance'
     needs: linux-wheel
     timeout-minutes: 45
     runs-on: "ubuntu-24.04-4x"
