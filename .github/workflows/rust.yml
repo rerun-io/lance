@@ -4,10 +4,12 @@ on:
     branches:
       - main
       - release/**
+      - release-*
   pull_request:
     branches:
       - main
       - release/**
+      - release-*
     paths:
       - rust/**
       - protos/**
@@ -31,6 +33,10 @@ env:
   RUST_BACKTRACE: "1"
 
 jobs:
+  # Rerun fork: `mac-build` requests `warp-macos-14-arm64-6x`, a WarpBuild runner that exists only
+  # in the upstream org. A job asking for a label that never resolves sits queued for 24h and is
+  # then cancelled, so it is skipped here. Every other runner label this workflow uses has a
+  # same-named runner in this org.
   format:
     runs-on: ubuntu-24.04
     timeout-minutes: 15
@@ -351,6 +357,7 @@ jobs:
           ALL_FEATURES=`cargo metadata --format-version=1 --no-deps | jq -r '.packages[] | .features | keys | .[]' | grep -v -e protoc -e slow_tests | sort | uniq | paste -s -d "," -`
           cargo build --profile ci --benches --features ${ALL_FEATURES} --tests
   mac-build:
+    if: github.repository != 'rerun-io/lance'
     runs-on: warp-macos-14-arm64-6x
     timeout-minutes: 45
     strategy:

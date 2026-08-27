@@ -5,10 +5,12 @@ on:
     branches:
       - main
       - release/**
+      - release-*
   pull_request:
     branches:
       - main
       - release/**
+      - release-*
     paths:
       - Cargo.*
       - python/**
@@ -40,6 +42,8 @@ env:
   CACHE_PREFIX: "2"
 
 jobs:
+  # Rerun fork: `mac` requests `warp-macos-14-arm64-6x`, a WarpBuild runner that exists only in the
+  # upstream org, so it is skipped here. See rust.yml.
   lint:
     timeout-minutes: 45
     runs-on: "ubuntu-24.04-4x"
@@ -246,6 +250,7 @@ jobs:
           sudo apt install -y libhdf5-dev
       - uses: ./.github/workflows/run_tests
   mac:
+    if: github.repository != 'rerun-io/lance'
     timeout-minutes: 45
     name: Python macOS 3.14 ARM
     runs-on: "warp-macos-14-arm64-6x"
