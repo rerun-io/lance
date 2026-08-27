@@ -368,13 +368,23 @@ impl ObjectStoreProvider for AzureBlobStoreProvider {
     /// For `az://` and `abfss://` URLs, the container/filesystem lives in
     /// the URL authority, so the entire URL path is the object path.
     fn extract_path(&self, url: &Url) -> Result<Path> {
-        if url.scheme() == "https" {
-            url.path_segments()
-                .map(|s| Path::from_iter(s.skip(1)))
-                .ok_or_else(|| Error::invalid_input(format!("Invalid Azure URL: {url}")))
+        // `https://<account>.blob.core.windows.net/<container>/<path>` names the container in
+        // the first path segment, and the store is already rooted there, so drop it. `az` and
+        // `abfss` carry the container in the URL host, so their whole path is the object path.
+        let path = if url.scheme() == "https" {
+            url.path()
+                .trim_start_matches('/')
+                .split_once('/')
+                .map_or("", |(_container, rest)| rest)
         } else {
-            Ok(Path::from(url.path()))
-        }
+            url.path()
+        };
+
+        // Decode before building the `Path`, as the trait default does: `Path` holds raw UTF-8,
+        // so the object store client percent-encodes once rather than twice.
+        Path::from_url_path(path).map_err(|e| {
+            Error::invalid_input(format!("Invalid path in URL '{}': {}", url.path(), e))
+        })
     }
 }
 
@@ -453,6 +463,41 @@ mod tests {
         let path = provider.extract_path(&url).unwrap();
         let expected_path = object_store::path::Path::from("path/to/file");
         assert_eq!(path, expected_path);
+    }
+
+    #[test]
+    fn test_azure_store_https_path_percent_decoded() {
+        // The container segment is dropped and the remainder is decoded, so the object store
+        // client encodes it exactly once. Encoding it here would double-encode the request.
+        let provider = AzureBlobStoreProvider;
+
+        let url = Url::parse("https://account.blob.core.windows.net/bucket/a%20b/c.lance").unwrap();
+        let path = provider.extract_path(&url).unwrap();
+        assert_eq!(path, object_store::path::Path::from("a b/c.lance"));
+    }
+
+    #[test]
+    fn test_azure_store_az_path_matches_trait_default() {
+        // `az` and `abfss` must keep the decoding behaviour of the default `extract_path`.
+        let provider = AzureBlobStoreProvider;
+
+        let url = Url::parse("az://bucket/a%20b/c.lance").unwrap();
+        let path = provider.extract_path(&url).unwrap();
+        assert_eq!(path, object_store::path::Path::from("a b/c.lance"));
+    }
+
+    #[test]
+    fn test_azure_store_https_container_root() {
+        let provider = AzureBlobStoreProvider;
+
+        for uri in [
+            "https://account.blob.core.windows.net/bucket",
+            "https://account.blob.core.windows.net/bucket/",
+        ] {
+            let url = Url::parse(uri).unwrap();
+            let path = provider.extract_path(&url).unwrap();
+            assert_eq!(path, object_store::path::Path::from(""), "{uri}");
+        }
     }
 
     #[test]

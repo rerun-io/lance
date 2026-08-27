@@ -1975,6 +1975,7 @@ mod tests {
     #[case::oss("oss://bucket-a/ds")]
     #[case::cos("cos://bucket-a/ds")]
     #[case::tos("tos://bucket-a/ds")]
+    #[case::https("https://account.blob.core.windows.net/container/ds")]
     async fn test_commit_handler_from_url_conditional_put_schemes(#[case] url: &str) {
         // Every scheme whose store supports atomic put-if-not-exists must
         // route to ConditionalPutCommitHandler — otherwise concurrent writers
