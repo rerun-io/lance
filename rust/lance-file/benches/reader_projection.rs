@@ -107,6 +107,22 @@ fn bench_from_field_ids(c: &mut Criterion) {
                     })
                 },
             );
+            group.bench_with_input(
+                BenchmarkId::new(format!("{shape}/from_field_ids_arc"), width),
+                schema,
+                |b, schema| {
+                    b.iter(|| {
+                        black_box(
+                            ReaderProjection::from_field_ids_arc(
+                                LanceFileVersion::V2_1,
+                                (*schema).clone(),
+                                &map,
+                            )
+                            .unwrap(),
+                        )
+                    })
+                },
+            );
         }
     }
     group.finish();

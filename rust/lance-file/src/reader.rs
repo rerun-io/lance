@@ -319,6 +319,20 @@ impl ReaderProjection {
         schema: &Schema,
         field_id_to_column_index: &BTreeMap<u32, u32>,
     ) -> Result<Self> {
+        Self::from_field_ids_arc(
+            file_version,
+            Arc::new(schema.clone()),
+            field_id_to_column_index,
+        )
+    }
+
+    /// Same as [`Self::from_field_ids`] but shares an already-`Arc`d schema
+    /// instead of deep-cloning it.
+    pub fn from_field_ids_arc(
+        file_version: LanceFileVersion,
+        schema: Arc<Schema>,
+        field_id_to_column_index: &BTreeMap<u32, u32>,
+    ) -> Result<Self> {
         let mut column_indices = Vec::new();
         Self::from_field_ids_helper(
             file_version,
@@ -326,11 +340,10 @@ impl ReaderProjection {
             field_id_to_column_index,
             &mut column_indices,
         )?;
-        let projection = Self {
-            schema: Arc::new(schema.clone()),
+        Ok(Self {
+            schema,
             column_indices,
-        };
-        Ok(projection)
+        })
     }
 
     /// Creates a projection that reads the entire file

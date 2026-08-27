@@ -362,9 +362,9 @@ mod v2_adapter {
             projection: Arc<Schema>,
         ) -> BoxFuture<'_, Result<ReadBatchTaskStream>> {
             async move {
-                let projection = ReaderProjection::from_field_ids(
+                let projection = ReaderProjection::from_field_ids_arc(
                     self.reader.metadata().version(),
-                    projection.as_ref(),
+                    projection,
                     self.field_id_to_column_idx.as_ref(),
                 )?;
                 Ok(self
@@ -392,9 +392,9 @@ mod v2_adapter {
             projection: Arc<Schema>,
         ) -> BoxFuture<'_, Result<ReadBatchTaskStream>> {
             async move {
-                let projection = ReaderProjection::from_field_ids(
+                let projection = ReaderProjection::from_field_ids_arc(
                     self.reader.metadata().version(),
-                    projection.as_ref(),
+                    projection,
                     self.field_id_to_column_idx.as_ref(),
                 )?;
                 Ok(self
@@ -421,9 +421,9 @@ mod v2_adapter {
             projection: Arc<Schema>,
         ) -> BoxFuture<'_, Result<ReadBatchTaskStream>> {
             async move {
-                let projection = ReaderProjection::from_field_ids(
+                let projection = ReaderProjection::from_field_ids_arc(
                     self.reader.metadata().version(),
-                    projection.as_ref(),
+                    projection,
                     self.field_id_to_column_idx.as_ref(),
                 )?;
                 Ok(self
@@ -453,9 +453,9 @@ mod v2_adapter {
         ) -> BoxFuture<'_, Result<ReadBatchTaskStream>> {
             let indices = UInt32Array::from(indices.to_vec());
             async move {
-                let projection = ReaderProjection::from_field_ids(
+                let projection = ReaderProjection::from_field_ids_arc(
                     self.reader.metadata().version(),
-                    projection.as_ref(),
+                    projection,
                     self.field_id_to_column_idx.as_ref(),
                 )?;
 
