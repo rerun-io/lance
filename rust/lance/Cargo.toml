@@ -172,6 +172,10 @@ name = "lq"
 required-features = ["cli"]
 
 [[bench]]
+name = "fragment_open"
+harness = false
+
+[[bench]]
 name = "scalar_index"
 harness = false
 

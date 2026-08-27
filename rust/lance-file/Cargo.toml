@@ -61,5 +61,9 @@ features = ["protoc"]
 name = "reader"
 harness = false
 
+[[bench]]
+name = "reader_projection"
+harness = false
+
 [lints]
 workspace = true
