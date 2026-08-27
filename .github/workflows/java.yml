@@ -5,10 +5,12 @@ on:
     branches:
       - main
       - release/**
+      - release-*
   pull_request:
     branches:
       - main
       - release/**
+      - release-*
     paths:
       - java/**
       - rust/**
