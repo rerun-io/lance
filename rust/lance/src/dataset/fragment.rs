@@ -965,9 +965,9 @@ impl FileFragment {
         read_config: &FragReadConfig,
     ) -> Result<Option<Box<dyn GenericFileReader>>> {
         let full_schema = self.dataset.schema();
-        // The data file may contain fields that are not part of the dataset any longer, remove those
-        let data_file_schema = data_file.schema(full_schema);
         let projection = projection.unwrap_or(full_schema);
+        // The data file may contain fields that are not part of the dataset any longer, remove those
+        let data_file_schema = data_file.schema_for_projection(full_schema, projection);
         // Also remove any fields that are not part of the user's provided projection
         let schema_per_file = Arc::new(projection.intersection_ignore_types(&data_file_schema)?);
 
@@ -2766,12 +2766,153 @@ mod tests {
     use super::*;
     use crate::{
         dataset::{
-            InsertBuilder,
+            InsertBuilder, WriteMode,
             transaction::{Operation, UpdateMode, UpdatedFragmentOffsets},
         },
         session::Session,
         utils::test::TestDatasetGenerator,
     };
+
+    async fn wide_dataset(uri: &str, width: usize) -> Dataset {
+        let arrow = Arc::new(ArrowSchema::new(
+            (0..width)
+                .map(|i| ArrowField::new(format!("c{i}"), DataType::Int64, true))
+                .collect::<Vec<_>>(),
+        ));
+        let mut ds = None;
+        for chunk in 0..4 {
+            let cols: Vec<ArrayRef> = (0..width)
+                .map(|i| {
+                    Arc::new(Int64Array::from_iter_values(
+                        (0..32).map(|r| (chunk * 32 + r) * 1000 + i as i64),
+                    )) as ArrayRef
+                })
+                .collect();
+            let batch = RecordBatch::try_new(arrow.clone(), cols).unwrap();
+            let reader = RecordBatchIterator::new(vec![Ok(batch)], arrow.clone());
+            ds = Some(
+                Dataset::write(
+                    reader,
+                    uri,
+                    Some(WriteParams {
+                        mode: if ds.is_none() {
+                            WriteMode::Create
+                        } else {
+                            WriteMode::Append
+                        },
+                        max_rows_per_file: 32,
+                        data_storage_version: Some(LanceFileVersion::V2_1),
+                        ..Default::default()
+                    }),
+                )
+                .await
+                .unwrap(),
+            );
+        }
+        ds.unwrap()
+    }
+
+    /// Per-column checksums plus the row-id checksum, so a mis-narrowed data-file
+    /// schema cannot pass by returning the right *number* of columns.
+    async fn projected_checksums(ds: &Dataset, names: &[&str]) -> BTreeMap<String, i128> {
+        use futures::TryStreamExt as _;
+        let mut scan = ds.scan();
+        scan.project(names).unwrap().with_row_id();
+        let mut sums: BTreeMap<String, i128> = BTreeMap::new();
+        let mut stream = scan.try_into_stream().await.unwrap();
+        while let Some(batch) = stream.try_next().await.unwrap() {
+            for (col, field) in batch.columns().iter().zip(batch.schema().fields()) {
+                let sum = if let Some(a) = col.as_any().downcast_ref::<Int64Array>() {
+                    a.iter().map(|v| v.unwrap_or(0) as i128).sum::<i128>()
+                } else if let Some(a) = col.as_any().downcast_ref::<UInt64Array>() {
+                    a.iter().map(|v| v.unwrap_or(0) as i128).sum::<i128>()
+                } else {
+                    panic!("unexpected column type {}", field.data_type());
+                };
+                *sums.entry(field.name().clone()).or_default() += sum;
+            }
+        }
+        sums
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn test_projected_read_checksum(#[values(58, 250)] width: usize) {
+        let dir = TempStrDir::default();
+        let ds = wide_dataset(dir.as_str(), width).await;
+        let names = [
+            format!("c{}", width / 2),
+            format!("c{}", width / 2 + 1),
+            "c0".to_string(),
+        ];
+        let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+        let sums = projected_checksums(&ds, &refs).await;
+
+        let rows = 128i128;
+        let row_total: i128 = (0..rows).sum();
+        let mut expected: BTreeMap<String, i128> = names
+            .iter()
+            .map(|n| {
+                let i = n[1..].parse::<i128>().unwrap();
+                (n.clone(), row_total * 1000 + rows * i)
+            })
+            .collect();
+        // row ids are (fragment << 32) | offset
+        expected.insert(
+            ROW_ID.to_string(),
+            ds.get_fragments()
+                .iter()
+                .flat_map(|f| {
+                    let id = f.id() as i128;
+                    (0..32i128).map(move |o| (id << 32) | o)
+                })
+                .sum(),
+        );
+        assert_eq!(sums, expected);
+    }
+
+    /// `FileFragment::open` is public: a caller can hand it a projection built from
+    /// an Arrow schema, whose field ids are fresh 0..n and mean nothing here.
+    /// The narrowing fast path must not fire on those ids -- it would filter
+    /// `data_file.fields` by them and drop the requested column entirely.
+    #[tokio::test]
+    async fn test_open_with_arrow_derived_projection() {
+        let dir = TempStrDir::default();
+        let ds = wide_dataset(dir.as_str(), 16).await;
+
+        let foreign = Schema::try_from(&ArrowSchema::new(vec![ArrowField::new(
+            "c9",
+            DataType::Int64,
+            true,
+        )]))
+        .unwrap();
+        assert_eq!(foreign.fields[0].id, 0);
+
+        let frag = ds.get_fragments().into_iter().next().unwrap();
+        let data_file = &frag.metadata().files[0];
+        assert_eq!(
+            data_file.schema_for_projection(ds.schema(), &foreign),
+            data_file.schema(ds.schema()),
+        );
+
+        let reader = frag
+            .open(&foreign, FragReadConfig::default())
+            .await
+            .unwrap();
+        let batch = reader.legacy_read_range_as_batch(0..32).await.unwrap();
+        assert_eq!(batch.num_columns(), 1);
+        assert_eq!(batch.schema().field(0).name(), "c9");
+        // pre-existing: `Field::do_intersection` keeps the projection's id, so the
+        // foreign id -- not the name -- picks the column. Unchanged by the narrowing.
+        assert_eq!(
+            batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap(),
+            &Int64Array::from_iter_values((0..32).map(|r| r * 1000)),
+        );
+    }
 
     async fn create_dataset(test_uri: &str, data_storage_version: LanceFileVersion) -> Dataset {
         let schema = Arc::new(ArrowSchema::new(vec![

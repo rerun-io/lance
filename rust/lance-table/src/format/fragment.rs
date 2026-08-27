@@ -179,6 +179,56 @@ impl DataFile {
         full_schema.project_by_ids(&self.fields, false)
     }
 
+    /// Like [`Self::schema`], but drops fields `projection` cannot match before
+    /// materialising them.
+    ///
+    /// Falls back to [`Self::schema`] unless every projected field is a top-level
+    /// leaf of `full_schema` under the same id and name.
+    pub fn schema_for_projection(&self, full_schema: &Schema, projection: &Schema) -> Schema {
+        match self.narrowed_field_ids(full_schema, projection) {
+            Some(ids) => full_schema.project_by_ids(&ids, false),
+            None => self.schema(full_schema),
+        }
+    }
+
+    /// `self.fields` restricted to what `projection` wants, or `None` when the
+    /// projection's ids are not this schema's (callers resolve fields by name).
+    fn narrowed_field_ids(&self, full_schema: &Schema, projection: &Schema) -> Option<Vec<i32>> {
+        let mut wanted: HashMap<i32, &str> = HashMap::with_capacity(projection.fields.len());
+        for field in projection.fields_pre_order() {
+            if !field.children.is_empty() {
+                return None;
+            }
+            wanted.insert(field.id, field.name.as_str());
+        }
+        // narrowing cannot pay for itself against a whole-schema projection
+        if wanted.len() >= full_schema.fields.len() {
+            return None;
+        }
+        let mut matched = 0;
+        for field in full_schema.fields.iter() {
+            if let Some(name) = wanted.get(&field.id) {
+                if field.name.as_str() != *name || !field.children.is_empty() {
+                    return None;
+                }
+                matched += 1;
+                if matched == wanted.len() {
+                    break;
+                }
+            }
+        }
+        if matched != wanted.len() {
+            return None;
+        }
+        Some(
+            self.fields
+                .iter()
+                .copied()
+                .filter(|id| wanted.contains_key(id))
+                .collect(),
+        )
+    }
+
     pub fn is_legacy_file(&self) -> bool {
         self.file_major_version == 0 && self.file_minor_version < 3
     }
@@ -733,6 +783,148 @@ mod tests {
     };
     use object_store::path::Path;
     use serde_json::{Value, json};
+
+    fn flat_schema(width: usize) -> Schema {
+        Schema::try_from(&ArrowSchema::new(
+            (0..width)
+                .map(|i| ArrowField::new(format!("c{i}"), DataType::Int32, true))
+                .collect::<Vec<_>>(),
+        ))
+        .unwrap()
+    }
+
+    /// The narrowed schema must intersect to exactly what the full one does.
+    #[test]
+    fn test_schema_for_projection_matches_baseline() {
+        let full = flat_schema(16);
+        let ids = full.field_ids();
+        let file = DataFile::new_legacy_from_fields("a.lance", ids.clone(), None);
+        for pick in [vec![ids[0]], vec![ids[7]], vec![ids[0], ids[3], ids[15]]] {
+            let projection = full.project_by_ids(&pick, false);
+            let narrowed = file.schema_for_projection(&full, &projection);
+            assert!(narrowed.fields.len() < full.fields.len());
+            assert_eq!(
+                projection.intersection_ignore_types(&narrowed).unwrap(),
+                projection
+                    .intersection_ignore_types(&file.schema(&full))
+                    .unwrap(),
+            );
+        }
+    }
+
+    /// Fields the dataset dropped are still excluded.
+    #[test]
+    fn test_schema_for_projection_ignores_stale_file_fields() {
+        let full = flat_schema(4);
+        let file = DataFile::new_legacy_from_fields("a.lance", vec![0, 1, 2, 3, 99], None);
+        let projection = full.project_by_ids(&[1], false);
+        let narrowed = file.schema_for_projection(&full, &projection);
+        assert_eq!(narrowed.fields.len(), 1);
+        assert_eq!(narrowed.fields[0].name, "c1");
+    }
+
+    /// An Arrow-derived projection carries fresh 0..n ids: the fast path must not fire.
+    #[test]
+    fn test_schema_for_projection_rejects_foreign_ids() {
+        let full = flat_schema(8);
+        let file = DataFile::new_legacy_from_fields("a.lance", full.field_ids(), None);
+        let foreign = Schema::try_from(&ArrowSchema::new(vec![ArrowField::new(
+            "c5",
+            DataType::Int32,
+            true,
+        )]))
+        .unwrap();
+        assert_eq!(foreign.fields[0].id, 0);
+        let narrowed = file.schema_for_projection(&full, &foreign);
+        // fell back: the whole data-file schema, so the name match still finds c5
+        assert_eq!(narrowed.fields.len(), full.fields.len());
+        let intersected = foreign.intersection_ignore_types(&narrowed).unwrap();
+        assert_eq!(intersected.fields.len(), 1);
+        assert_eq!(intersected.fields[0].name, "c5");
+    }
+
+    /// A struct in the projection means ids alone don't determine the result.
+    #[test]
+    fn test_schema_for_projection_falls_back_on_nesting() {
+        let arrow = ArrowSchema::new(vec![
+            ArrowField::new(
+                "s",
+                DataType::Struct(ArrowFields::from(vec![
+                    ArrowField::new("x", DataType::Int32, false),
+                    ArrowField::new("y", DataType::Int32, false),
+                ])),
+                true,
+            ),
+            ArrowField::new("b", DataType::Boolean, true),
+        ]);
+        let full = Schema::try_from(&arrow).unwrap();
+        // the struct's own id is in the file, its children are not
+        let file = DataFile::new_legacy_from_fields("a.lance", vec![0, 3], None);
+        let projection = full.project_by_ids(&[0, 2], false);
+        // narrowing to [0] would re-expand the struct to all its children
+        assert_eq!(
+            file.schema_for_projection(&full, &projection),
+            file.schema(&full)
+        );
+    }
+
+    /// Every data-file / projection combination over a mixed flat+nested schema
+    /// must intersect to exactly what the un-narrowed schema does, including
+    /// projections that have been round-tripped through Arrow and so carry
+    /// fresh 0..n field ids.
+    #[test]
+    fn test_schema_for_projection_exhaustive() {
+        let full = Schema::try_from(&ArrowSchema::new(vec![
+            ArrowField::new("a", DataType::Int32, true),
+            ArrowField::new("b", DataType::Int32, true),
+            ArrowField::new(
+                "s",
+                DataType::Struct(ArrowFields::from(vec![
+                    ArrowField::new("x", DataType::Int32, true),
+                    ArrowField::new("y", DataType::Int32, true),
+                ])),
+                true,
+            ),
+            ArrowField::new("c", DataType::Int32, true),
+        ]))
+        .unwrap();
+        let all: Vec<i32> = full.field_ids();
+        assert_eq!(all.len(), 6);
+        let subset = |mask: u32| -> Vec<i32> {
+            all.iter()
+                .enumerate()
+                .filter(|(i, _)| mask & (1 << i) != 0)
+                .map(|(_, id)| *id)
+                .collect()
+        };
+        for file_mask in 0..64u32 {
+            let file = DataFile::new_legacy_from_fields("a.lance", subset(file_mask), None);
+            let baseline = file.schema(&full);
+            for proj_mask in 0..64u32 {
+                let native = full.project_by_ids(&subset(proj_mask), false);
+                let arrow_derived = Schema::try_from(&ArrowSchema::from(&native)).unwrap();
+                for projection in [&native, &arrow_derived] {
+                    assert_eq!(
+                        projection
+                            .intersection_ignore_types(
+                                &file.schema_for_projection(&full, projection)
+                            )
+                            .unwrap(),
+                        projection.intersection_ignore_types(&baseline).unwrap(),
+                        "file_mask={file_mask} proj_mask={proj_mask}",
+                    );
+                }
+            }
+        }
+    }
+
+    /// A whole-schema projection has nothing to narrow.
+    #[test]
+    fn test_schema_for_projection_whole_schema() {
+        let full = flat_schema(4);
+        let file = DataFile::new_legacy_from_fields("a.lance", full.field_ids(), None);
+        assert_eq!(file.schema_for_projection(&full, &full), file.schema(&full));
+    }
 
     #[test]
     fn test_new_fragment() {

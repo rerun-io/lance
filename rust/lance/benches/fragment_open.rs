@@ -94,6 +94,8 @@ struct Case {
     data_file: DataFile,
     /// One-column projection carved out of `full`.
     projection: Schema,
+    /// The same column, but with an Arrow-derived (foreign) field id.
+    foreign_projection: Schema,
 }
 
 fn case(width: usize) -> Case {
@@ -109,10 +111,17 @@ fn case(width: usize) -> Case {
         None,
     );
     let projection = full.project_by_ids(&[ids[width / 2]], false);
+    let foreign_projection = Schema::try_from(&ArrowSchema::new(vec![ArrowField::new(
+        field_name(width / 2),
+        DataType::Utf8,
+        true,
+    )]))
+    .unwrap();
     Case {
         full,
         data_file,
         projection,
+        foreign_projection,
     }
 }
 
@@ -125,6 +134,31 @@ fn bench_schema_per_file(c: &mut Criterion) {
                 let data_file_schema = case.data_file.schema(&case.full);
                 black_box(
                     case.projection
+                        .intersection_ignore_types(&data_file_schema)
+                        .unwrap(),
+                )
+            })
+        });
+        group.bench_with_input(BenchmarkId::new("narrowed", width), &case, |b, case| {
+            b.iter(|| {
+                let data_file_schema = case
+                    .data_file
+                    .schema_for_projection(&case.full, &case.projection);
+                black_box(
+                    case.projection
+                        .intersection_ignore_types(&data_file_schema)
+                        .unwrap(),
+                )
+            })
+        });
+        // A projection whose ids are not `full`'s: must land on the fallback.
+        group.bench_with_input(BenchmarkId::new("foreign_ids", width), &case, |b, case| {
+            b.iter(|| {
+                let data_file_schema = case
+                    .data_file
+                    .schema_for_projection(&case.full, &case.foreign_projection);
+                black_box(
+                    case.foreign_projection
                         .intersection_ignore_types(&data_file_schema)
                         .unwrap(),
                 )
