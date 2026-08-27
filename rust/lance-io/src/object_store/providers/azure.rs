@@ -15,6 +15,7 @@ use opendal::{Operator, services::Azblob, services::Azdls};
 use object_store::{
     RetryConfig,
     azure::{AzureConfigKey, AzureCredential, MicrosoftAzureBuilder},
+    path::Path,
 };
 use url::Url;
 
@@ -148,6 +149,45 @@ impl AzureBlobStoreProvider {
                     })
                     .map(|b| b.finish())
             }
+            "https" => {
+                let host = base_path.host_str().ok_or_else(|| {
+                    Error::invalid_input(
+                        "https:// Azure URL must contain a host: \
+                         https://<account>.blob.core.windows.net/<container>/<path>",
+                    )
+                })?;
+                let mut segments = base_path.path_segments().ok_or_else(|| {
+                    Error::invalid_input(format!("Invalid Azure URL: {base_path}"))
+                })?;
+                let container = segments
+                    .next()
+                    .filter(|s| !s.is_empty())
+                    .ok_or_else(|| {
+                        Error::invalid_input(format!(
+                            "https:// Azure URL must include container name: {base_path}"
+                        ))
+                    })?
+                    .to_string();
+                config_map.insert("container".to_string(), container);
+                config_map.insert("endpoint".to_string(), format!("https://{}", host));
+                config_map
+                    .entry("account_name".to_string())
+                    .or_insert_with(|| host.split('.').next().unwrap_or(host).to_string());
+
+                let prefix: Vec<&str> = segments.filter(|s| !s.is_empty()).collect();
+                if !prefix.is_empty() {
+                    config_map.insert("root".to_string(), format!("/{}", prefix.join("/")));
+                }
+
+                Operator::from_iter::<Azblob>(config_map)
+                    .map_err(|e| {
+                        Error::invalid_input(format!(
+                            "Failed to create Azure Blob operator: {:?}",
+                            e
+                        ))
+                    })
+                    .map(|b| b.finish())
+            }
             _ => Err(Error::invalid_input(format!(
                 "Unsupported Azure scheme: {}",
                 base_path.scheme()
@@ -209,6 +249,24 @@ impl AzureBlobStoreProvider {
         storage_options: Option<&HashMap<String, String>>,
         env_options: &HashMap<String, String>,
     ) -> Result<String> {
+        if url.scheme() == "https" {
+            // 'https://account.blob.core.windows.net/container/path-part/file'
+            let host = url.host_str().ok_or_else(|| {
+                Error::invalid_input(format!("https:// Azure URL missing host: {url}"))
+            })?;
+            let account = host.split('.').next().unwrap_or_default().to_string();
+            let container = url
+                .path_segments()
+                .and_then(|mut s| s.next())
+                .filter(|s| !s.is_empty())
+                .ok_or_else(|| {
+                    Error::invalid_input(format!(
+                        "https:// Azure URL must include container name: {url}"
+                    ))
+                })?
+                .to_string();
+            return Ok(format!("{}${}@{}", url.scheme(), container, account));
+        }
         let authority = url.authority();
         let (container, account) = match authority.find("@") {
             Some(at_index) => {
@@ -245,9 +303,9 @@ impl AzureBlobStoreProvider {
 impl ObjectStoreProvider for AzureBlobStoreProvider {
     async fn new_store(&self, base_path: Url, params: &ObjectStoreParams) -> Result<ObjectStore> {
         let scheme = base_path.scheme().to_string();
-        if scheme != "az" && scheme != "abfss" {
+        if scheme != "az" && scheme != "abfss" && scheme != "https" {
             return Err(Error::invalid_input(format!(
-                "Unsupported Azure scheme '{}', expected 'az' or 'abfss'",
+                "Unsupported Azure scheme '{}', expected 'az', 'abfss', or 'https'",
                 scheme
             )));
         }
@@ -303,6 +361,20 @@ impl ObjectStoreProvider for AzureBlobStoreProvider {
         storage_options: Option<&HashMap<String, String>>,
     ) -> Result<String> {
         Self::calculate_object_store_prefix_with_env(url, storage_options, &ENV_OPTIONS.0)
+    }
+
+    /// Azure `https://` URLs encode the container name as the first path
+    /// segment. For those, the object path starts from the second segment.
+    /// For `az://` and `abfss://` URLs, the container/filesystem lives in
+    /// the URL authority, so the entire URL path is the object path.
+    fn extract_path(&self, url: &Url) -> Result<Path> {
+        if url.scheme() == "https" {
+            url.path_segments()
+                .map(|s| Path::from_iter(s.skip(1)))
+                .ok_or_else(|| Error::invalid_input(format!("Invalid Azure URL: {url}")))
+        } else {
+            Ok(Path::from(url.path()))
+        }
     }
 }
 
@@ -371,6 +443,30 @@ mod tests {
         let path = provider.extract_path(&url).unwrap();
         let expected_path = object_store::path::Path::from("path/to/file");
         assert_eq!(path, expected_path);
+    }
+
+    #[test]
+    fn test_azure_store_https_path() {
+        let provider = AzureBlobStoreProvider;
+
+        let url = Url::parse("https://account.blob.core.windows.net/bucket/path/to/file").unwrap();
+        let path = provider.extract_path(&url).unwrap();
+        let expected_path = object_store::path::Path::from("path/to/file");
+        assert_eq!(path, expected_path);
+    }
+
+    #[test]
+    fn test_calculate_object_store_prefix_https() {
+        let provider = AzureBlobStoreProvider;
+        assert_eq!(
+            "https$container@account",
+            provider
+                .calculate_object_store_prefix(
+                    &Url::parse("https://account.blob.core.windows.net/container/path").unwrap(),
+                    None,
+                )
+                .unwrap()
+        );
     }
 
     #[tokio::test]
