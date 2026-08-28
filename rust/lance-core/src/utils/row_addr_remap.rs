@@ -51,6 +51,7 @@ use crate::utils::address::RowAddress;
 use crate::{Error, Result};
 use roaring::{RoaringBitmap, RoaringTreemap};
 use std::collections::{HashMap, HashSet};
+use std::hash::{BuildHasherDefault, Hasher};
 use std::mem::size_of;
 
 /// A queryable row-address remapping with the exact semantics of
@@ -406,7 +407,7 @@ impl GroupRemap {
         }
         let total_new_rows = rewritten_rows_before;
 
-        let mut per_frag: HashMap<u32, RoaringBitmap> = rewritten_old_row_addrs
+        let mut per_frag: IntMap<u32, RoaringBitmap> = rewritten_old_row_addrs
             .bitmaps()
             .map(|(frag_id, bitmap)| (frag_id, bitmap.clone()))
             .collect();
@@ -490,17 +491,78 @@ impl DeepSizeOf for GroupRemap {
     }
 }
 
+/// Hasher for this module's integer-keyed maps.
+///
+/// `remap_row_id` probes `CompactRemapStep::frags` once per remap step per row
+/// address, so at hundreds of millions of rows the default SipHash is a large
+/// share of consolidation CPU. The keys are internal fragment ids, never
+/// attacker-supplied, so the hash-flooding resistance it buys is worth nothing here.
+///
+/// Only single-integer keys are hashed well: `write_u32`/`write_u64`/`write_usize`
+/// replace the state rather than mixing into it, so a composite key would collide on
+/// its last field alone. Correct either way — `Eq` still decides — but keep these maps
+/// keyed by one integer.
+#[derive(Clone, Copy)]
+struct IntHasher(u64);
+
+/// FNV-1a offset basis, so the byte fallback does not absorb leading zero bytes.
+const FNV_OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
+
+impl Default for IntHasher {
+    #[inline]
+    fn default() -> Self {
+        Self(FNV_OFFSET_BASIS)
+    }
+}
+
+impl Hasher for IntHasher {
+    /// Folds the high half down: multiplication only carries upward, so without this
+    /// the low bits — which hashbrown uses to pick the bucket — would ignore the high
+    /// bits of the key, and fragment ids strided by a power of two would all land in
+    /// one bucket.
+    #[inline]
+    fn finish(&self) -> u64 {
+        self.0 ^ (self.0 >> 32)
+    }
+
+    #[inline]
+    fn write(&mut self, bytes: &[u8]) {
+        // Fallback for key types this module does not use.
+        for &b in bytes {
+            self.0 = (self.0 ^ u64::from(b)).wrapping_mul(0x0000_0100_0000_01b3);
+        }
+    }
+
+    #[inline]
+    fn write_u32(&mut self, value: u32) {
+        self.0 = u64::from(value).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    }
+
+    #[inline]
+    fn write_u64(&mut self, value: u64) {
+        self.0 = value.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    }
+
+    #[inline]
+    fn write_usize(&mut self, value: usize) {
+        self.write_u64(value as u64);
+    }
+}
+
+/// `HashMap` over single-integer keys, hashed with [`IntHasher`].
+type IntMap<K, V> = HashMap<K, V, BuildHasherDefault<IntHasher>>;
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct CompactRemapStep {
     groups: Vec<GroupRemap>,
     /// Old fragment id -> its bitmap/rank layout and rewrite group. Size is
     /// O(#fragments), not rows.
-    frags: HashMap<u32, OldFragmentRemap>,
+    frags: IntMap<u32, OldFragmentRemap>,
 }
 
 impl CompactRemapStep {
     fn new(groups: impl IntoIterator<Item = GroupInput>) -> Result<Self> {
-        let mut frags = HashMap::new();
+        let mut frags = IntMap::default();
         let mut group_remaps = Vec::new();
         for input in groups {
             let gi = group_remaps.len();
@@ -521,7 +583,7 @@ impl CompactRemapStep {
     }
 
     fn new_with_layout(groups: impl IntoIterator<Item = GroupInputWithLayout>) -> Result<Self> {
-        let mut frags = HashMap::new();
+        let mut frags = IntMap::default();
         let mut group_remaps = Vec::new();
         for input in groups {
             let gi = group_remaps.len();
