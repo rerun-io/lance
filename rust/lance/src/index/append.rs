@@ -1338,10 +1338,10 @@ mod tests {
             base_id: None,
             files: None,
         };
-        let frag_reuse_index = FragReuseIndex {
-            uuid: Uuid::new_v4(),
-            row_addr_maps: vec![],
-            details: FragReuseIndexDetails {
+        let frag_reuse_index = FragReuseIndex::new_from_remaps(
+            Uuid::new_v4(),
+            vec![],
+            FragReuseIndexDetails {
                 versions: vec![FragReuseVersion {
                     dataset_version: 5,
                     groups: vec![FragReuseGroup {
@@ -1359,7 +1359,7 @@ mod tests {
                     }],
                 }],
             },
-        };
+        );
 
         assert!(fragment_reuse_affects_segments(
             &frag_reuse_index,

@@ -100,9 +100,18 @@ impl RowAddrRemap {
         }
     }
 
+    /// Every fragment whose addresses this remap can answer non-`None` for.
+    ///
+    /// Must never under-report: callers skip a remap entirely for fragments absent from
+    /// this set, so a missing fragment silently drops that fragment's remaps. Over-reporting
+    /// is fine -- it only costs a `get` that answers `None`. Any new [`RowAddrRemap`] variant
+    /// must uphold that direction.
     pub fn affected_fragments(&self) -> RoaringBitmap {
         match self {
+            // Exact: `get` returns `None` precisely when the fragment is absent here.
             Self::Compact(c) => RoaringBitmap::from_iter(c.frag_to_group.keys().copied()),
+            // Superset: `get` answers non-`None` only for listed addresses, whose fragments
+            // are all covered.
             Self::Direct(m) => RoaringBitmap::from_iter(m.keys().map(|addr| (addr >> 32) as u32)),
         }
     }
