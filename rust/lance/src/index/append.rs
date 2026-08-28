@@ -4213,6 +4213,76 @@ mod tests {
         }
     }
 
+    /// A production-width consolidation: 26 Bitmap delta segments merged into one
+    /// by a single `optimize_indices` call, with no unindexed data on top.
+    #[tokio::test]
+    async fn test_optimize_bitmap_wide_consolidation() {
+        let test_dir = TempStrDir::default();
+        let test_uri = test_dir.as_str();
+        let schema = id_cat_schema();
+
+        let num_segments = 26;
+        let rows_per_fragment = 12;
+        let total_rows = num_segments * rows_per_fragment;
+        let batches = (0..num_segments)
+            .map(|i| {
+                Ok(id_cat_batch(
+                    &schema,
+                    i * rows_per_fragment..(i + 1) * rows_per_fragment,
+                ))
+            })
+            .collect::<Vec<_>>();
+        let reader = RecordBatchIterator::new(batches, schema.clone());
+        let mut dataset = Dataset::write(
+            reader,
+            test_uri,
+            Some(WriteParams {
+                max_rows_per_file: rows_per_fragment as usize,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(dataset.get_fragments().len(), num_segments as usize);
+
+        commit_bitmap_segment_per_fragment(&mut dataset, "cat_idx").await;
+        assert_eq!(
+            dataset.load_indices_by_name("cat_idx").await.unwrap().len(),
+            num_segments as usize
+        );
+
+        dataset
+            .optimize_indices(&OptimizeOptions::merge(num_segments as usize))
+            .await
+            .unwrap();
+
+        let dataset = DatasetBuilder::from_uri(test_uri).load().await.unwrap();
+        let segments = dataset.load_indices_by_name("cat_idx").await.unwrap();
+        assert_eq!(
+            segments.len(),
+            1,
+            "a {num_segments}-way merge must consolidate every bitmap segment, got {segments:?}"
+        );
+        let expected_coverage = dataset
+            .get_fragments()
+            .iter()
+            .map(|frag| frag.id() as u32)
+            .collect::<RoaringBitmap>();
+        assert_eq!(
+            segments[0].fragment_bitmap.as_ref(),
+            Some(&expected_coverage)
+        );
+
+        let per_cat = (total_rows / 3) as usize;
+        for cat in ["A", "B", "C"] {
+            assert_eq!(
+                count_cat(&dataset, cat).await,
+                per_cat,
+                "wrong row count for cat = {cat} after wide bitmap consolidation"
+            );
+        }
+    }
+
     /// Deferred-remap compaction leaves the bitmap segments pointing at retired
     /// fragment ids; a K-way segment merge must remap them through the
     /// FragReuseIndex instead of dropping or mis-attributing the rows.

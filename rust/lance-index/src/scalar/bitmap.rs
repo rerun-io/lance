@@ -2011,7 +2011,7 @@ mod tests {
     use super::*;
     use crate::metrics::{LocalMetricsCollector, NoOpMetricsCollector};
     use crate::scalar::lance_format::LanceIndexStore;
-    use arrow_array::{RecordBatch, StringArray, UInt64Array, record_batch};
+    use arrow_array::{BooleanArray, RecordBatch, StringArray, UInt64Array, record_batch};
     use arrow_schema::{DataType, Field, Schema};
 
     /// Sort a (value, row_id) RecordBatch by the value column so that unit tests
@@ -2068,15 +2068,38 @@ mod tests {
         ))
     }
 
-    /// Train a standalone bitmap segment over `rows`, keeping its temp dir alive.
-    async fn train_bitmap_segment(rows: &[(Option<&str>, u64)]) -> (TempObjDir, Arc<BitmapIndex>) {
+    fn bool_value_row_id_stream(rows: &[(Option<bool>, u64)]) -> SendableRecordBatchStream {
+        let schema = value_row_id_schema(DataType::Boolean);
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(BooleanArray::from(
+                    rows.iter().map(|(value, _)| *value).collect::<Vec<_>>(),
+                )),
+                Arc::new(UInt64Array::from(
+                    rows.iter().map(|(_, addr)| *addr).collect::<Vec<_>>(),
+                )),
+            ],
+        )
+        .unwrap();
+        let batch = sort_batch_by_value(&batch);
+        Box::pin(RecordBatchStreamAdapter::new(
+            schema,
+            stream::once(async move { Ok(batch) }),
+        ))
+    }
+
+    /// Train a standalone bitmap segment over `data`, keeping its temp dir alive.
+    async fn train_bitmap_segment_from(
+        data: SendableRecordBatchStream,
+    ) -> (TempObjDir, Arc<BitmapIndex>) {
         let tmpdir = TempObjDir::default();
         let store = Arc::new(LanceIndexStore::new(
             Arc::new(ObjectStore::local()),
             tmpdir.clone(),
             Arc::new(LanceCache::no_cache()),
         ));
-        BitmapIndexPlugin::train_bitmap_index(value_row_id_stream(rows), store.as_ref())
+        BitmapIndexPlugin::train_bitmap_index(data, store.as_ref())
             .await
             .unwrap();
         let index = BitmapIndex::load(store, None, &LanceCache::no_cache())
@@ -2085,11 +2108,11 @@ mod tests {
         (tmpdir, index)
     }
 
-    async fn search_addrs(index: &BitmapIndex, value: Option<&str>) -> Vec<u64> {
-        let query = match value {
-            Some(value) => SargableQuery::Equals(ScalarValue::Utf8(Some(value.to_string()))),
-            None => SargableQuery::IsNull(),
-        };
+    async fn train_bitmap_segment(rows: &[(Option<&str>, u64)]) -> (TempObjDir, Arc<BitmapIndex>) {
+        train_bitmap_segment_from(value_row_id_stream(rows)).await
+    }
+
+    async fn search_addrs_for(index: &BitmapIndex, query: SargableQuery) -> Vec<u64> {
         let SearchResult::Exact(selection) =
             index.search(&query, &NoOpMetricsCollector).await.unwrap()
         else {
@@ -2103,6 +2126,22 @@ mod tests {
             .collect::<Vec<_>>();
         addrs.sort_unstable();
         addrs
+    }
+
+    async fn search_addrs(index: &BitmapIndex, value: Option<&str>) -> Vec<u64> {
+        let query = match value {
+            Some(value) => SargableQuery::Equals(ScalarValue::Utf8(Some(value.to_string()))),
+            None => SargableQuery::IsNull(),
+        };
+        search_addrs_for(index, query).await
+    }
+
+    async fn search_bool_addrs(index: &BitmapIndex, value: Option<bool>) -> Vec<u64> {
+        let query = match value {
+            Some(value) => SargableQuery::Equals(ScalarValue::Boolean(Some(value))),
+            None => SargableQuery::IsNull(),
+        };
+        search_addrs_for(index, query).await
     }
 
     /// A 4-way segment merge: three contributing segments plus one whose filter
@@ -2235,6 +2274,117 @@ mod tests {
         );
         assert_eq!(search_addrs(&merged, Some("b")).await, vec![addr(1, 0)]);
         assert_eq!(search_addrs(&merged, None).await, vec![addr(2, 1)]);
+    }
+
+    /// A K-way merge where the NEW data stream also contains nulls: the null run
+    /// (sorted first) must pull in every old segment's null_map exactly once,
+    /// respecting per-segment filters, and not emit a second null entry.
+    #[tokio::test]
+    async fn test_bitmap_merge_k_segments_with_new_nulls() {
+        let (_dir0, seg0) = train_bitmap_segment(&[
+            (Some("red"), addr(0, 0)),
+            (None, addr(0, 1)),
+            (None, addr(0, 2)),
+        ])
+        .await;
+        let (_dir1, seg1) =
+            train_bitmap_segment(&[(Some("blue"), addr(1, 0)), (None, addr(1, 1))]).await;
+        let (_dir2, seg2) = train_bitmap_segment(&[(Some("green"), addr(2, 0))]).await;
+
+        // seg1's null row (1,1) is deleted: the allow-list omits it.
+        let mut still_valid = RowAddrTreeMap::new();
+        still_valid.insert(addr(1, 0));
+        let filters = vec![
+            None,
+            Some(crate::scalar::OldIndexDataFilter::RowIds(still_valid)),
+            None,
+        ];
+
+        let new_rows = [
+            (None, addr(3, 0)),
+            (Some("red"), addr(3, 1)),
+            (None, addr(3, 2)),
+        ];
+        let dest_dir = TempObjDir::default();
+        let dest_store = Arc::new(LanceIndexStore::new(
+            Arc::new(ObjectStore::local()),
+            dest_dir.clone(),
+            Arc::new(LanceCache::no_cache()),
+        ));
+        BitmapIndex::merge_segments(
+            &[seg0, seg1, seg2],
+            value_row_id_stream(&new_rows),
+            dest_store.as_ref(),
+            &filters,
+        )
+        .await
+        .unwrap();
+        let merged = BitmapIndex::load(dest_store, None, &LanceCache::no_cache())
+            .await
+            .unwrap();
+
+        assert_eq!(
+            search_addrs(&merged, None).await,
+            vec![addr(0, 1), addr(0, 2), addr(3, 0), addr(3, 2)]
+        );
+        assert_eq!(
+            search_addrs(&merged, Some("red")).await,
+            vec![addr(0, 0), addr(3, 1)]
+        );
+        assert_eq!(search_addrs(&merged, Some("blue")).await, vec![addr(1, 0)]);
+        assert_eq!(search_addrs(&merged, Some("green")).await, vec![addr(2, 0)]);
+        assert_eq!(merged.index_map.len(), 3, "nulls must not enter index_map");
+    }
+
+    /// A K-way merge over a Boolean key column, the motivating production shape.
+    #[tokio::test]
+    async fn test_bitmap_merge_k_segments_boolean_keys() {
+        let (_dir0, seg0) = train_bitmap_segment_from(bool_value_row_id_stream(&[
+            (Some(true), addr(0, 0)),
+            (Some(false), addr(0, 1)),
+            (None, addr(0, 2)),
+        ]))
+        .await;
+        let (_dir1, seg1) = train_bitmap_segment_from(bool_value_row_id_stream(&[
+            (Some(false), addr(1, 0)),
+            (Some(true), addr(1, 1)),
+        ]))
+        .await;
+        let (_dir2, seg2) =
+            train_bitmap_segment_from(bool_value_row_id_stream(&[(Some(true), addr(2, 0))])).await;
+
+        let new_rows = [(Some(false), addr(3, 0)), (None, addr(3, 1))];
+        let dest_dir = TempObjDir::default();
+        let dest_store = Arc::new(LanceIndexStore::new(
+            Arc::new(ObjectStore::local()),
+            dest_dir.clone(),
+            Arc::new(LanceCache::no_cache()),
+        ));
+        BitmapIndex::merge_segments(
+            &[seg0, seg1, seg2],
+            bool_value_row_id_stream(&new_rows),
+            dest_store.as_ref(),
+            &[None, None, None],
+        )
+        .await
+        .unwrap();
+        let merged = BitmapIndex::load(dest_store, None, &LanceCache::no_cache())
+            .await
+            .unwrap();
+
+        assert_eq!(
+            search_bool_addrs(&merged, Some(true)).await,
+            vec![addr(0, 0), addr(1, 1), addr(2, 0)]
+        );
+        assert_eq!(
+            search_bool_addrs(&merged, Some(false)).await,
+            vec![addr(0, 1), addr(1, 0), addr(3, 0)]
+        );
+        assert_eq!(
+            search_bool_addrs(&merged, None).await,
+            vec![addr(0, 2), addr(3, 1)]
+        );
+        assert_eq!(merged.value_type, DataType::Boolean);
     }
 
     fn assert_state_roundtrips(state: &BitmapIndexState) {
