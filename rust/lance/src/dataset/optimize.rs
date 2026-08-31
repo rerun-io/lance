@@ -3642,11 +3642,16 @@ mod tests {
     /// The reason the compact form exists, measured rather than argued: open the same
     /// dataset each way and compare what the reuse index costs the cache.
     ///
-    /// `Dataset::cache_size_bytes` is a public API over the same `DeepSizeOf` estimate the
-    /// byte-bounded cache charges an entry at admission, so this measures what the cache
-    /// believes rather than resident set size. The gap it reports is wide enough that the
-    /// distinction does not matter here: roughly thirty times, on a dataset small enough to
-    /// run in a test.
+    /// Measured on the dataset's *index* cache. `LanceCache::size_bytes` reports the same
+    /// `DeepSizeOf` estimate the byte-bounded cache charges an entry at admission, so this
+    /// measures what the cache believes rather than resident set size. The gap it reports is
+    /// wide enough that the distinction does not matter here: roughly thirty times, on a
+    /// dataset small enough to run in a test.
+    ///
+    /// The reading is backend-wide rather than scoped to this dataset's namespace -- no
+    /// namespace-scoped accounting exists -- so it is only meaningful because each iteration
+    /// opens its own `Session`. Do not hoist the opens out of the loop into a shared session:
+    /// that would silently measure both forms at once.
     #[tokio::test]
     async fn test_compact_form_costs_the_cache_far_less() {
         use crate::dataset::builder::DatasetBuilder;
@@ -3696,7 +3701,7 @@ mod tests {
                 .load()
                 .await
                 .unwrap();
-            let before = reopened.cache_size_bytes();
+            let before = reopened.index_cache.size_bytes().await;
             // Running a query is what pulls the index, and with it the reuse index, into
             // the cache; measuring before that would compare two empty caches.
             answers.push(
@@ -3705,7 +3710,7 @@ mod tests {
                     .await
                     .unwrap(),
             );
-            growth.push(reopened.cache_size_bytes() - before);
+            growth.push(reopened.index_cache.size_bytes().await - before);
         }
         let (direct, compact) = (growth[0], growth[1]);
 
