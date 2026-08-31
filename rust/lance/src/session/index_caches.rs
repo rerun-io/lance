@@ -47,8 +47,28 @@ impl GlobalIndexCache {
     ///
     /// If `Direct` is eventually removed there is only one form left, and this collapses back
     /// into [`Self::for_dataset`].
+    ///
+    /// The form is added as its own hierarchy segment rather than interpolated into the URI's:
+    /// [`LanceCache::with_key_prefix`] frames each call, so a dataset whose URI happens to end
+    /// in the name of a form cannot collide with the same dataset under that form.
     pub fn for_dataset_with_remap_mode(&self, uri: &str, mode: IndexRemapMode) -> DSIndexCache {
-        DSIndexCache(self.0.with_key_prefix(&format!("{uri}/{mode:?}")))
+        DSIndexCache(
+            self.0
+                .with_key_prefix(uri)
+                .with_key_prefix(remap_mode_segment(mode)),
+        )
+    }
+}
+
+/// The cache namespace segment naming a fragment-reuse remap form.
+///
+/// Matched explicitly rather than taken from `Debug`: a new [`IndexRemapMode`] variant should
+/// fail to compile here rather than silently mint a fresh cache namespace, and a cache
+/// namespace should not depend on a `Debug` impl that anyone is free to reword.
+pub(crate) fn remap_mode_segment(mode: IndexRemapMode) -> &'static str {
+    match mode {
+        IndexRemapMode::Compact => "compact",
+        IndexRemapMode::Direct => "direct",
     }
 }
 
@@ -230,5 +250,42 @@ mod tests {
         };
 
         assert_ne!(first.key(), second.key());
+    }
+
+    /// The remap form is its own hierarchy segment, so it cannot be confused with a URI
+    /// segment that happens to spell a form.
+    ///
+    /// Interpolating `{uri}/{mode}` into one segment makes these two handles identical:
+    /// the unpartitioned handle for a dataset stored under `.../direct`, and the
+    /// partitioned handle for the dataset one level up read in `Direct`. Both would frame
+    /// the single string `memory://ds/direct`. Framing them separately keeps them apart.
+    ///
+    /// Asserted behaviourally, by whether an entry written to one is visible through the
+    /// other: there is no namespace-scoped key enumeration to inspect instead.
+    #[tokio::test]
+    async fn remap_mode_prefix_cannot_collide_with_a_uri_segment() {
+        let global = GlobalIndexCache(LanceCache::with_capacity(64 * 1024 * 1024));
+        let uuid = Uuid::new_v4();
+        let key = FragReuseIndexKey { uuid: &uuid };
+
+        let uri_named_like_a_form = global.for_dataset("memory://ds/direct");
+        let partitioned = global.for_dataset_with_remap_mode("memory://ds", IndexRemapMode::Direct);
+
+        uri_named_like_a_form
+            .insert_with_key(
+                &key,
+                Arc::new(FragReuseIndex::new(
+                    uuid,
+                    vec![],
+                    lance_index::frag_reuse::FragReuseIndexDetails { versions: vec![] },
+                )),
+            )
+            .await;
+
+        assert!(
+            partitioned.get_with_key(&key).await.is_none(),
+            "the partitioned handle read an entry written by a dataset whose URI ends in a \
+             form name, so the form is not its own cache segment"
+        );
     }
 }
