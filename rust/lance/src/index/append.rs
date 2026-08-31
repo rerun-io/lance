@@ -4285,7 +4285,7 @@ mod tests {
 
     /// Deferred-remap compaction leaves the bitmap segments pointing at retired
     /// fragment ids; a K-way segment merge must remap them through the
-    /// FragReuseIndex instead of dropping or mis-attributing the rows.
+    /// FragReuseIndex instead of dropping or misattributing the rows.
     #[tokio::test]
     async fn test_optimize_bitmap_merge_remaps_deferred_compaction() {
         let test_dir = TempStrDir::default();
