@@ -66,6 +66,43 @@ async fn init_writer_if_necessary(
     Ok(false)
 }
 
+/// The `(fields, column_indices)` a data file written for `schema` records.
+///
+/// v2_0 gives every field a column in pre-order; v2_1+ gives columns only to leaves, blobs and
+/// packed structs.
+pub(super) fn data_file_columns(
+    schema: &Schema,
+    version: LanceFileVersion,
+) -> (Vec<i32>, Vec<i32>) {
+    fn append(
+        fields: &[lance_core::datatypes::Field],
+        is_structural: bool,
+        field_ids: &mut Vec<i32>,
+        column_indices: &mut Vec<i32>,
+    ) {
+        for field in fields {
+            let is_physical =
+                field.children.is_empty() || field.is_blob() || field.is_packed_struct();
+            if is_physical || !is_structural {
+                field_ids.push(field.id);
+                column_indices.push(column_indices.len() as i32);
+            }
+            if !is_physical {
+                append(&field.children, is_structural, field_ids, column_indices);
+            }
+        }
+    }
+    let mut field_ids = Vec::new();
+    let mut column_indices = Vec::new();
+    append(
+        &schema.fields,
+        version >= LanceFileVersion::V2_1,
+        &mut field_ids,
+        &mut column_indices,
+    );
+    (field_ids, column_indices)
+}
+
 /// v2_0 vs v2_1+ field-to-column index mapping
 ///  - v2_1+ stores only leaf columns; non-leaf fields get `-1` in the mapping
 ///  - v2_0 includes structural headers as columns; non-leaf fields map to a concrete index
