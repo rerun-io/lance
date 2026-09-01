@@ -200,7 +200,11 @@ impl FragReuseIndexDetails {
 /// An index that stores row ID maps.
 /// A row ID map describes the mapping from old row address to new address after compactions.
 /// Each version contains the mapping for one round of compaction.
-#[derive(Debug, Clone)]
+///
+/// Equality compares the stored remaps as represented, not the addresses they resolve to:
+/// see [`RowAddrRemap`]. Two indices built from the same payload in different forms are
+/// unequal.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FragReuseIndex {
     pub uuid: Uuid,
     /// One remap per reuse version, oldest first. Order is load-bearing: each version is

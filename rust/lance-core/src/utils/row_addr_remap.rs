@@ -55,7 +55,12 @@ use std::collections::HashMap;
 /// * `None` — the address is not affected by this remap (keep it unchanged)
 /// * `Some(None)` — the row was deleted
 /// * `Some(Some(addr))` — the row moved to `addr`
-#[derive(Clone)]
+///
+/// Equality is *representational*, not behavioural: a `Compact` and a `Direct` remap that
+/// resolve every address identically are still unequal, because they are different variants.
+/// Use it to compare two remaps of the same provenance, not to decide whether two remaps
+/// agree.
+#[derive(Clone, PartialEq, Eq)]
 pub enum RowAddrRemap {
     /// Compact, `O(#fragments)` remap built from per-group rewritten-row
     /// bitmaps and new-fragment layouts.
@@ -129,7 +134,7 @@ pub struct GroupInput {
     pub new_frags: Vec<(u32, u32)>,
 }
 
-#[derive(Clone, crate::deepsize::DeepSizeOf)]
+#[derive(Clone, PartialEq, Eq, crate::deepsize::DeepSizeOf)]
 struct GroupRemap {
     /// Old fragment id -> (rewritten old row offsets in that fragment,
     /// rewritten row count before this fragment in the group).
@@ -243,7 +248,7 @@ impl GroupRemap {
 }
 
 /// Compact remap backed by per-group rewritten row bitmaps + new-fragment layouts.
-#[derive(Clone, crate::deepsize::DeepSizeOf)]
+#[derive(Clone, PartialEq, Eq, crate::deepsize::DeepSizeOf)]
 pub struct CompactRowAddrRemap {
     groups: Vec<GroupRemap>,
     /// Old fragment id -> index into `groups`. Size is O(#fragments), not rows.
@@ -459,6 +464,42 @@ mod tests {
             large > small,
             "size must grow with bitmap contents, got {large} vs {small}"
         );
+    }
+
+    /// Equality is representational, which is what the type documents and all it can offer:
+    /// the compact form cannot enumerate its keys, so there is nothing to compare a
+    /// materialized map against address by address.
+    #[test]
+    fn test_equality_compares_representation_not_resolved_addresses() {
+        let rows = 4u32;
+        let compact = RowAddrRemap::compact([GroupInput {
+            rewritten_old_row_addrs: RoaringTreemap::from_iter(
+                (0..rows).map(|offset| addr(0, offset)),
+            ),
+            old_frag_ids: vec![0],
+            new_frags: vec![(10, rows)],
+        }])
+        .unwrap();
+
+        // The same mapping written out by hand: every row of fragment 0 moved to fragment 10
+        // at the same offset. Both resolve these addresses identically...
+        let direct = RowAddrRemap::direct(
+            (0..rows)
+                .map(|offset| (addr(0, offset), Some(addr(10, offset))))
+                .collect(),
+        );
+        for offset in 0..rows {
+            assert_eq!(
+                compact.get(addr(0, offset)),
+                direct.get(addr(0, offset)),
+                "the two forms should agree on a rewritten address"
+            );
+        }
+
+        // ...but they are still unequal, because equality is over the representation.
+        assert_ne!(compact, direct);
+        assert_eq!(compact.clone(), compact);
+        assert_eq!(direct.clone(), direct);
     }
 
     #[test]
