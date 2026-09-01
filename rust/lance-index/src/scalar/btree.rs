@@ -2018,6 +2018,9 @@ const MERGE_BYTES_PER_IO_THREAD: u64 = 32 * 1024 * 1024;
 /// `max(one scan's budget, num_sources * 32 MiB)` rather than a constant. Past
 /// `io_parallelism` sources the floor wins and the total starts growing again; that is the
 /// point at which a caller wanting a real constant would have to merge in passes.
+///
+/// Measured at `io_parallelism = 8`: 288 MiB at N=8, 864 MiB at N=24, i.e. `N * 36 MiB`
+/// once the floor binds.
 fn merge_io_buffer_size(io_parallelism: usize, num_sources: u64) -> u64 {
     let total = MERGE_BYTES_PER_IO_THREAD * io_parallelism.max(1) as u64;
     (total / num_sources.max(1)).max(MERGE_BYTES_PER_IO_THREAD)
@@ -2150,6 +2153,8 @@ impl Index for BTreeIndex {
         .map_err(|err| err.into())
     }
 
+    /// Whole-file plan, and `LogicalScalarIndex` runs one per segment concurrently against
+    /// unrescoped stores, so N segments hold N full budgets.
     async fn calculate_included_frags(&self) -> Result<RoaringBitmap> {
         let mut frag_ids = RoaringBitmap::default();
 
@@ -2335,6 +2340,7 @@ impl ScalarIndex for BTreeIndex {
             let train_schema_clone = train_schema.clone();
             let train_schema = train_schema.clone();
 
+            // Unrescoped, but `dataset/index.rs` drives remap serially, so one budget at a time.
             let remapped_stream = stream_index_file(
                 sub_index_reader,
                 self.batch_size,
@@ -3465,6 +3471,7 @@ impl ScalarIndexPlugin for BTreeIndexPlugin {
 #[cfg(test)]
 mod tests {
     use lance_core::utils::row_addr_remap::RowAddrRemap;
+    use rstest::rstest;
     use std::pin::Pin;
     use std::sync::atomic::Ordering;
     use std::{collections::HashMap, sync::Arc};

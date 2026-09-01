@@ -16,7 +16,7 @@ use lance_encoding::version::LanceFileVersion;
 use lance_file::reader::{FileReader as CurrentFileReader, FileReaderOptions, ReaderProjection};
 use lance_file::versions::v1::reader::FileReader as V1FileReader;
 use lance_file::writer as current_writer;
-use lance_io::scheduler::{ScanScheduler, SchedulerConfig};
+use lance_io::scheduler::{ScanScheduler, SchedulerConfig, SchedulerPurpose};
 use lance_io::utils::CachedFileSize;
 use lance_io::{ReadBatchParams, object_store::ObjectStore};
 use lance_table::format::SelfDescribingFileReader;
@@ -86,7 +86,7 @@ impl LanceIndexStore {
         // `IndexStore::with_io_buffer_size`.
         let scheduler = ScanScheduler::new(
             object_store.clone(),
-            SchedulerConfig::max_bandwidth(&object_store),
+            SchedulerConfig::max_bandwidth(&object_store).with_purpose(SchedulerPurpose::Index),
         );
         Self {
             object_store,
@@ -440,8 +440,10 @@ impl IndexStore for LanceIndexStore {
         // through it stay cached; only the scheduler, and therefore the prefetch budget,
         // is private to the returned store.
         let mut scoped = self.clone();
-        scoped.scheduler =
-            ScanScheduler::new(self.object_store.clone(), SchedulerConfig::new(bytes));
+        scoped.scheduler = ScanScheduler::new(
+            self.object_store.clone(),
+            SchedulerConfig::new(bytes).with_purpose(SchedulerPurpose::Index),
+        );
         Arc::new(scoped)
     }
 
