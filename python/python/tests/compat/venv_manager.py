@@ -47,8 +47,22 @@ NAMESPACE_0_6_DEPENDENCY = "lance-namespace<0.7"
 NAMESPACE_0_7_DEPENDENCY = "lance-namespace>=0.7.2,<0.8"
 NAMESPACE_0_8_DEPENDENCY = "lance-namespace>=0.8.0,<0.9"
 
+# From this version on, the wheel declares its own `lance-namespace` range, so
+# pinning one here can only contradict it. 8.0.0 declares `>=0.8.5,<0.9`;
+# 12.0.0b11 declares `>=0.11.1,<0.12`.
+FIRST_SELF_DESCRIBING_VERSION = Version("8.0.0b0")
 
-def _lance_namespace_dependency(pylance_version: str) -> str:
+
+def _lance_namespace_dependency(pylance_version: str) -> Optional[str]:
+    """The `lance-namespace` pin an old pylance wheel needs, or `None` if it
+    declares its own.
+
+    Only the old wheels need this: they import symbols that later
+    `lance-namespace` releases removed, and under-declare the range that would
+    have excluded them.
+    """
+    if Version(pylance_version) >= FIRST_SELF_DESCRIBING_VERSION:
+        return None
     if Version(pylance_version) >= Version("7.2.0b5"):
         return NAMESPACE_0_8_DEPENDENCY
     if Version(pylance_version) >= Version("6.0.0b0"):
@@ -241,12 +255,12 @@ class VenvExecutor:
                 "--extra-index-url",
                 "https://pypi.fury.io/lancedb/",
                 f"pylance=={self.version}",
+                "pytest",
                 # Older Lance wheels (e.g. 2.0.1, 4.0.0b1) import
                 # CreateEmptyTableRequest from lance_namespace, which was
-                # removed in lance-namespace 0.7.0. Pin to <0.7 so old wheels
-                # resolve a compatible transitive dep.
-                _lance_namespace_dependency(self.version),
-                "pytest",
+                # removed in lance-namespace 0.7.0. Pin so old wheels resolve a
+                # compatible transitive dep; newer wheels declare their own.
+                *filter(None, [_lance_namespace_dependency(self.version)]),
             ],
             check=True,
             capture_output=True,
