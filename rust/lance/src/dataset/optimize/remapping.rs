@@ -7,7 +7,7 @@
 use crate::Result;
 use crate::dataset::transaction::{Operation, Transaction};
 use crate::index::DatasetIndexExt;
-use crate::index::frag_reuse::{load_frag_reuse_index_details, open_frag_reuse_index};
+use crate::index::frag_reuse::{load_frag_reuse_index_details, open_frag_reuse_index_with_mode};
 use crate::{Dataset, index};
 use async_trait::async_trait;
 use lance_core::Error;
@@ -98,9 +98,17 @@ struct MissingAddrs<'a, I: Iterator<Item = u64>> {
 }
 
 impl<'a, I: Iterator<Item = u64>> MissingAddrs<'a, I> {
-    /// row_addrs must be sorted in the same order in which the rows would be
-    /// found by scanning fragments in the order they are presented in.
-    /// fragments is not guaranteed to be sorted by id.
+    /// `row_addrs` must be sorted in the same order in which the rows would be found by
+    /// scanning fragments in the order they are presented in.
+    ///
+    /// This type does not require `fragments` to be sorted by id, and tolerating an
+    /// unsorted list is deliberate. Note though that a manifest's fragment list has been
+    /// stored in id order since #2075, so callers passing fragments straight from a
+    /// manifest are already handing over a sorted list. Do not read the tolerance here as
+    /// evidence that unsorted input arises in practice: for `row_addrs` in ascending
+    /// address order -- which is how a serialized `RoaringTreemap` iterates -- an unsorted
+    /// `fragments` makes this type report rows of the out-of-order fragment as missing,
+    /// overwriting their real mappings.
     fn new(row_addrs: I, fragments: &'a Vec<FragDigest>) -> Self {
         assert!(!fragments.is_empty());
         let first_frag = &fragments[0];
@@ -214,12 +222,15 @@ async fn remap_index(dataset: &mut Dataset, index_id: &Uuid) -> Result<()> {
     let frag_reuse_details = load_frag_reuse_index_details(dataset, frag_reuse_index_meta)
         .await
         .unwrap();
-    let frag_reuse_index =
-        open_frag_reuse_index(frag_reuse_index_meta.uuid, frag_reuse_details.as_ref())
-            .await
-            .unwrap();
+    let frag_reuse_index = open_frag_reuse_index_with_mode(
+        frag_reuse_index_meta.uuid,
+        frag_reuse_details.as_ref(),
+        dataset.frag_reuse_remap_mode,
+    )
+    .await
+    .unwrap();
 
-    if frag_reuse_index.row_id_maps.is_empty() {
+    if frag_reuse_index.row_addr_maps.is_empty() {
         return Ok(());
     }
 
@@ -311,10 +322,24 @@ async fn remap_index(dataset: &mut Dataset, index_id: &Uuid) -> Result<()> {
     // stale (an empty map makes `index::remap_index` return `Keep`). The map is
     // bounded by the rows the reuse index touched; addresses this index does not
     // store are simply never looked up.
+    //
+    // The compact remap cannot enumerate its keys by design: it stores per-fragment
+    // bitmaps rather than rows, and treats any unlisted offset in a rewritten fragment as
+    // deleted, so its key domain is not a finite set. Rebuild the per-row maps from the
+    // details to recover that key set. This is the one place left whose memory grows with
+    // the number of rows touched rather than the number of fragments; composing the
+    // per-version remaps directly would avoid it.
     let composed_row_id_map: HashMap<u64, Option<u64>> = frag_reuse_index
-        .row_id_maps
+        .details
+        .versions
         .iter()
-        .flat_map(|row_id_map| row_id_map.keys().copied())
+        .flat_map(|version| version.groups.iter())
+        .flat_map(|group| {
+            let changed =
+                RoaringTreemap::deserialize_from(std::io::Cursor::new(&group.changed_row_addrs))
+                    .expect("fragment reuse index details were already parsed");
+            transpose_row_ids_from_digest(changed, &group.old_frags, &group.new_frags).into_keys()
+        })
         .map(|old_addr| (old_addr, frag_reuse_index.remap_row_id(old_addr)))
         .collect();
 

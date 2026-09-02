@@ -1314,7 +1314,7 @@ mod tests {
     use rstest::rstest;
 
     use crate::dataset::builder::DatasetBuilder;
-    use crate::dataset::optimize::{CompactionOptions, compact_files};
+    use crate::dataset::optimize::{CompactionOptions, IndexRemapMode, compact_files};
     use crate::dataset::{MergeInsertBuilder, WhenMatched, WhenNotMatched, WriteMode, WriteParams};
     use crate::index::CreateIndexBuilder;
     use crate::index::vector::VectorIndexParams;
@@ -1340,7 +1340,7 @@ mod tests {
         };
         let frag_reuse_index = FragReuseIndex {
             uuid: Uuid::new_v4(),
-            row_id_maps: vec![],
+            row_addr_maps: vec![],
             details: FragReuseIndexDetails {
                 versions: vec![FragReuseVersion {
                     dataset_version: 5,
@@ -2981,8 +2981,16 @@ mod tests {
         }
     }
 
+    /// Run against both remap forms. The deferred remap leaves the merged segment's
+    /// addresses to be resolved through the reuse index, so the search below goes through
+    /// whichever form the reader was opened with. The merge itself runs on the writing
+    /// handle and so always uses the default form; parameterising that too would mean
+    /// restructuring the setup, and the compaction-side mode is already covered upstream.
+    #[rstest]
+    #[case::direct(IndexRemapMode::Direct)]
+    #[case::compact(IndexRemapMode::Compact)]
     #[tokio::test]
-    async fn test_optimize_ngram_merge_remaps_deferred_compaction() {
+    async fn test_optimize_ngram_merge_remaps_deferred_compaction(#[case] mode: IndexRemapMode) {
         let test_dir = TempStrDir::default();
         let test_uri = test_dir.as_str();
         let schema = Arc::new(Schema::new(vec![Field::new("text", DataType::Utf8, true)]));
@@ -3054,7 +3062,13 @@ mod tests {
             .await
             .unwrap();
 
-        let dataset = DatasetBuilder::from_uri(test_uri).load().await.unwrap();
+        let dataset = DatasetBuilder::from_uri(test_uri)
+            .with_frag_reuse_remap_mode(mode)
+            .load()
+            .await
+            .unwrap();
+        assert_served_remap_form(&dataset, mode).await;
+
         let logical = crate::index::scalar_logical::open_named_scalar_index(
             &dataset,
             "text",
@@ -3962,8 +3976,36 @@ mod tests {
         assert_eq!(rows, 1, "id = 1 must return exactly one row after merge");
     }
 
+    /// Assert a reader was actually served the remap form it asked for.
+    ///
+    /// The answers either form gives are identical for any payload a real writer produces --
+    /// they diverge only on offsets past a fragment's `physical_rows`, which never named a
+    /// row -- so a parameterised test's own assertions cannot tell whether the mode took
+    /// effect. Only the form of what the reader was handed can.
+    async fn assert_served_remap_form(dataset: &Dataset, mode: IndexRemapMode) {
+        use lance_core::utils::row_addr_remap::RowAddrRemap;
+
+        let fri = dataset
+            .open_frag_reuse_index(&NoOpMetricsCollector)
+            .await
+            .unwrap()
+            .expect("a deferred-remap compaction leaves a reuse index behind");
+        assert_eq!(
+            matches!(fri.row_addr_maps[0], RowAddrRemap::Compact(_)),
+            mode == IndexRemapMode::Compact,
+            "reader asked for {mode:?} but was served {:?}",
+            fri.row_addr_maps[0]
+        );
+    }
+
+    /// Run against both remap forms: the deferred remap means the merge below and every
+    /// query after it resolve the old segment's addresses through the reuse index, so both
+    /// forms are exercised on the read path rather than only the default.
+    #[rstest]
+    #[case::direct(IndexRemapMode::Direct)]
+    #[case::compact(IndexRemapMode::Compact)]
     #[tokio::test]
-    async fn test_optimize_btree_merge_remaps_deferred_compaction() {
+    async fn test_optimize_btree_merge_remaps_deferred_compaction(#[case] mode: IndexRemapMode) {
         let test_dir = TempStrDir::default();
         let test_uri = test_dir.as_str();
 
@@ -4017,7 +4059,11 @@ mod tests {
         .unwrap();
 
         // Append a third fragment, left unindexed.
-        let mut dataset = DatasetBuilder::from_uri(test_uri).load().await.unwrap();
+        let mut dataset = DatasetBuilder::from_uri(test_uri)
+            .with_frag_reuse_remap_mode(mode)
+            .load()
+            .await
+            .unwrap();
         dataset
             .append(
                 RecordBatchIterator::new(vec![Ok(make(100..150))], schema.clone()),
@@ -4032,7 +4078,13 @@ mod tests {
             .await
             .unwrap();
 
-        let dataset = DatasetBuilder::from_uri(test_uri).load().await.unwrap();
+        let dataset = DatasetBuilder::from_uri(test_uri)
+            .with_frag_reuse_remap_mode(mode)
+            .load()
+            .await
+            .unwrap();
+        assert_served_remap_form(&dataset, mode).await;
+
         // A value from the compacted fragments must still be found via the index.
         let hit = dataset
             .scan()

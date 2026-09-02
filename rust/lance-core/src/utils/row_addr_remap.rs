@@ -55,7 +55,12 @@ use std::collections::HashMap;
 /// * `None` — the address is not affected by this remap (keep it unchanged)
 /// * `Some(None)` — the row was deleted
 /// * `Some(Some(addr))` — the row moved to `addr`
-#[derive(Clone)]
+///
+/// Equality is *representational*, not behavioural: a `Compact` and a `Direct` remap that
+/// resolve every address identically are still unequal, because they are different variants.
+/// Use it to compare two remaps of the same provenance, not to decide whether two remaps
+/// agree.
+#[derive(Clone, PartialEq, Eq)]
 pub enum RowAddrRemap {
     /// Compact, `O(#fragments)` remap built from per-group rewritten-row
     /// bitmaps and new-fragment layouts.
@@ -129,7 +134,7 @@ pub struct GroupInput {
     pub new_frags: Vec<(u32, u32)>,
 }
 
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Eq, crate::deepsize::DeepSizeOf)]
 struct GroupRemap {
     /// Old fragment id -> (rewritten old row offsets in that fragment,
     /// rewritten row count before this fragment in the group).
@@ -141,6 +146,11 @@ struct GroupRemap {
 
 impl GroupRemap {
     fn new(input: GroupInput) -> Result<Self> {
+        // Note the asymmetry between the two fragment lists. `old_frag_ids` carries no
+        // ordering requirement beyond being the order the fragments were read: positions are
+        // assigned by walking it, so any order is handled correctly and none is rejected.
+        // `new_frags` is different, and is checked below.
+        //
         // `compute_new_addr` maps a rewritten row's group-local index to a new
         // address by accumulating `physical_rows` in `new_frags` order, so that
         // order must be the order rows were written. New fragment ids are
@@ -238,7 +248,7 @@ impl GroupRemap {
 }
 
 /// Compact remap backed by per-group rewritten row bitmaps + new-fragment layouts.
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Eq, crate::deepsize::DeepSizeOf)]
 pub struct CompactRowAddrRemap {
     groups: Vec<GroupRemap>,
     /// Old fragment id -> index into `groups`. Size is O(#fragments), not rows.
@@ -274,12 +284,50 @@ impl CompactRowAddrRemap {
         self.groups.is_empty()
     }
 
+    /// Number of rewrite groups held.
+    pub fn num_groups(&self) -> usize {
+        self.groups.len()
+    }
+
+    /// Number of old fragments covered. This is what the structure scales with.
+    pub fn num_fragments(&self) -> usize {
+        self.frag_to_group.len()
+    }
+
     fn fully_deleted_fragments(&self) -> Option<RoaringBitmap> {
         // A group with any rewritten row moved at least one row.
         if self.groups.iter().any(|g| !g.frags.is_empty()) {
             return None;
         }
         Some(RoaringBitmap::from_iter(self.frag_to_group.keys().copied()))
+    }
+}
+
+// `Debug` is written by hand rather than derived because the payload is bitmaps and
+// hash maps of unbounded size: a derived impl would print the whole remap. The shape
+// and scale are what a caller logging a remap actually wants.
+impl std::fmt::Debug for RowAddrRemap {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Compact(compact) => f
+                .debug_struct("RowAddrRemap::Compact")
+                .field("groups", &compact.num_groups())
+                .field("fragments", &compact.num_fragments())
+                .finish(),
+            Self::Direct(map) => f
+                .debug_struct("RowAddrRemap::Direct")
+                .field("entries", &map.len())
+                .finish(),
+        }
+    }
+}
+
+impl crate::deepsize::DeepSizeOf for RowAddrRemap {
+    fn deep_size_of_children(&self, cx: &mut crate::deepsize::Context) -> usize {
+        match self {
+            Self::Compact(compact) => compact.deep_size_of_children(cx),
+            Self::Direct(map) => map.deep_size_of_children(cx),
+        }
     }
 }
 
@@ -388,6 +436,70 @@ mod tests {
             new_frags: vec![(12, 1), (11, 1)],
         };
         assert!(RowAddrRemap::compact([input]).is_err());
+    }
+
+    #[test]
+    fn test_deep_size_of_reaches_the_bitmaps() {
+        use crate::deepsize::DeepSizeOf;
+
+        // The derived impl has to walk Vec -> HashMap -> tuple -> RoaringBitmap. If any
+        // link stopped short the two remaps below would report the same size, since they
+        // differ only in how many rows their bitmaps hold.
+        let remap_over = |rows: u32| {
+            RowAddrRemap::compact([GroupInput {
+                rewritten_old_row_addrs: RoaringTreemap::from_iter(
+                    (0..rows).map(|offset| addr(0, offset)),
+                ),
+                old_frag_ids: vec![0],
+                new_frags: vec![(10, rows)],
+            }])
+            .unwrap()
+        };
+
+        // 8 values fit an array container; 40k promote to a bitmap container.
+        let small = remap_over(8).deep_size_of();
+        let large = remap_over(40_000).deep_size_of();
+        assert!(small > 0, "a non-empty remap must report a non-zero size");
+        assert!(
+            large > small,
+            "size must grow with bitmap contents, got {large} vs {small}"
+        );
+    }
+
+    /// Equality is representational, which is what the type documents and all it can offer:
+    /// the compact form cannot enumerate its keys, so there is nothing to compare a
+    /// materialized map against address by address.
+    #[test]
+    fn test_equality_compares_representation_not_resolved_addresses() {
+        let rows = 4u32;
+        let compact = RowAddrRemap::compact([GroupInput {
+            rewritten_old_row_addrs: RoaringTreemap::from_iter(
+                (0..rows).map(|offset| addr(0, offset)),
+            ),
+            old_frag_ids: vec![0],
+            new_frags: vec![(10, rows)],
+        }])
+        .unwrap();
+
+        // The same mapping written out by hand: every row of fragment 0 moved to fragment 10
+        // at the same offset. Both resolve these addresses identically...
+        let direct = RowAddrRemap::direct(
+            (0..rows)
+                .map(|offset| (addr(0, offset), Some(addr(10, offset))))
+                .collect(),
+        );
+        for offset in 0..rows {
+            assert_eq!(
+                compact.get(addr(0, offset)),
+                direct.get(addr(0, offset)),
+                "the two forms should agree on a rewritten address"
+            );
+        }
+
+        // ...but they are still unequal, because equality is over the representation.
+        assert_ne!(compact, direct);
+        assert_eq!(compact.clone(), compact);
+        assert_eq!(direct.clone(), direct);
     }
 
     #[test]
