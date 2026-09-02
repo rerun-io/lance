@@ -48,8 +48,8 @@ NAMESPACE_0_7_DEPENDENCY = "lance-namespace>=0.7.2,<0.8"
 NAMESPACE_0_8_DEPENDENCY = "lance-namespace>=0.8.0,<0.9"
 
 # From this version on, the wheel declares its own `lance-namespace` range, so
-# pinning one here can only contradict it. 8.0.0 declares `>=0.8.5,<0.9`;
-# 12.0.0b11 declares `>=0.11.1,<0.12`.
+# pinning one here can only contradict it: 8.0.0 declares `>=0.8.5,<0.9`, and
+# later releases have declared ranges of their own.
 FIRST_SELF_DESCRIBING_VERSION = Version("8.0.0b0")
 
 
