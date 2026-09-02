@@ -23,6 +23,42 @@ from packaging.version import Version
 
 
 @lru_cache(maxsize=1)
+def version_under_test() -> Optional[Version]:
+    """The pylance version this checkout builds, used as a ceiling on the matrix below.
+
+    Compatibility here is a claim about *older* releases: whether they can read what
+    this build writes, and whether this build can read what they wrote. A release
+    branch owes nothing to versions cut after it -- being unable to read a future
+    format is not a defect in it.
+
+    Both discovery queries below are global rather than relative to this checkout, so
+    without a ceiling a release branch tests against upstream's later development
+    line: on `release-10.0.0` the matrix would pick up 11.0.0 and the newest 12.0.0
+    beta. That makes CI hostage to upstream publishing, with no change on this side.
+    """
+    try:
+        import lance
+
+        return Version(lance.__version__)
+    except Exception as e:
+        print(
+            f"Warning: Could not determine the pylance version under test: {e}",
+            file=sys.stderr,
+        )
+        return None
+
+
+def _within_ceiling(version: Version) -> bool:
+    """Whether `version` is at or below the version under test.
+
+    An unknown ceiling admits everything, keeping the previous behaviour rather than
+    silently emptying the matrix.
+    """
+    ceiling = version_under_test()
+    return ceiling is None or version <= ceiling
+
+
+@lru_cache(maxsize=1)
 def pylance_stable_versions() -> List[Version]:
     """Fetches and returns a sorted list of stable pylance versions from PyPI."""
     try:
@@ -47,8 +83,12 @@ def pylance_stable_versions() -> List[Version]:
 
 
 def recent_major_versions(n: int) -> List[str]:
-    """Returns the n most recent major versions of pylance as strings."""
-    stable_versions = pylance_stable_versions()
+    """Returns the n most recent major versions of pylance at or below this build.
+
+    Versions above the one under test are skipped rather than counted, so capping
+    keeps n majors of real coverage instead of shortening the list.
+    """
+    stable_versions = [v for v in pylance_stable_versions() if _within_ceiling(v)]
     major_versions = []
     seen_majors = set()
 
@@ -127,7 +167,11 @@ def last_beta_release():
 
 VERSIONS = recent_major_versions(3)
 LAST_BETA_RELEASE = last_beta_release()
-if LAST_BETA_RELEASE is not None:
+# The newest beta on the index is upstream's, not necessarily this line's, so it is
+# only included when it is at or below the version under test. On a release branch it
+# is normally above and is skipped; on a development line it is normally the build's
+# own beta and is kept.
+if LAST_BETA_RELEASE is not None and _within_ceiling(Version(LAST_BETA_RELEASE)):
     VERSIONS.append(LAST_BETA_RELEASE)
 
 
