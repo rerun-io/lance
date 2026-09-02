@@ -1088,7 +1088,11 @@ impl DatasetIndexExt for Dataset {
             infer_missing_vector_details(self, &mut updated).await;
             if updated != *indices {
                 indices = Arc::new(updated);
-                self.index_cache
+                // Written back through the same handle it was read from. The
+                // remap-partitioned handle would put it where no reader looks, so
+                // inference would never be observed and would leave an unreachable
+                // entry behind.
+                self.manifest_index_cache
                     .insert_with_key(&metadata_key, indices.clone())
                     .await;
             }
@@ -4581,6 +4585,82 @@ mod tests {
         );
         let descriptions = dataset.describe_indices(None).await.unwrap();
         assert_eq!(descriptions[0].index_type(), inferred_type);
+    }
+
+    /// `load_indices` reads the manifest's index list from the unpartitioned handle,
+    /// because that list is not translated through the fragment reuse index and the
+    /// prefetch in `load_manifest` writes it there before any remap form is known. The
+    /// inferred list has to go back to that same handle: on the remap-partitioned one it
+    /// lands where no reader looks, so inference is never observed and an unreachable
+    /// entry is left behind.
+    ///
+    /// Seeds the cache directly rather than doctoring the manifest, because a committed
+    /// manifest gets its details inferred and persisted, after which inference is a no-op
+    /// and the write-back branch is never entered -- which is why
+    /// `test_legacy_vector_index_details_inferred_on_load_and_migration` does not cover
+    /// this.
+    ///
+    /// Only the read-back half is assertable. "No unreachable entry in the partitioned
+    /// namespace" is not: there is no namespace-scoped size or key enumeration to inspect.
+    /// That half holds by inspection -- there is now exactly one write, to this handle.
+    #[tokio::test]
+    async fn test_load_indices_writes_inferred_details_back_where_it_reads_them() {
+        use lance_linalg::distance::DistanceType;
+
+        let test_dir = lance_core::utils::tempfile::TempDir::default();
+        let test_uri = test_dir.path_str();
+        let data = gen_batch()
+            .col("vec", array::rand_vec::<Float32Type>(16.into()))
+            .into_reader_rows(RowCount::from(256), BatchCount::from(1));
+        let mut dataset = Dataset::write(data, &test_uri, None).await.unwrap();
+        dataset
+            .create_index(
+                &["vec"],
+                IndexType::Vector,
+                None,
+                &VectorIndexParams::ivf_pq(1, 8, 1, DistanceType::L2, 1),
+                false,
+            )
+            .await
+            .unwrap();
+
+        // A legacy-shaped list: `VectorIndexDetails` with an empty value, which is what
+        // `needs_vector_details_inference` looks for.
+        let mut legacy = dataset.load_indices().await.unwrap().as_ref().clone();
+        for idx in &mut legacy {
+            idx.index_details = Some(Arc::new(vector_index_details_default()));
+        }
+        assert!(
+            legacy[0].index_details.as_ref().unwrap().value.is_empty(),
+            "the seeded list must actually need inference"
+        );
+
+        let metadata_key = crate::session::index_caches::IndexMetadataKey {
+            version: dataset.version().version,
+        };
+        dataset
+            .manifest_index_cache
+            .insert_with_key(&metadata_key, Arc::new(legacy))
+            .await;
+
+        // Reads the seeded list, infers, and writes the result back.
+        dataset.load_indices().await.unwrap();
+
+        let cached = dataset
+            .manifest_index_cache
+            .get_with_key(&metadata_key)
+            .await
+            .expect("the manifest index list is cached on this handle");
+        assert!(
+            !cached[0]
+                .index_details
+                .as_ref()
+                .expect("cached entry should carry details")
+                .value
+                .is_empty(),
+            "the cached list still has empty details, so the inferred list was written to \
+             a handle that no reader reads"
+        );
     }
 
     #[tokio::test]
