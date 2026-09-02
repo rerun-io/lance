@@ -1799,7 +1799,13 @@ async fn rewrite_files(
             let captured_ids = row_ids_rx
                 .try_recv()
                 .map_err(|err| Error::internal(format!("Failed to receive row ids: {}", err)))?;
-            let row_addrs = captured_ids.row_addrs(None).into_owned();
+            let mut row_addrs = captured_ids.row_addrs(None).into_owned();
+            // Compaction rewrites long contiguous spans of addresses, which roaring stores
+            // as dense bitmap containers unless asked otherwise: one bit per row, so a
+            // large table costs tens of megabytes here. `optimize` converts those to run
+            // containers, which cost a few bytes per span. This payload is read on every
+            // index open, so it is worth shrinking at rest.
+            row_addrs.optimize();
             let mut serialized = Vec::with_capacity(row_addrs.serialized_size());
             row_addrs.serialize_into(&mut serialized)?;
             Ok(Some(serialized))
@@ -3040,6 +3046,58 @@ mod tests {
         async fn create_remapper(&self, _: &Dataset) -> Result<Option<Box<dyn IndexRemapper>>> {
             Ok(None)
         }
+    }
+
+    #[tokio::test]
+    async fn test_captured_row_addrs_are_run_optimized() {
+        // Past roaring's 4096-element array limit an unoptimized store is a dense bitset,
+        // which is the case `optimize()` exists for, so keep fragments above it.
+        let mut dataset = lance_datagen::gen_batch()
+            .col("i", lance_datagen::array::step::<Int32Type>())
+            .into_ram_dataset(FragmentCount::from(3), FragmentRowCount::from(5_000))
+            .await
+            .unwrap();
+
+        // Row addresses are only captured when a remappable index covers the data.
+        create_scalar_index(&mut dataset, "i", false).await;
+
+        let options = CompactionOptions {
+            target_rows_per_fragment: 15_000,
+            ..Default::default()
+        };
+        let plan = plan_compaction(&dataset, &options).await.unwrap();
+        let result = rewrite_files(Cow::Borrowed(&dataset), plan.tasks()[0].clone(), &options)
+            .await
+            .unwrap();
+
+        let payload = result
+            .row_addrs
+            .expect("compaction over indexed data should capture row addresses");
+        let row_addrs = RoaringTreemap::deserialize_from(&mut Cursor::new(&payload)).unwrap();
+        assert_eq!(row_addrs.len(), 15_000);
+
+        for (frag_id, bitmap) in row_addrs.bitmaps() {
+            let stats = bitmap.statistics();
+            assert_eq!(
+                (
+                    stats.n_run_containers,
+                    stats.n_array_containers,
+                    stats.n_bitset_containers
+                ),
+                (1, 0, 0),
+                "fragment {frag_id} should hold exactly one run container, got {stats:?}"
+            );
+        }
+
+        // Re-inserting the same addresses never produces run stores, so this is the
+        // encoding the payload would carry without the optimization.
+        let unencoded: RoaringTreemap = row_addrs.iter().collect();
+        assert!(
+            payload.len() * 20 < unencoded.serialized_size(),
+            "run encoding should shrink the payload by more than 20x, got {} against {}",
+            payload.len(),
+            unencoded.serialized_size()
+        );
     }
 
     #[rstest]
