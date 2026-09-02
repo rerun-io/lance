@@ -23,16 +23,13 @@ use oracle::Oracle;
 use probes::{PROBES, ProbeParams, Survival, build_probes};
 use std::io::Write as _;
 
-const SWEEP_N: &[u64] = &[
-    1 << 13,
-    1 << 16,
-    1 << 19,
-    1 << 22,
-    1 << 24,
-    1 << 26,
-    1 << 28,
-    1 << 30,
-];
+/// Capped at `2^24`. Chain depth grows logarithmically in `N` -- `2^24` reaches 16
+/// versions at `k=H` and 63 at `k=1`, against 22 and 87 at `2^30` -- so the sizes above
+/// cost 64x the rows for a few more versions. The `k` axis reaches depth far more
+/// cheaply, and `2^24` already brackets a production chain of 26. Capping here also puts
+/// every cell inside `direct_fits`, so both forms run at every size and nothing is
+/// skipped.
+const SWEEP_N: &[u64] = &[1 << 13, 1 << 16, 1 << 19, 1 << 22, 1 << 24];
 const SWEEP_B: &[u64] = &[0, 3, 6, 12];
 const SWEEP_K: &[u64] = &[FRAGS_PER_LEVEL, 1];
 const SWEEP_M: &[u64] = &[1, 2, 4, 128];
@@ -140,7 +137,9 @@ fn main() {
          PROBES={PROBES}"
     );
     println!(
-        "axes    N=2^13..2^30 ({})  b={SWEEP_B:?}  k={SWEEP_K:?}  m={SWEEP_M:?}  c={SWEEP_C:?}",
+        "axes    N=2^{}..2^{} ({})  b={SWEEP_B:?}  k={SWEEP_K:?}  m={SWEEP_M:?}  c={SWEEP_C:?}",
+        SWEEP_N[0].trailing_zeros(),
+        SWEEP_N[SWEEP_N.len() - 1].trailing_zeros(),
         SWEEP_N.len()
     );
     println!(

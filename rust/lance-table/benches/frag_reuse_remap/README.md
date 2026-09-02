@@ -24,9 +24,9 @@ more than it helps. Quote figures with the hardware and date beside them.
 
 | axis | values | what it controls |
 |---|---|---|
-| `N` | 2^13 .. 2^30 | rows. `Direct` is skipped where its table would exceed 8 GiB |
+| `N` | 2^13 .. 2^24 | rows. Every cell fits `Direct`'s 8 GiB budget at this ceiling, so both forms run at every size |
 | `b` | 0, 3, 6, 12 | deleted rows per 128-row period, so bitmap fragmentation |
-| `k` | 4, 1 | fragments merged per round, so chain depth (5–22 vs 19–87) |
+| `k` | 4, 1 | fragments merged per round, so chain depth (5–16 vs 19–63) |
 | `m` | 1, 2, 4, 128 | probe range is `m*N`, so the reuse-index hit rate is `1/m` |
 | `c` | 1, 512, 65536 | run length: consecutive rows per jump |
 
