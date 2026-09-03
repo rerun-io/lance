@@ -66,9 +66,10 @@ version bumps and no Rerun git tags — the workspace `version` stays identical 
    └────────────────────────────────┘
 ```
 
-Every PR into a release branch carries a `vX fork` label naming the line it landed on — `v10 fork`
-for `release-10.0.0` — so the fork's history stays queryable after a patch has been dropped and no
-longer shows up in the diff below.
+Every PR into a release branch carries a `lance fork X.Y.Z` label naming the line it landed on —
+`lance fork 10.0.0` for `release-10.0.0` — so the fork's history stays queryable after a patch has
+been dropped and no longer shows up in the diff below. Lines before 10.0.0 predate the labels and
+are not relabelled in retrospect.
 
 On top of that, every patch is one of three kinds, and carries exactly one of these labels:
 
@@ -112,8 +113,8 @@ Guidelines:
 - Fill in `.github/pull_request_template.md`.
 - Title the PR per [Conventional Commits](https://www.conventionalcommits.org/en/v1.0.0/). The
   `PR Checks` workflow validates the title and body with commitlint.
-- **Label the PR** with `vX fork` and exactly one of the three kinds below. The `Fork Labels`
-  workflow fails the PR until both are set.
+- **Label the PR** with `lance fork X.Y.Z` and exactly one of the three kinds below. The
+  `Fork Labels` workflow fails the PR until both are set, by running `ci/rerun_fork.py check`.
 - In the PR body, record **provenance**: for a port or backport, the source commit SHA and PR, the
   release line it came from, and whether it applied unchanged or was adapted; for a fork-only
   change, say that it is fork-only. This is what lets us identify and delete the patch later.
@@ -218,4 +219,10 @@ git switch -c myname/my-fix origin/release-X.Y.Z && ... && gh pr create --base r
 git switch -c release-NEW vNEW
 git rebase --onto release-NEW vOLD origin/release-OLD
 git push origin release-NEW
+
+# The patch set as a timeline, with the kind of each change
+python3 ci/rerun_fork.py view release-X.Y.Z
+
+# Which PRs are missing their labels, and the command to fix each
+python3 ci/rerun_fork.py audit release-X.Y.Z --state merged
 ```
