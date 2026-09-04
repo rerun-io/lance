@@ -3183,6 +3183,254 @@ mod tests {
         );
     }
 
+    /// A distributed build races a deferred-remap compaction: per-fragment
+    /// segments are built uncommitted, a compaction retires the fragments they
+    /// cover while the build is still in flight, and only then are they merged.
+    ///
+    /// `merge_existing_index_segments` receives the segments straight from the
+    /// caller, so their `fragment_bitmap` still names the retired fragments --
+    /// unlike `load_indices`, which remaps segment coverage through the
+    /// fragment-reuse index on the way out. Their row sets, by contrast, are
+    /// remapped when the segment is opened. Per-segment filters derived from the
+    /// unremapped coverage therefore keep nothing, and every remapped row is
+    /// filtered away.
+    ///
+    /// The committed index is scaffolding, not the subject: compaction only
+    /// writes a fragment-reuse index when a compacted group is already indexed,
+    /// and `defer_index_remap` is rejected outright on stable row ids.
+    #[tokio::test]
+    async fn test_bitmap_merge_uncommitted_segments_across_deferred_compaction() {
+        // Open `segment` directly rather than scanning, so the assertion cannot
+        // be satisfied by the scaffolding index.
+        async fn count_value(dataset: &Dataset, segment: &IndexMetadata, value: &str) -> usize {
+            let field_path = dataset.schema().field_path(segment.fields[0]).unwrap();
+            let index = crate::index::scalar::open_scalar_index(
+                dataset,
+                &field_path,
+                segment,
+                &NoOpMetricsCollector,
+            )
+            .await
+            .unwrap();
+            let query = SargableQuery::Equals(ScalarValue::Utf8(Some(value.to_string())));
+            match index.search(&query, &NoOpMetricsCollector).await.unwrap() {
+                SearchResult::Exact(row_addrs) => {
+                    row_addrs.true_rows().row_addrs().unwrap().count()
+                }
+                other => panic!("expected exact result, got {other:?}"),
+            }
+        }
+
+        let tmpdir = TempStrDir::default();
+        let dataset_uri = format!("file://{}", tmpdir.as_str());
+
+        // 12 rows across three 4-row fragments. `cat` is built from `id` rather
+        // than a cycling generator so the per-value totals are exactly 4 each
+        // regardless of how the generator restarts across batches.
+        let schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("id", DataType::Int32, false),
+            ArrowField::new("cat", DataType::Utf8, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from_iter_values(0..12)),
+                Arc::new(StringArray::from_iter_values(
+                    (0..12).map(|i| ["A", "B", "C"][(i % 3) as usize]),
+                )),
+            ],
+        )
+        .unwrap();
+        let reader = RecordBatchIterator::new(vec![Ok(batch)], schema);
+        let mut dataset = Dataset::write(
+            reader,
+            &dataset_uri,
+            Some(WriteParams {
+                max_rows_per_file: 4,
+                mode: WriteMode::Overwrite,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(dataset.get_fragments().len(), 3);
+
+        let params = ScalarIndexParams::for_builtin(lance_index::scalar::BuiltinIndexType::Bitmap);
+
+        // The segments under test: built uncommitted, then held across the
+        // compaction below, as a distributed coordinator would hold them.
+        let mut in_flight = Vec::with_capacity(3);
+        for fragment in dataset.get_fragments() {
+            in_flight.push(
+                CreateIndexBuilder::new(&mut dataset, &["cat"], IndexType::Bitmap, &params)
+                    .name("cat_in_flight".to_string())
+                    .fragments(vec![fragment.id() as u32])
+                    .execute_uncommitted()
+                    .await
+                    .unwrap(),
+            );
+        }
+
+        // Scaffolding: a committed index over the whole column, so the
+        // compaction below writes a fragment-reuse index at all. It must be a
+        // single segment -- the planner bins fragments by which index segments
+        // cover them, and a segment-per-fragment index would put each fragment
+        // in its own bin, where a lone `CompactWithNeighbors` candidate is a
+        // no-op and nothing would compact.
+        dataset
+            .create_index(
+                &["cat"],
+                IndexType::Bitmap,
+                Some("cat_committed".to_string()),
+                &params,
+                false,
+            )
+            .await
+            .unwrap();
+
+        crate::dataset::optimize::compact_files(
+            &mut dataset,
+            crate::dataset::optimize::CompactionOptions {
+                target_rows_per_fragment: 12,
+                defer_index_remap: true,
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            dataset.get_fragments().len(),
+            1,
+            "compaction must collapse the three fragments and retire their ids"
+        );
+
+        let merged = dataset
+            .merge_existing_index_segments(in_flight)
+            .await
+            .unwrap();
+
+        for value in ["A", "B", "C"] {
+            assert_eq!(
+                count_value(&dataset, &merged, value).await,
+                4,
+                "cat = {value} lost rows merging in-flight segments across a \
+                 deferred-remap compaction"
+            );
+        }
+    }
+
+    /// The BTree analogue of
+    /// [`test_bitmap_merge_uncommitted_segments_across_deferred_compaction`].
+    ///
+    /// BTree's `merge_segments` already derived per-segment filters from
+    /// unremapped coverage before bitmap did, so this determines whether the
+    /// loss is bitmap-specific or shared by every type routed through
+    /// `build_per_segment_filters`.
+    #[tokio::test]
+    async fn test_btree_merge_uncommitted_segments_across_deferred_compaction() {
+        async fn count_all(dataset: &Dataset, segment: &IndexMetadata) -> usize {
+            let field_path = dataset.schema().field_path(segment.fields[0]).unwrap();
+            let index = crate::index::scalar::open_scalar_index(
+                dataset,
+                &field_path,
+                segment,
+                &NoOpMetricsCollector,
+            )
+            .await
+            .unwrap();
+            let query = SargableQuery::Range(
+                Bound::Included(ScalarValue::Int32(Some(0))),
+                Bound::Excluded(ScalarValue::Int32(Some(12))),
+            );
+            match index.search(&query, &NoOpMetricsCollector).await.unwrap() {
+                SearchResult::Exact(row_addrs) => {
+                    row_addrs.true_rows().row_addrs().unwrap().count()
+                }
+                other => panic!("expected exact result, got {other:?}"),
+            }
+        }
+
+        let tmpdir = TempStrDir::default();
+        let dataset_uri = format!("file://{}", tmpdir.as_str());
+
+        // 12 rows across three 4-row fragments. Address-style row ids, since
+        // `defer_index_remap` is rejected on stable row ids.
+        let reader = gen_batch()
+            .col("id", lance_datagen::array::step::<Int32Type>())
+            .into_reader_rows(
+                lance_datagen::RowCount::from(4),
+                lance_datagen::BatchCount::from(3),
+            );
+        let mut dataset = Dataset::write(
+            reader,
+            &dataset_uri,
+            Some(WriteParams {
+                max_rows_per_file: 4,
+                mode: WriteMode::Overwrite,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(dataset.get_fragments().len(), 3);
+
+        let params = ScalarIndexParams::for_builtin(lance_index::scalar::BuiltinIndexType::BTree);
+
+        let mut in_flight = Vec::with_capacity(3);
+        for fragment in dataset.get_fragments() {
+            in_flight.push(
+                CreateIndexBuilder::new(&mut dataset, &["id"], IndexType::BTree, &params)
+                    .name("id_in_flight".to_string())
+                    .fragments(vec![fragment.id() as u32])
+                    .execute_uncommitted()
+                    .await
+                    .unwrap(),
+            );
+        }
+
+        // Single-segment scaffolding index, so compaction writes a
+        // fragment-reuse index and bins all three fragments together.
+        dataset
+            .create_index(
+                &["id"],
+                IndexType::BTree,
+                Some("id_committed".to_string()),
+                &params,
+                false,
+            )
+            .await
+            .unwrap();
+
+        crate::dataset::optimize::compact_files(
+            &mut dataset,
+            crate::dataset::optimize::CompactionOptions {
+                target_rows_per_fragment: 12,
+                defer_index_remap: true,
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            dataset.get_fragments().len(),
+            1,
+            "compaction must collapse the three fragments and retire their ids"
+        );
+
+        let merged = dataset
+            .merge_existing_index_segments(in_flight)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            count_all(&dataset, &merged).await,
+            12,
+            "BTree merge lost rows across a deferred-remap compaction"
+        );
+    }
+
     #[tokio::test]
     async fn test_label_list_merge_rejects_nullable_segment_missing_null_metadata() {
         use crate::dataset::index::LanceIndexStoreExt;
