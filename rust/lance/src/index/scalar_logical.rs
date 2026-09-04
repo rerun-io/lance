@@ -121,6 +121,13 @@ impl Index for LogicalScalarIndex {
     }
 
     async fn calculate_included_frags(&self) -> Result<RoaringBitmap> {
+        // Scans every segment end to end, concurrently, each at its own full prefetch
+        // budget; loud because it is a memory spike on the commit path.
+        tracing::info!(
+            index = %self.name,
+            num_segments = self.segments.len(),
+            "recomputing index fragment bitmap: whole-file scan of every segment"
+        );
         let fragment_sets = try_join_all(
             self.segments
                 .iter()

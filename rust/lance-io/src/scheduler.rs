@@ -10,7 +10,7 @@ use std::fmt::Debug;
 use std::future::Future;
 use std::num::NonZero;
 use std::ops::Range;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 use tokio::sync::Notify;
@@ -118,10 +118,22 @@ struct IoQueueState {
     last_warn: AtomicU64,
     // When true, skip all byte-based backpressure checks (set when io_buffer_size == 0)
     no_backpressure: bool,
+    // High-water mark of bytes debited but not yet credited back.
+    //
+    // This is the quantity the byte budget is supposed to bound, and until now nothing
+    // reported it: callers could only observe whole-process RSS, which cannot separate
+    // scheduler prefetch from decode buffers.
+    max_bytes_in_flight: u64,
+    // Requests admitted even though the remaining budget did not cover them, via the
+    // `priority <= min_in_flight` path that guarantees forward progress. Each one is a
+    // place where the budget is a soft bound rather than a hard one.
+    priority_bypass_admissions: u64,
+    // Which process-wide counter this queue's bytes belong to.
+    purpose: SchedulerPurpose,
 }
 
 impl IoQueueState {
-    fn new(io_capacity: u32, io_buffer_size: u64) -> Self {
+    fn new(io_capacity: u32, io_buffer_size: u64, purpose: SchedulerPurpose) -> Self {
         Self {
             io_capacity,
             iops_avail: io_capacity,
@@ -133,7 +145,15 @@ impl IoQueueState {
             start: Instant::now(),
             last_warn: AtomicU64::from(0),
             no_backpressure: io_buffer_size == 0,
+            max_bytes_in_flight: 0,
+            priority_bypass_admissions: 0,
+            purpose,
         }
+    }
+
+    /// Bytes currently debited and not yet credited back.
+    fn bytes_in_flight(&self) -> u64 {
+        (self.io_buffer_size as i64 - self.bytes_avail).max(0) as u64
     }
 
     fn scheduler_state_event(&self) -> Option<SchedulerStateEvent> {
@@ -251,7 +271,13 @@ impl IoQueueState {
             self.priorities_in_flight.push(task.priority);
             self.iops_avail -= 1;
             if !skip_bytes_accounting {
+                if task.num_bytes() as i64 > self.bytes_avail {
+                    // `can_deliver` let this through on priority, not on budget.
+                    self.priority_bypass_admissions += 1;
+                }
                 self.bytes_avail -= task.num_bytes() as i64;
+                account_bytes(self.purpose, task.num_bytes() as i64);
+                self.max_bytes_in_flight = self.max_bytes_in_flight.max(self.bytes_in_flight());
                 if self.bytes_avail < 0 {
                     // This can happen when we admit special priority requests
                     log::debug!(
@@ -280,9 +306,14 @@ struct IoQueue {
 }
 
 impl IoQueue {
-    fn new(io_capacity: u32, io_buffer_size: u64, stats: IoStats) -> Self {
+    fn new(
+        io_capacity: u32,
+        io_buffer_size: u64,
+        stats: IoStats,
+        purpose: SchedulerPurpose,
+    ) -> Self {
         Self {
-            state: Mutex::new(IoQueueState::new(io_capacity, io_buffer_size)),
+            state: Mutex::new(IoQueueState::new(io_capacity, io_buffer_size, purpose)),
             notify: Notify::new(),
             stats,
         }
@@ -340,6 +371,7 @@ impl IoQueue {
         let event = {
             let mut state = self.state.lock().unwrap();
             state.bytes_avail += bytes as i64;
+            account_bytes(state.purpose, -(bytes as i64));
             for _ in 0..num_reqs {
                 state.priorities_in_flight.remove(priority);
             }
@@ -628,6 +660,23 @@ pub struct ScanStats {
     pub bytes_read: u64,
 }
 
+/// What the backpressure budget actually did, as opposed to what it was configured to do.
+///
+/// `max_bytes_in_flight` is the peak of bytes debited and not yet credited: the quantity
+/// the budget bounds. `priority_bypass_admissions` counts the times a request was admitted
+/// despite the budget being exhausted, which is how the budget stays soft enough to
+/// guarantee forward progress. A non-zero count means the ceiling was crossed deliberately.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct BackpressureStats {
+    pub io_buffer_size: u64,
+    pub max_bytes_in_flight: u64,
+    pub priority_bypass_admissions: u64,
+    /// Bytes debited and not yet credited *right now*. `max_bytes_in_flight` is a
+    /// high-water mark per scheduler, so summing it across several schedulers overstates
+    /// their true simultaneous peak; sampling this does not.
+    pub bytes_in_flight: u64,
+}
+
 impl ScanStats {
     fn new(stats: &StatsCollector) -> Self {
         Self {
@@ -814,6 +863,62 @@ impl Drop for Response {
     }
 }
 
+/// What a scheduler's I/O is for, so process-wide byte accounting can be attributed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SchedulerPurpose {
+    /// Dataset scans.
+    Scan,
+    /// Scalar/vector index file reads.
+    Index,
+    /// Anything not otherwise attributed.
+    Other,
+}
+
+impl SchedulerPurpose {
+    const COUNT: usize = 3;
+    const fn idx(self) -> usize {
+        match self {
+            Self::Scan => 0,
+            Self::Index => 1,
+            Self::Other => 2,
+        }
+    }
+}
+
+// Process-wide sum of bytes debited but not yet credited, by purpose. Per-scheduler
+// stats cannot answer "how much is in flight right now", because callers that fan out
+// hold one scheduler per source.
+static BYTES_IN_FLIGHT: [AtomicI64; SchedulerPurpose::COUNT] =
+    [const { AtomicI64::new(0) }; SchedulerPurpose::COUNT];
+static PEAK_BYTES_IN_FLIGHT: [AtomicU64; SchedulerPurpose::COUNT] =
+    [const { AtomicU64::new(0) }; SchedulerPurpose::COUNT];
+
+fn account_bytes(purpose: SchedulerPurpose, delta: i64) {
+    let now = BYTES_IN_FLIGHT[purpose.idx()].fetch_add(delta, Ordering::Relaxed) + delta;
+    if delta > 0 {
+        PEAK_BYTES_IN_FLIGHT[purpose.idx()].fetch_max(now.max(0) as u64, Ordering::Relaxed);
+    }
+}
+
+/// Bytes currently prefetched but not yet consumed, across every scheduler of `purpose`.
+///
+/// Standard-queue schedulers only; the lite queue reserves through its own RAII type.
+pub fn bytes_in_flight(purpose: SchedulerPurpose) -> u64 {
+    BYTES_IN_FLIGHT[purpose.idx()]
+        .load(Ordering::Relaxed)
+        .max(0) as u64
+}
+
+/// High-water mark of [`bytes_in_flight`] since the last [`reset_peak_bytes_in_flight`].
+pub fn peak_bytes_in_flight(purpose: SchedulerPurpose) -> u64 {
+    PEAK_BYTES_IN_FLIGHT[purpose.idx()].load(Ordering::Relaxed)
+}
+
+/// Reset the peak to the current value, so the next window measures afresh.
+pub fn reset_peak_bytes_in_flight(purpose: SchedulerPurpose) {
+    PEAK_BYTES_IN_FLIGHT[purpose.idx()].store(bytes_in_flight(purpose), Ordering::Relaxed);
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct SchedulerConfig {
     /// the # of bytes that can be buffered but not yet requested.
@@ -826,15 +931,23 @@ pub struct SchedulerConfig {
     /// - `Some(false)` forces the standard scheduler.
     /// - `None` defers to the object store's preference (see [`ObjectStore::prefers_lite_scheduler`]).
     pub use_lite_scheduler: Option<bool>,
+    /// What this scheduler's I/O is for; drives process-wide accounting only.
+    pub purpose: SchedulerPurpose,
 }
 
 impl SchedulerConfig {
+    /// Attribute this scheduler's bytes to `purpose` in the process-wide gauge.
+    pub fn with_purpose(self, purpose: SchedulerPurpose) -> Self {
+        Self { purpose, ..self }
+    }
+
     pub fn new(io_buffer_size_bytes: u64) -> Self {
         Self {
             io_buffer_size_bytes,
             use_lite_scheduler: std::env::var("LANCE_USE_LITE_SCHEDULER")
                 .ok()
                 .map(|v| str_is_truthy(v.trim())),
+            purpose: SchedulerPurpose::Other,
         }
     }
 
@@ -843,6 +956,7 @@ impl SchedulerConfig {
         Self {
             io_buffer_size_bytes: 256 * 1024 * 1024,
             use_lite_scheduler: None,
+            purpose: SchedulerPurpose::Other,
         }
     }
 
@@ -885,6 +999,7 @@ impl ScanScheduler {
                 io_capacity as u32,
                 config.io_buffer_size_bytes,
                 stats.clone(),
+                config.purpose,
             ));
             let io_queue_clone = io_queue.clone();
             // Best we can do here is fire and forget.  If the I/O loop is still running when the scheduler is
@@ -1103,6 +1218,25 @@ impl ScanScheduler {
 
     pub fn stats(&self) -> ScanStats {
         self.stats.snapshot()
+    }
+
+    /// Peak backpressure usage for this scheduler; see [`BackpressureStats`].
+    ///
+    /// Returns the default (all zero) for the lite scheduler, which accounts for
+    /// reservations with its own RAII type rather than this queue.
+    pub fn backpressure_stats(&self) -> BackpressureStats {
+        match &self.io_queue {
+            IoQueueType::Standard(queue) => {
+                let state = queue.state.lock().expect("io queue mutex poisoned");
+                BackpressureStats {
+                    io_buffer_size: state.io_buffer_size,
+                    max_bytes_in_flight: state.max_bytes_in_flight,
+                    priority_bypass_admissions: state.priority_bypass_admissions,
+                    bytes_in_flight: state.bytes_in_flight(),
+                }
+            }
+            IoQueueType::Lite(_) => BackpressureStats::default(),
+        }
     }
 
     #[cfg(test)]
@@ -1399,7 +1533,7 @@ mod tests {
             requests: 3,
             bytes_read: 4096,
         });
-        let mut state = IoQueueState::new(4, 192);
+        let mut state = IoQueueState::new(4, 192, SchedulerPurpose::Other);
         state.iops_avail = 2;
         state.bytes_avail = 128;
         state.pending_requests.push(make_task(1, false));
@@ -1432,7 +1566,12 @@ mod tests {
     fn test_batch_with_undelivered_slot_is_error() {
         let response = Arc::new(Mutex::new(None));
         let response_clone = response.clone();
-        let io_queue = Arc::new(IoQueue::new(1, 1024, IoStats::new()));
+        let io_queue = Arc::new(IoQueue::new(
+            1,
+            1024,
+            IoStats::new(),
+            SchedulerPurpose::Other,
+        ));
         let batch = MutableBatch::new(
             move |rsp| *response_clone.lock().unwrap() = Some(rsp),
             2, // num_data_buffers
@@ -1697,6 +1836,7 @@ mod tests {
         ));
 
         let config = SchedulerConfig {
+            purpose: SchedulerPurpose::Other,
             io_buffer_size_bytes: 1024 * 1024,
             use_lite_scheduler: None,
         };
@@ -1788,6 +1928,7 @@ mod tests {
         let scheduler = ScanScheduler::new(
             obj_store,
             SchedulerConfig {
+                purpose: SchedulerPurpose::Other,
                 io_buffer_size_bytes: 1024 * 1024,
                 use_lite_scheduler: Some(false),
             },
@@ -1918,6 +2059,7 @@ mod tests {
         ));
 
         let config = SchedulerConfig {
+            purpose: SchedulerPurpose::Other,
             io_buffer_size_bytes: 10,
             use_lite_scheduler: None,
         };
@@ -1993,6 +2135,7 @@ mod tests {
 
         // Ensure deadlock prevention timeout can be disabled
         let config = SchedulerConfig {
+            purpose: SchedulerPurpose::Other,
             io_buffer_size_bytes: 10,
             use_lite_scheduler: None,
         };
@@ -2075,6 +2218,7 @@ mod tests {
         let scheduler = ScanScheduler::new(
             obj_store,
             SchedulerConfig {
+                purpose: SchedulerPurpose::Other,
                 io_buffer_size_bytes: 10,
                 use_lite_scheduler: Some(false),
             },
@@ -2184,6 +2328,7 @@ mod tests {
         let memory_store = Arc::new(ObjectStore::memory());
         assert!(!memory_store.prefers_lite_scheduler());
         let config = SchedulerConfig {
+            purpose: SchedulerPurpose::Other,
             io_buffer_size_bytes: 256 * 1024 * 1024,
             use_lite_scheduler: None,
         };
@@ -2204,6 +2349,7 @@ mod tests {
         ));
         assert!(uring_store.prefers_lite_scheduler());
         let config = SchedulerConfig {
+            purpose: SchedulerPurpose::Other,
             io_buffer_size_bytes: 256 * 1024 * 1024,
             use_lite_scheduler: None,
         };
@@ -2212,6 +2358,7 @@ mod tests {
 
         // Explicit Some(false) overrides a file+uring:// store's preference
         let config = SchedulerConfig {
+            purpose: SchedulerPurpose::Other,
             io_buffer_size_bytes: 256 * 1024 * 1024,
             use_lite_scheduler: Some(false),
         };
@@ -2220,6 +2367,7 @@ mod tests {
 
         // Explicit Some(true) overrides a memory:// store's preference
         let config = SchedulerConfig {
+            purpose: SchedulerPurpose::Other,
             io_buffer_size_bytes: 256 * 1024 * 1024,
             use_lite_scheduler: Some(true),
         };
@@ -2241,6 +2389,7 @@ mod tests {
 
         // Only one request will be allowed in
         let config = SchedulerConfig {
+            purpose: SchedulerPurpose::Other,
             io_buffer_size_bytes: 1,
             use_lite_scheduler: None,
         };
@@ -2266,6 +2415,7 @@ mod tests {
         // through without blocking, even though a zero budget would normally halt all I/O.
         let obj_store = Arc::new(ObjectStore::memory());
         let config = SchedulerConfig {
+            purpose: SchedulerPurpose::Other,
             io_buffer_size_bytes: 0,
             use_lite_scheduler: Some(false),
         };
@@ -2342,6 +2492,7 @@ mod tests {
 
         // Budget = 10 bytes.
         let config = SchedulerConfig {
+            purpose: SchedulerPurpose::Other,
             io_buffer_size_bytes: 10,
             use_lite_scheduler: Some(false),
         };
@@ -2410,6 +2561,7 @@ mod tests {
         let scheduler = ScanScheduler::new(
             obj_store,
             SchedulerConfig {
+                purpose: SchedulerPurpose::Other,
                 io_buffer_size_bytes: 100,
                 use_lite_scheduler: Some(use_lite_scheduler),
             },
