@@ -1,0 +1,33 @@
+name: Fork Labels
+
+on:
+  # pull_request_target takes both the workflow and the labels from the base
+  # branch, so the check covers every open PR into a release line rather than
+  # only branches cut after it landed. The branch filter is deliberately broad:
+  # the script itself skips lines older than 10.0.0, which is what keeps
+  # release-8.0.0 and release-9.0.0 out, so this file needs no edit when a new
+  # line is cut. The labeled and unlabeled types re-run the check when a label
+  # is fixed, so a failure clears without a push.
+  pull_request_target:
+    types: [opened, reopened, synchronize, labeled, unlabeled]
+    branches:
+      - release-*
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  fork-labels:
+    name: Require fork labels
+    runs-on: ubuntu-latest
+    steps:
+      # Checks out the base branch, not the PR head: under pull_request_target
+      # that is the trusted side, and it is the copy of the script we want to
+      # run. A PR editing the script is therefore checked by the merged
+      # version, not by its own.
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - run: python3 ci/rerun_fork.py check
