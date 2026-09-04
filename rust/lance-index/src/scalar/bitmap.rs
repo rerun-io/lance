@@ -2029,11 +2029,13 @@ mod tests {
         let sorted_row_ids = arrow::compute::take(row_ids.as_ref(), &indices, None).unwrap();
         RecordBatch::try_new(batch.schema(), vec![sorted_values, sorted_row_ids]).unwrap()
     }
+    use crate::scalar::OldIndexDataFilter;
     use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
     use futures::stream;
     use lance_core::utils::{address::RowAddress, tempfile::TempObjDir};
     use lance_io::object_store::ObjectStore;
     use lance_select::RowSetOps;
+    use rand::{Rng, SeedableRng, rngs::SmallRng};
     use rstest::rstest;
 
     fn addr(fragment: u32, offset: u32) -> u64 {
@@ -2385,6 +2387,133 @@ mod tests {
             vec![addr(0, 2), addr(3, 1)]
         );
         assert_eq!(merged.value_type, DataType::Boolean);
+    }
+
+    /// Does `filter` keep `row_addr`? Mirrors
+    /// [`crate::scalar::OldIndexDataFilter::retain_old_rows`], deliberately
+    /// reimplemented so the oracle below is independent of the merge.
+    fn oracle_keeps(filter: &Option<OldIndexDataFilter>, row_addr: u64) -> bool {
+        match filter {
+            Some(OldIndexDataFilter::Fragments { to_keep, .. }) => {
+                to_keep.contains(RowAddress::from(row_addr).fragment_id())
+            }
+            Some(OldIndexDataFilter::RowIds(valid)) => valid.contains(row_addr),
+            None => true,
+        }
+    }
+
+    /// The merge's contract is that its output is the union of its filtered inputs.
+    /// Check exactly that against a brute-force union over many pseudo-random
+    /// shapes: 1-4 segments over a small vocabulary and address space so keys and
+    /// row addresses collide across segments, every filter variant including ones
+    /// that keep nothing, and nulls on either side.
+    ///
+    /// Assertions read `index_map`/`null_map` rather than `search`, to compare what
+    /// the merge wrote and not how a query later resolves a row that is both null
+    /// and non-null.
+    #[tokio::test]
+    async fn test_bitmap_merge_matches_brute_force_union() {
+        const VOCAB: [&str; 5] = ["a", "b", "c", "d", "e"];
+        const FRAGMENTS: u32 = 4;
+
+        for seed in 0..200u64 {
+            let mut rng = SmallRng::seed_from_u64(seed);
+            let rand_row = |rng: &mut SmallRng| {
+                let value = rng
+                    .random_bool(0.8)
+                    .then(|| VOCAB[rng.random_range(0..VOCAB.len())]);
+                let row_addr = addr(rng.random_range(0..FRAGMENTS), rng.random_range(0..8u32));
+                (value, row_addr)
+            };
+
+            let num_segments = rng.random_range(1..=4usize);
+            let mut segment_rows = Vec::with_capacity(num_segments);
+            let mut filters = Vec::with_capacity(num_segments);
+            for _ in 0..num_segments {
+                let rows = (0..rng.random_range(1..=8))
+                    .map(|_| rand_row(&mut rng))
+                    .collect::<Vec<_>>();
+                filters.push(match rng.random_range(0..4) {
+                    0 => None,
+                    1 => Some(OldIndexDataFilter::Fragments {
+                        // The bitmap merge reads only `to_keep`.
+                        to_keep: (0..FRAGMENTS).filter(|_| rng.random_bool(0.6)).collect(),
+                        to_remove: RoaringBitmap::new(),
+                    }),
+                    2 => Some(OldIndexDataFilter::RowIds(
+                        rows.iter()
+                            .filter(|_| rng.random_bool(0.6))
+                            .map(|(_, row_addr)| *row_addr)
+                            .collect(),
+                    )),
+                    _ => Some(OldIndexDataFilter::Fragments {
+                        to_keep: RoaringBitmap::new(),
+                        to_remove: RoaringBitmap::new(),
+                    }),
+                });
+                segment_rows.push(rows);
+            }
+            let new_rows = (0..rng.random_range(0..=6))
+                .map(|_| rand_row(&mut rng))
+                .collect::<Vec<_>>();
+
+            // Brute-force union: surviving old rows plus every new row.
+            let mut expected: HashMap<Option<&str>, RowAddrTreeMap> = HashMap::new();
+            for (rows, filter) in segment_rows.iter().zip(&filters) {
+                for (value, row_addr) in rows {
+                    if oracle_keeps(filter, *row_addr) {
+                        expected.entry(*value).or_default().insert(*row_addr);
+                    }
+                }
+            }
+            for (value, row_addr) in &new_rows {
+                expected.entry(*value).or_default().insert(*row_addr);
+            }
+
+            let mut segments = Vec::with_capacity(num_segments);
+            let mut _dirs = Vec::with_capacity(num_segments);
+            for rows in &segment_rows {
+                let (dir, segment) = train_bitmap_segment(rows).await;
+                _dirs.push(dir);
+                segments.push(segment);
+            }
+
+            let dest_dir = TempObjDir::default();
+            let dest_store = Arc::new(LanceIndexStore::new(
+                Arc::new(ObjectStore::local()),
+                dest_dir.clone(),
+                Arc::new(LanceCache::no_cache()),
+            ));
+            BitmapIndex::merge_segments(
+                &segments,
+                value_row_id_stream(&new_rows),
+                dest_store.as_ref(),
+                &filters,
+            )
+            .await
+            .unwrap();
+            let merged = BitmapIndex::load(dest_store, None, &LanceCache::no_cache())
+                .await
+                .unwrap();
+
+            // A key whose rows were all filtered out is still materialised, with an
+            // empty bitmap, so only a key outside the vocabulary is a fabrication.
+            for value in VOCAB {
+                let key = OrderableScalarValue(ScalarValue::Utf8(Some(value.to_string())));
+                let want = expected.get(&Some(value)).cloned().unwrap_or_default();
+                let got = merged.load_bitmap(&key, None).await.unwrap();
+                assert_eq!(*got, want, "seed {seed}: row sets differ for {value:?}");
+            }
+            assert!(
+                merged.index_map.len() <= VOCAB.len(),
+                "seed {seed}: merge materialised keys outside the vocabulary"
+            );
+            assert_eq!(
+                *merged.null_map,
+                expected.get(&None).cloned().unwrap_or_default(),
+                "seed {seed}: null row sets differ"
+            );
+        }
     }
 
     fn assert_state_roundtrips(state: &BitmapIndexState) {
