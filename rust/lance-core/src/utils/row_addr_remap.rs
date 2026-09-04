@@ -101,6 +101,11 @@ impl RowAddrRemap {
         }
     }
 
+    /// Every fragment whose addresses this remap can answer non-`None` for.
+    ///
+    /// Must never under-report: callers skip a remap entirely for fragments absent from
+    /// this set, so a missing fragment silently drops that fragment's remaps. Over-reporting
+    /// only costs a `get` that answers `None`.
     pub fn affected_fragments(&self) -> RoaringBitmap {
         match self {
             Self::Compact(c) => RoaringBitmap::from_iter(c.frag_to_group.keys().copied()),
@@ -377,6 +382,19 @@ impl CompactRowAddrRemap {
         let frag = (addr >> 32) as u32;
         // Not in any rewrite group -> unaffected by this remap.
         let gi = *self.frag_to_group.get(&frag)?;
+        Some(self.groups[gi].get(frag, addr as u32))
+    }
+
+    /// `(fragment id, group index)` for every fragment this remap rewrote.
+    pub fn frag_groups(&self) -> impl Iterator<Item = (u32, usize)> + '_ {
+        self.frag_to_group.iter().map(|(&f, &g)| (f, g))
+    }
+
+    /// [`Self::get`] for a caller that already knows the fragment's group, skipping the
+    /// `frag_to_group` probe. `gi` must come from [`Self::frag_groups`] for `addr`'s fragment.
+    #[inline]
+    pub fn get_in_group(&self, gi: usize, addr: u64) -> Option<Option<u64>> {
+        let frag = (addr >> 32) as u32;
         Some(self.groups[gi].get(frag, addr as u32))
     }
 

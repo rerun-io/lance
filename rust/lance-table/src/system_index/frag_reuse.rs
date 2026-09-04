@@ -216,12 +216,88 @@ pub struct FragReuseIndex {
     /// [`RowAddrRemap::Compact`] scales with fragment count instead. The index is opened on
     /// the read path and the result cached, so readers pay whichever cost.
     pub row_addr_maps: Vec<RowAddrRemap>,
+    versions_by_fragment: VersionsByFragment,
     pub details: FragReuseIndexDetails,
+}
+
+/// Which reuse versions rewrote each fragment, indexed directly by fragment id so a
+/// lookup is a bounds check and one load. Fragment ids are allocated sequentially, so
+/// the table is dense; it ends at the largest fragment any version rewrote, and an id
+/// past the end was rewritten by no version.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct VersionsByFragment {
+    /// `slots[frag] = (start, len)` window into `entries`.
+    slots: Vec<(u32, u32)>,
+    /// `(version index, group index)` ascending by version. Group index is `u32::MAX`
+    /// for [`RowAddrRemap::Direct`], which has no groups.
+    entries: Vec<(u32, u32)>,
+}
+
+impl VersionsByFragment {
+    fn new(row_addr_maps: &[RowAddrRemap]) -> Self {
+        let per_version: Vec<Vec<(u32, u32)>> = row_addr_maps
+            .iter()
+            .map(|m| match m {
+                RowAddrRemap::Compact(c) => c.frag_groups().map(|(f, g)| (f, g as u32)).collect(),
+                RowAddrRemap::Direct(_) => m
+                    .affected_fragments()
+                    .iter()
+                    .map(|f| (f, u32::MAX))
+                    .collect(),
+            })
+            .collect();
+        let max_frag = per_version.iter().flatten().map(|&(f, _)| f).max();
+        let Some(max_frag) = max_frag else {
+            return Self {
+                slots: Vec::new(),
+                entries: Vec::new(),
+            };
+        };
+        let mut slots = vec![(0u32, 0u32); max_frag as usize + 1];
+        for frags in &per_version {
+            for &(f, _) in frags {
+                slots[f as usize].1 += 1;
+            }
+        }
+        let mut start = 0u32;
+        for slot in slots.iter_mut() {
+            slot.0 = start;
+            start += slot.1;
+            slot.1 = 0;
+        }
+        let mut entries = vec![(0u32, 0u32); start as usize];
+        for (vi, frags) in per_version.iter().enumerate() {
+            for &(f, g) in frags {
+                let slot = &mut slots[f as usize];
+                entries[(slot.0 + slot.1) as usize] = (vi as u32, g);
+                slot.1 += 1;
+            }
+        }
+        Self { slots, entries }
+    }
+
+    /// First version at or after `from` that rewrote `frag`, with that version's group.
+    #[inline]
+    fn first_affecting(&self, frag: u32, from: u32) -> Option<(u32, u32)> {
+        let &(start, len) = self.slots.get(frag as usize)?;
+        self.entries[start as usize..(start + len) as usize]
+            .iter()
+            .find(|(vi, _)| *vi >= from)
+            .copied()
+    }
+}
+
+impl DeepSizeOf for VersionsByFragment {
+    fn deep_size_of_children(&self, cx: &mut Context) -> usize {
+        self.slots.deep_size_of_children(cx) + self.entries.deep_size_of_children(cx)
+    }
 }
 
 impl DeepSizeOf for FragReuseIndex {
     fn deep_size_of_children(&self, cx: &mut Context) -> usize {
-        self.row_addr_maps.deep_size_of_children(cx) + self.details.deep_size_of_children(cx)
+        self.row_addr_maps.deep_size_of_children(cx)
+            + self.versions_by_fragment.deep_size_of_children(cx)
+            + self.details.deep_size_of_children(cx)
     }
 }
 
@@ -248,24 +324,43 @@ impl FragReuseIndex {
         row_addr_maps: Vec<RowAddrRemap>,
         details: FragReuseIndexDetails,
     ) -> Self {
+        let versions_by_fragment = VersionsByFragment::new(&row_addr_maps);
         Self {
             uuid,
             row_addr_maps,
+            versions_by_fragment,
             details,
         }
     }
 
+    /// Walk `row_id` through every reuse version, oldest first: `None` if some version
+    /// deleted it, otherwise its current address. Only versions that rewrote the address'
+    /// current fragment are visited; a version absent from a fragment answers `None` for
+    /// every address in it, which the walk treats as a no-op anyway.
     pub fn remap_row_id(&self, row_id: u64) -> Option<u64> {
-        let mut mapped_value = Some(row_id);
-        for row_addr_map in self.row_addr_maps.iter() {
-            if mapped_value.is_some() {
-                mapped_value = row_addr_map
-                    .get(mapped_value.unwrap())
-                    .unwrap_or(mapped_value);
+        let mut addr = row_id;
+        // Versions are applied in ascending order and never revisited: a remap can land an
+        // address in a fragment an earlier version also rewrote.
+        let mut next_version = 0u32;
+        loop {
+            let frag = (addr >> 32) as u32;
+            let Some((vi, gi)) = self
+                .versions_by_fragment
+                .first_affecting(frag, next_version)
+            else {
+                return Some(addr);
+            };
+            let hit = match &self.row_addr_maps[vi as usize] {
+                RowAddrRemap::Compact(c) => c.get_in_group(gi as usize, addr),
+                RowAddrRemap::Direct(m) => m.get(&addr).copied(),
+            };
+            match hit {
+                None => {}
+                Some(None) => return None,
+                Some(Some(new_addr)) => addr = new_addr,
             }
+            next_version = vi + 1;
         }
-
-        mapped_value
     }
 
     pub fn remap_row_addrs_tree_map(&self, row_addrs: &RowAddrTreeMap) -> RowAddrTreeMap {
@@ -385,6 +480,7 @@ mod tests {
     use arrow_schema::{DataType, Field, Schema};
     use lance_core::utils::address::RowAddress;
     use lance_core::utils::row_addr_remap::GroupInput;
+    use rand::{Rng, SeedableRng, rngs::SmallRng};
     use rstest::rstest;
 
     fn addr(frag: u32, offset: u32) -> u64 {
@@ -652,5 +748,280 @@ mod tests {
                 num_deleted_rows: 0,
             }]
         );
+    }
+
+    /// The pre-index loop, kept verbatim as the oracle for the fuzz below.
+    fn remap_row_id_reference(index: &FragReuseIndex, row_id: u64) -> Option<u64> {
+        let mut mapped_value = Some(row_id);
+        for row_addr_map in index.row_addr_maps.iter() {
+            if mapped_value.is_some() {
+                mapped_value = row_addr_map
+                    .get(mapped_value.unwrap())
+                    .unwrap_or(mapped_value);
+            }
+        }
+        mapped_value
+    }
+
+    /// How many versions answered for `row_id` along the reference walk; proves the fuzz
+    /// reached multi-hop chains rather than only trivial addresses.
+    fn reference_applied_versions(index: &FragReuseIndex, row_id: u64) -> usize {
+        let mut mapped_value = Some(row_id);
+        let mut applied = 0;
+        for row_addr_map in index.row_addr_maps.iter() {
+            let Some(addr) = mapped_value else { break };
+            if let Some(answer) = row_addr_map.get(addr) {
+                applied += 1;
+                mapped_value = answer;
+            }
+        }
+        applied
+    }
+
+    fn first_version(index: &FragReuseIndex, frag: u32, from: u32) -> Option<u32> {
+        index
+            .versions_by_fragment
+            .first_affecting(frag, from)
+            .map(|(vi, _)| vi)
+    }
+
+    #[test]
+    fn test_multi_hop_chain_applies_every_later_version() {
+        // A row moved by version 1 lands in a fragment version 3 rewrites again. Versions 0
+        // and 2 touch unrelated fragments, so the index has to skip them without losing
+        // the second hop.
+        let index = index_from(vec![
+            compact_round(&[(90, 0)], vec![90], vec![(91, 1)]),
+            compact_round(&[(0, 0)], vec![0], vec![(10, 1)]),
+            compact_round(&[(92, 0)], vec![92], vec![(93, 1)]),
+            compact_round(&[(10, 0)], vec![10], vec![(20, 1)]),
+        ]);
+        assert_eq!(index.remap_row_id(addr(0, 0)), Some(addr(20, 0)));
+        assert_eq!(
+            remap_row_id_reference(&index, addr(0, 0)),
+            Some(addr(20, 0))
+        );
+        assert_eq!(reference_applied_versions(&index, addr(0, 0)), 2);
+    }
+
+    #[test]
+    fn test_remap_into_an_earlier_versions_fragment_does_not_replay_it() {
+        // Version 1 moves a row into fragment 5, which version 0 rewrote. Version 0 must
+        // not be applied to it: replaying it would change the answer and let the walk cycle.
+        let index = index_from(vec![
+            compact_round(&[(5, 0)], vec![5], vec![(7, 1)]),
+            compact_round(&[(3, 0)], vec![3], vec![(5, 1)]),
+        ]);
+        assert_eq!(index.remap_row_id(addr(3, 0)), Some(addr(5, 0)));
+        assert_eq!(remap_row_id_reference(&index, addr(3, 0)), Some(addr(5, 0)));
+    }
+
+    #[test]
+    fn test_deletion_short_circuits_later_versions() {
+        // Offset 1 is inside a rewritten fragment but not rewritten, so version 0 reports it
+        // deleted. Version 1 would map that same address somewhere real; it must never run.
+        let index = index_from(vec![
+            compact_round(&[(0, 0)], vec![0], vec![(10, 1)]),
+            RowAddrRemap::direct(HashMap::from_iter([(addr(0, 1), Some(addr(30, 0)))])),
+        ]);
+        assert_eq!(index.remap_row_id(addr(0, 1)), None);
+        assert_eq!(remap_row_id_reference(&index, addr(0, 1)), None);
+        assert_eq!(index.remap_row_id(addr(0, 3)), None);
+        assert_eq!(
+            first_version(&index, 0, 1),
+            Some(1),
+            "version 1 does cover fragment 0"
+        );
+    }
+
+    #[test]
+    fn test_untouched_fragment_costs_no_version_probes() {
+        let index = two_round_index();
+        assert_eq!(index.remap_row_id(addr(5, 5)), Some(addr(5, 5)));
+        // No version covers fragment 5, so the walk returns without consulting a remap.
+        assert_eq!(first_version(&index, 5, 0), None);
+        assert_eq!(first_version(&index, 0, 0), Some(0));
+        assert_eq!(first_version(&index, 10, 0), Some(1));
+        assert_eq!(first_version(&index, 0, 1), None);
+        // Past the table entirely, as a freshly appended fragment would be.
+        assert_eq!(first_version(&index, 1_000_000, 0), None);
+    }
+
+    /// Fragment ids and row offsets the fuzz draws from. Small enough that versions collide,
+    /// chain into each other, and revisit fragments earlier versions already rewrote.
+    const FUZZ_FRAGS: u32 = 10;
+    const FUZZ_ROWS: u32 = 5;
+
+    /// `n` fragment ids not already in `used`, appended to it.
+    fn sample_frags(rng: &mut SmallRng, n: usize, used: &mut Vec<u32>) -> Vec<u32> {
+        let mut out = Vec::with_capacity(n);
+        for _ in 0..(n * 8) {
+            if out.len() == n {
+                break;
+            }
+            let frag = rng.random_range(0..FUZZ_FRAGS);
+            if !used.contains(&frag) {
+                used.push(frag);
+                out.push(frag);
+            }
+        }
+        out
+    }
+
+    fn random_compact(rng: &mut SmallRng) -> RowAddrRemap {
+        // Old fragments are drawn without replacement across groups: a fragment in two
+        // groups of one remap is malformed input, not a case worth fuzzing.
+        let mut used_old = Vec::new();
+        let mut groups = Vec::new();
+        for _ in 0..rng.random_range(1..=2) {
+            let wanted_old = rng.random_range(1..=2);
+            let old_frag_ids = sample_frags(rng, wanted_old, &mut used_old);
+            if old_frag_ids.is_empty() {
+                continue;
+            }
+            // Offsets left out are the rows the rewrite deleted.
+            let mut rewritten = RoaringTreemap::new();
+            for &frag in &old_frag_ids {
+                for offset in 0..FUZZ_ROWS {
+                    if rng.random_bool(0.6) {
+                        rewritten.insert(addr(frag, offset));
+                    }
+                }
+            }
+            // New fragments come from the same id space, so later versions rewrite them.
+            let total = rewritten.len() as u32;
+            let mut new_frags = Vec::new();
+            if total > 0 {
+                let wanted = (rng.random_range(1..=2) as u32).min(total) as usize;
+                let mut ids = sample_frags(rng, wanted, &mut Vec::new());
+                ids.sort_unstable();
+                let parts = ids.len() as u32;
+                for (i, id) in ids.into_iter().enumerate() {
+                    let rows = total / parts + u32::from((i as u32) < total % parts);
+                    new_frags.push((id, rows));
+                }
+            }
+            groups.push(GroupInput {
+                rewritten_old_row_addrs: rewritten,
+                old_frag_ids,
+                new_frags,
+            });
+        }
+        RowAddrRemap::compact(groups).unwrap()
+    }
+
+    fn random_direct(rng: &mut SmallRng) -> RowAddrRemap {
+        let mut map = HashMap::new();
+        for _ in 0..rng.random_range(0..8) {
+            let key = addr(
+                rng.random_range(0..FUZZ_FRAGS),
+                rng.random_range(0..FUZZ_ROWS),
+            );
+            let value = (!rng.random_bool(0.3)).then(|| {
+                addr(
+                    rng.random_range(0..FUZZ_FRAGS),
+                    rng.random_range(0..FUZZ_ROWS),
+                )
+            });
+            map.insert(key, value);
+        }
+        RowAddrRemap::direct(map)
+    }
+
+    #[test]
+    fn test_remap_row_id_matches_reference_over_random_indices() {
+        const TRIALS: u64 = 3000;
+
+        let mut probes = 0u64;
+        let mut moved = 0u64;
+        let mut deleted = 0u64;
+        let mut chained = 0u64;
+
+        for seed in 0..TRIALS {
+            let mut rng = SmallRng::seed_from_u64(seed);
+            let maps = (0..rng.random_range(0..8))
+                .map(|_| {
+                    if rng.random_bool(0.5) {
+                        random_direct(&mut rng)
+                    } else {
+                        random_compact(&mut rng)
+                    }
+                })
+                .collect::<Vec<_>>();
+            let index = index_from(maps);
+
+            // The table's own shape: it ends at the last rewritten fragment, and each
+            // window is strictly ascending by version or `first_affecting` misdirects.
+            let vbf = &index.versions_by_fragment;
+            if let Some(&(_, last_len)) = vbf.slots.last() {
+                assert!(
+                    last_len > 0,
+                    "seed {seed}: table extends past the last rewritten fragment"
+                );
+            }
+            for &(start, len) in &vbf.slots {
+                let window = &vbf.entries[start as usize..][..len as usize];
+                assert!(
+                    window.windows(2).all(|pair| pair[0].0 < pair[1].0),
+                    "seed {seed}: window {window:?} is not strictly ascending"
+                );
+            }
+
+            // Probe past both bounds so unaffected fragments and unaffected offsets inside
+            // affected fragments are covered, plus one address in no fragment at all.
+            let addrs = (0..=FUZZ_FRAGS + 1)
+                .flat_map(|frag| (0..=FUZZ_ROWS + 1).map(move |offset| addr(frag, offset)))
+                .chain([addr(1_000_000, 7)]);
+            for probe in addrs {
+                let expected = remap_row_id_reference(&index, probe);
+                assert_eq!(
+                    index.remap_row_id(probe),
+                    expected,
+                    "seed {seed}, addr {probe:#x}, index {index:?}"
+                );
+
+                // Requirement the optimization rests on: any version that answers for an
+                // address must be listed against that address' fragment -- checked along
+                // the addresses actually reached, not just the starting one.
+                let mut cur = Some(probe);
+                for (vi, map) in index.row_addr_maps.iter().enumerate() {
+                    let Some(a) = cur else { break };
+                    if let Some(answer) = map.get(a) {
+                        let frag = (a >> 32) as u32;
+                        let listed = vbf
+                            .slots
+                            .get(frag as usize)
+                            .map(|&(start, len)| {
+                                vbf.entries[start as usize..][..len as usize]
+                                    .iter()
+                                    .any(|&(v, _)| v == vi as u32)
+                            })
+                            .unwrap_or(false);
+                        assert!(
+                            listed,
+                            "seed {seed}: version {vi} answers for fragment {frag} but is not \
+                             indexed against it"
+                        );
+                        cur = answer;
+                    }
+                }
+
+                probes += 1;
+                match expected {
+                    None => deleted += 1,
+                    Some(landed) if landed != probe => moved += 1,
+                    Some(_) => {}
+                }
+                if reference_applied_versions(&index, probe) >= 2 {
+                    chained += 1;
+                }
+            }
+        }
+
+        // Without these the run could be thousands of no-op indices proving nothing.
+        assert!(probes > 100_000, "only {probes} probes");
+        assert!(moved > 1_000, "only {moved} addresses moved");
+        assert!(deleted > 1_000, "only {deleted} addresses deleted");
+        assert!(chained > 1_000, "only {chained} multi-version chains");
     }
 }
