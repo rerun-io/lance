@@ -1126,6 +1126,16 @@ impl BitmapBatchWriter {
     /// Serialize and buffer a single (key, bitmap) pair, flushing the current
     /// batch to disk if adding it would exceed MAX_BITMAP_ARRAY_LENGTH.
     async fn emit(&mut self, key: ScalarValue, bitmap: &RowAddrTreeMap) -> Result<()> {
+        // An old-data filter can remove every row of a key. Writing that key
+        // anyway would put it back into `index_map` on load -- which is built
+        // from the keys column alone and so cannot tell it from a live key --
+        // where nothing prunes it, and each later merge would re-read and
+        // re-emit it. Both filter variants drop emptied fragments, so an
+        // `is_empty` set really holds no rows.
+        if bitmap.is_empty() {
+            return Ok(());
+        }
+
         let mut buf = Vec::new();
         bitmap.serialize_into(&mut buf).unwrap();
         let size = buf.len();
@@ -2537,6 +2547,58 @@ mod tests {
                 "seed {seed}: null row sets differ"
             );
         }
+    }
+
+    /// A key whose every row the filter removes must not be materialised: `load`
+    /// builds `index_map` from the keys column alone, so it would come back as a
+    /// live directory entry that nothing prunes.
+    #[tokio::test]
+    async fn test_bitmap_merge_drops_emptied_keys() {
+        let (_dir, segment) = train_bitmap_segment(&[
+            (Some("kept"), addr(0, 0)),
+            (Some("gone"), addr(5, 0)),
+            (None, addr(5, 1)),
+        ])
+        .await;
+
+        // Fragment 5 is retired, so "gone" and the null row lose every row.
+        let filters = vec![Some(OldIndexDataFilter::Fragments {
+            to_keep: RoaringBitmap::from_iter([0u32]),
+            to_remove: RoaringBitmap::from_iter([5u32]),
+        })];
+
+        let dest_dir = TempObjDir::default();
+        let dest_store = Arc::new(LanceIndexStore::new(
+            Arc::new(ObjectStore::local()),
+            dest_dir.clone(),
+            Arc::new(LanceCache::no_cache()),
+        ));
+        BitmapIndex::merge_segments(
+            &[segment],
+            value_row_id_stream(&[]),
+            dest_store.as_ref(),
+            &filters,
+        )
+        .await
+        .unwrap();
+        let merged = BitmapIndex::load(dest_store, None, &LanceCache::no_cache())
+            .await
+            .unwrap();
+
+        assert_eq!(
+            merged
+                .index_map
+                .keys()
+                .map(|key| key.0.to_string())
+                .collect::<Vec<_>>(),
+            vec!["kept"],
+            "an emptied key must not be materialised"
+        );
+        assert_eq!(search_addrs(&merged, Some("kept")).await, vec![addr(0, 0)]);
+        assert!(
+            merged.null_map.is_empty(),
+            "an emptied null row must not be materialised"
+        );
     }
 
     /// A row set too large for an `i32` offset must be reported, not panicked on
