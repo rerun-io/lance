@@ -1080,6 +1080,28 @@ impl ScalarIndex for BitmapIndex {
     }
 }
 
+/// One value's serialized row set has to fit a single `BinaryArray` element,
+/// whose offsets are `i32`, so it cannot reach `MAX_BITMAP_ARRAY_LENGTH`.
+///
+/// The batch-level check in [`BitmapBatchWriter::emit`] bounds only the
+/// accumulated buffer, and flushing an empty buffer changes nothing, so an
+/// oversized single entry would otherwise reach `BinaryBuilder::append_value`
+/// and panic in `next_offset` with "byte array offset overflow".
+///
+/// Reachable on a large, low-cardinality column: a value's row set costs at
+/// most one bit per row of the offset space it spans, so a scattered boolean
+/// crosses the limit somewhere past `8 * i32::MAX` rows.
+fn check_bitmap_entry_size(key: &ScalarValue, size: usize) -> Result<()> {
+    if size > MAX_BITMAP_ARRAY_LENGTH {
+        return Err(Error::not_supported(format!(
+            "bitmap index: the row set for value {key} serializes to {size} bytes, \
+             over the {MAX_BITMAP_ARRAY_LENGTH} byte limit for one index entry \
+             (a BinaryArray element is addressed by an i32 offset)"
+        )));
+    }
+    Ok(())
+}
+
 /// Buffers serialized (key, bitmap) pairs and flushes them as record batches
 /// to the index file, respecting the MAX_BITMAP_ARRAY_LENGTH limit.
 struct BitmapBatchWriter {
@@ -1107,6 +1129,7 @@ impl BitmapBatchWriter {
         let mut buf = Vec::new();
         bitmap.serialize_into(&mut buf).unwrap();
         let size = buf.len();
+        check_bitmap_entry_size(&key, size)?;
 
         if self.bytes + size > MAX_BITMAP_ARRAY_LENGTH {
             self.flush().await?;
@@ -2514,6 +2537,23 @@ mod tests {
                 "seed {seed}: null row sets differ"
             );
         }
+    }
+
+    /// A row set too large for an `i32` offset must be reported, not panicked on
+    /// inside the Arrow builder.
+    #[test]
+    fn test_bitmap_entry_size_limit() {
+        let key = ScalarValue::Utf8(Some("wide".to_string()));
+        assert!(check_bitmap_entry_size(&key, MAX_BITMAP_ARRAY_LENGTH).is_ok());
+
+        let err = check_bitmap_entry_size(&key, MAX_BITMAP_ARRAY_LENGTH + 1).unwrap_err();
+        assert!(
+            matches!(err, Error::NotSupported { .. }),
+            "expected NotSupported, got {err:?}"
+        );
+        let message = err.to_string();
+        assert!(message.contains("wide"), "{message}");
+        assert!(message.contains("i32 offset"), "{message}");
     }
 
     fn assert_state_roundtrips(state: &BitmapIndexState) {
