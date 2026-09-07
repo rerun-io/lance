@@ -62,6 +62,10 @@ const BITMAP_PART_LOOKUP_SUFFIX: &str = "_bitmap_page_lookup.lance";
 const EXPLICIT_SHARD_ID_TAG: u64 = 0;
 const IMPLICIT_FRAGMENT_ID_TAG: u64 = 1;
 
+/// Ceiling on the bytes one `bitmaps` column can hold, since a `BinaryArray`
+/// addresses its elements with `i32` offsets. It bounds two different things:
+/// a single entry, checked by [`check_bitmap_entry_size`], and the accumulated
+/// buffer, which is what makes [`BitmapBatchWriter`] flush.
 const MAX_BITMAP_ARRAY_LENGTH: usize = i32::MAX as usize - 1024 * 1024; // leave headroom
 
 const MAX_ROWS_PER_CHUNK: usize = 2 * 1024;
@@ -1143,6 +1147,26 @@ fn check_bitmap_entry_size(key: &ScalarValue, size: usize) -> Result<()> {
 
 /// Buffers serialized (key, bitmap) pairs and flushes them as record batches
 /// to the index file, respecting the MAX_BITMAP_ARRAY_LENGTH limit.
+///
+/// # Memory
+///
+/// The flush trigger is that limit and nothing smaller, so an index under
+/// ~2.15 GB is written as one record batch and every serialized row set in it
+/// is resident until [`Self::finish`]. `flush` then allocates a `BinaryBuilder`
+/// of the full buffered size while `serialized` is still live, so the peak is
+/// about twice the buffered bytes. Callers that stream their input one key at a
+/// time -- [`BitmapIndexPlugin::streaming_build_and_write`] -- are therefore
+/// bounded by their output, not by their input.
+///
+/// A smaller flush target would bound that, and multi-batch lookup files are
+/// already valid: row offsets stay global, [`BitmapIndex::load`] streams the
+/// keys column across batches, and [`merge_index_files`] writes such files
+/// today. It is not obviously a win, though. Batch boundaries force page
+/// breaks, and `IndexReader::read_range` builds a decode plan whose
+/// initialization is proportional to the pages in the column rather than to
+/// the range asked for, so page count is a cost on every single-key read in
+/// [`BitmapIndex::load_bitmap`], not just on whole-file scans. Which way the
+/// trade lands has not been measured.
 struct BitmapBatchWriter {
     file: Box<dyn super::IndexWriter>,
     keys: Vec<ScalarValue>,
@@ -1672,12 +1696,18 @@ impl BitmapIndexPlugin {
     }
 
     /// Builds and writes a bitmap index in a streaming fashion from value-sorted
-    /// input. Only one value's bitmap is in memory at a time, reducing peak memory
-    /// from O(unique_values * avg_bitmap) to O(largest_single_bitmap).
+    /// input.
     ///
     /// `old_segments` are merged with the new data via a k-way sorted merge-join
     /// (each segment's index_map is a BTreeMap, already sorted by value), so the
-    /// peak stays at one posting per segment plus the union being emitted.
+    /// input side holds one row set per segment for the key being unioned, plus
+    /// that union, rather than all of them at once.
+    ///
+    /// That bounds what is read, not what is written: [`BitmapBatchWriter`] keeps
+    /// every serialized row set until it flushes, so the whole output index is
+    /// resident for any index below `MAX_BITMAP_ARRAY_LENGTH`. See its `Memory`
+    /// section. Each segment's `index_map` also stays resident for the merge,
+    /// which dominates on a high-cardinality column.
     async fn streaming_build_and_write(
         mut data_source: SendableRecordBatchStream,
         old_segments: Vec<OldSegment<'_>>,
