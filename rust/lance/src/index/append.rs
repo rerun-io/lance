@@ -4190,6 +4190,108 @@ mod tests {
             .unwrap() as usize
     }
 
+    async fn count_rows_where(dataset: &Dataset, predicate: &str) -> usize {
+        dataset
+            .scan()
+            .filter(predicate)
+            .unwrap()
+            .count_rows()
+            .await
+            .unwrap() as usize
+    }
+
+    /// `id` ascending, `cat` cycling through A/B/C/NULL.
+    fn id_cat_nullable_batch(schema: &Arc<Schema>, range: std::ops::Range<i32>) -> RecordBatch {
+        RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from_iter_values(range.clone())),
+                Arc::new(StringArray::from_iter(
+                    range.map(|i| ["A", "B", "C"].get((i % 4) as usize).copied()),
+                )),
+            ],
+        )
+        .unwrap()
+    }
+
+    /// The K-way merge over a nullable column: nulls must survive consolidation of
+    /// several segments plus an unindexed tail, and `IS NULL` is served from
+    /// `null_map`, which is filled separately from the value row sets.
+    #[tokio::test]
+    async fn test_optimize_bitmap_multi_segment_merge_keeps_nulls() {
+        let test_dir = TempStrDir::default();
+        let test_uri = test_dir.as_str();
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("cat", DataType::Utf8, true),
+        ]));
+
+        // 36 rows over three 12-row fragments; every fourth row is null.
+        let reader = RecordBatchIterator::new(
+            vec![
+                Ok(id_cat_nullable_batch(&schema, 0..12)),
+                Ok(id_cat_nullable_batch(&schema, 12..24)),
+                Ok(id_cat_nullable_batch(&schema, 24..36)),
+            ],
+            schema.clone(),
+        );
+        let mut dataset = Dataset::write(
+            reader,
+            test_uri,
+            Some(WriteParams {
+                max_rows_per_file: 12,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(dataset.get_fragments().len(), 3);
+
+        commit_bitmap_segment_per_fragment(&mut dataset, "cat_idx").await;
+        dataset
+            .append(
+                RecordBatchIterator::new(
+                    vec![Ok(id_cat_nullable_batch(&schema, 36..48))],
+                    schema.clone(),
+                ),
+                None,
+            )
+            .await
+            .unwrap();
+
+        dataset
+            .optimize_indices(&OptimizeOptions::merge(200))
+            .await
+            .unwrap();
+
+        let dataset = DatasetBuilder::from_uri(test_uri).load().await.unwrap();
+        assert_eq!(
+            dataset.load_indices_by_name("cat_idx").await.unwrap().len(),
+            1,
+            "the merge must consolidate every bitmap segment"
+        );
+
+        // 48 rows cycling A/B/C/NULL: 12 of each.
+        for cat in ["A", "B", "C"] {
+            assert_eq!(
+                count_cat(&dataset, cat).await,
+                12,
+                "wrong row count for cat = {cat} after merging a nullable column"
+            );
+        }
+        assert_eq!(
+            count_rows_where(&dataset, "cat IS NULL").await,
+            12,
+            "nulls lost across the bitmap merge"
+        );
+        assert_eq!(
+            count_rows_where(&dataset, "cat IS NOT NULL").await,
+            36,
+            "IS NOT NULL disagrees with the value row sets"
+        );
+        assert_eq!(dataset.scan().count_rows().await.unwrap(), 48);
+    }
+
     /// A 200-way merge over three Bitmap segments plus an unindexed fragment must
     /// consolidate into one segment (via the N:1 segment-merge primitive) and keep
     /// every posting.

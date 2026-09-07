@@ -1080,6 +1080,45 @@ impl ScalarIndex for BitmapIndex {
     }
 }
 
+/// Enforce the ordering a bitmap build requires, once per value change.
+///
+/// A run is a maximal group of equal keys, so reopening a run for a key already
+/// written loses rows silently: `BitmapIndex::load` keys `index_map` by value and
+/// keeps only the last of the two file offsets. The same holds for nulls, which
+/// `load` funnels into `null_map` from the last null entry it sees.
+///
+/// Only the non-null keys have to ascend. Nulls are collected separately rather
+/// than merge-joined by value, so a single null run is correct wherever it falls,
+/// which lets a caller sort nulls first or last. `null_run_closed` says whether one
+/// has already been flushed, making a second run detectable.
+///
+/// Both keys come from the same column, so they share a `ScalarValue` variant and
+/// `OrderableScalarValue`'s `Ord` cannot panic comparing them.
+fn check_run_order(
+    previous: &ScalarValue,
+    next: &ScalarValue,
+    null_run_closed: bool,
+) -> Result<()> {
+    if next.is_null() {
+        if null_run_closed {
+            return Err(Error::invalid_input(
+                "bitmap index: input is not sorted by value, it has more than one run of nulls"
+                    .to_string(),
+            ));
+        }
+        return Ok(());
+    }
+    if previous.is_null() {
+        return Ok(());
+    }
+    if OrderableScalarValue(next.clone()) <= OrderableScalarValue(previous.clone()) {
+        return Err(Error::invalid_input(format!(
+            "bitmap index: input must be sorted by value, but {next} follows {previous}"
+        )));
+    }
+    Ok(())
+}
+
 /// One value's serialized row set has to fit a single `BinaryArray` element,
 /// whose offsets are `i32`, so it cannot reach `MAX_BITMAP_ARRAY_LENGTH`.
 ///
@@ -1680,6 +1719,7 @@ impl BitmapIndexPlugin {
                     _ => {
                         // Value changed — flush the previous run.
                         if let Some(prev_key) = current_key.take() {
+                            check_run_order(&prev_key, &key, emitted_null)?;
                             let mut prev_bitmap = std::mem::take(&mut current_bitmap);
                             Self::finish_run(
                                 prev_key,
@@ -2324,7 +2364,10 @@ mod tests {
         .await;
         let (_dir1, seg1) =
             train_bitmap_segment(&[(Some("blue"), addr(1, 0)), (None, addr(1, 1))]).await;
-        let (_dir2, seg2) = train_bitmap_segment(&[(Some("green"), addr(2, 0))]).await;
+        // seg2's null survives, so two old segments contribute nulls and the fold
+        // cannot pass by reading only the first.
+        let (_dir2, seg2) =
+            train_bitmap_segment(&[(Some("green"), addr(2, 0)), (None, addr(2, 1))]).await;
 
         // seg1's null row (1,1) is deleted: the allow-list omits it.
         let mut still_valid = RowAddrTreeMap::new();
@@ -2360,7 +2403,7 @@ mod tests {
 
         assert_eq!(
             search_addrs(&merged, None).await,
-            vec![addr(0, 1), addr(0, 2), addr(3, 0), addr(3, 2)]
+            vec![addr(0, 1), addr(0, 2), addr(2, 1), addr(3, 0), addr(3, 2)]
         );
         assert_eq!(
             search_addrs(&merged, Some("red")).await,
@@ -2599,6 +2642,52 @@ mod tests {
             merged.null_map.is_empty(),
             "an emptied null row must not be materialised"
         );
+    }
+
+    /// Unsorted input must be rejected. It would reopen a run for a key already
+    /// written, and `load` keeps only the last file offset per key, so the earlier
+    /// row set would vanish silently. Nulls may lead or trail, but only once.
+    #[rstest]
+    #[case::value_reappears(vec![Some("a"), Some("b"), Some("a")], "a follows b")]
+    #[case::two_null_runs(vec![None, Some("a"), None], "more than one run of nulls")]
+    #[tokio::test]
+    async fn test_bitmap_build_rejects_unsorted_input(
+        #[case] values: Vec<Option<&str>>,
+        #[case] expected: &str,
+    ) {
+        let schema = value_row_id_schema(DataType::Utf8);
+        let row_addrs = (0..values.len() as u32)
+            .map(|i| addr(0, i))
+            .collect::<Vec<_>>();
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(StringArray::from(values)),
+                Arc::new(UInt64Array::from(row_addrs)),
+            ],
+        )
+        .unwrap();
+        let unsorted: SendableRecordBatchStream = Box::pin(RecordBatchStreamAdapter::new(
+            schema,
+            stream::once(async move { Ok(batch) }),
+        ));
+
+        let tmpdir = TempObjDir::default();
+        let store = Arc::new(LanceIndexStore::new(
+            Arc::new(ObjectStore::local()),
+            tmpdir.clone(),
+            Arc::new(LanceCache::no_cache()),
+        ));
+        let Err(err) = BitmapIndexPlugin::train_bitmap_index(unsorted, store.as_ref()).await else {
+            panic!("expected unsorted input to be rejected");
+        };
+        assert!(
+            matches!(err, Error::InvalidInput { .. }),
+            "expected InvalidInput, got {err:?}"
+        );
+        let message = err.to_string();
+        assert!(message.contains("sorted by value"), "{message}");
+        assert!(message.contains(expected), "{message}");
     }
 
     /// A row set too large for an `i32` offset must be reported, not panicked on
