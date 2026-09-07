@@ -2396,7 +2396,7 @@ fn build_frag_reuse_mapping(
     row_ids: &UInt64Array,
 ) -> Option<HashMap<u64, Option<u64>>> {
     let fri = fri?;
-    if fri.row_id_maps.is_empty() {
+    if fri.row_addr_maps.is_empty() {
         return None;
     }
     let mut mapping: HashMap<u64, Option<u64>> = HashMap::new();

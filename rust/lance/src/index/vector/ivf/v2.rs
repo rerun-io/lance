@@ -6549,7 +6549,15 @@ mod tests {
     ) -> HashSet<lance_core::cache::InternalCacheKey> {
         use lance_core::cache::{CacheKey, CacheNamespace, KeyBuilder, UnsizedCacheKey};
 
-        let mut namespace = CacheNamespace::root().child(dataset_uri);
+        // Mirrors `GlobalIndexCache::for_dataset_with_remap_mode`: a dataset's index cache is
+        // namespaced by URI *and* fragment-reuse remap form, each its own framed segment.
+        // These datasets take the process default, so read the form from the same place rather
+        // than naming one here, and spell it with the same function production uses.
+        let mut namespace = CacheNamespace::root().child(dataset_uri).child(
+            crate::session::index_caches::remap_mode_segment(
+                crate::dataset::default_frag_reuse_remap_mode(),
+            ),
+        );
         namespace = namespace.child(uuid.as_hyphenated().to_string().as_str());
         if let Some(fri_uuid) = fri_uuid {
             namespace = namespace.child(fri_uuid.as_hyphenated().to_string().as_str());

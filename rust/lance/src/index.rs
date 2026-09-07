@@ -87,7 +87,7 @@ use crate::dataset::optimize::RemappedIndex;
 use crate::dataset::optimize::remapping::RemapResult;
 use crate::dataset::transaction::{Operation, Transaction, TransactionBuilder};
 pub use crate::index::api::{DatasetIndexExt, IndexSegment, IntoIndexSegment};
-use crate::index::frag_reuse::{load_frag_reuse_index_details, open_frag_reuse_index};
+use crate::index::frag_reuse::{load_frag_reuse_index_details, open_frag_reuse_index_with_mode};
 use crate::index::mem_wal::open_mem_wal_index;
 pub use crate::index::prefilter::{FilterLoader, PreFilter};
 use crate::index::scalar::{IndexDetails, fetch_index_details, load_training_data};
@@ -1494,7 +1494,7 @@ impl DatasetIndexExt for Dataset {
             store_identity: &self.object_store.store_prefix,
         };
         let mut indices = self
-            .index_cache
+            .manifest_index_cache
             .get_or_insert_with_key(metadata_key, || async {
                 let mut loaded_indices = read_manifest_indexes(
                     &self.object_store,
@@ -1515,7 +1515,10 @@ impl DatasetIndexExt for Dataset {
             infer_missing_vector_details(self, &mut updated).await;
             if updated != *indices {
                 indices = Arc::new(updated);
-                self.index_cache
+                // Written back through the same handle it was read from. The remap-partitioned
+                // handle would put it where no reader looks, so inference would never be
+                // observed and would leave an unreachable entry behind.
+                self.manifest_index_cache
                     .insert_with_key(&metadata_key, indices.clone())
                     .await;
             }
@@ -1524,6 +1527,9 @@ impl DatasetIndexExt for Dataset {
         if let Some(frag_reuse_index_meta) =
             indices.iter().find(|idx| idx.name == FRAG_REUSE_INDEX_NAME)
         {
+            // Isolation between the two forms comes from the cache's own prefix, which the
+            // dataset built with its remap mode, so the key itself needs only the uuid.
+            let mode = self.frag_reuse_remap_mode;
             let fri_key = FragReuseIndexKey {
                 uuid: &frag_reuse_index_meta.uuid,
             };
@@ -1532,7 +1538,12 @@ impl DatasetIndexExt for Dataset {
                 .get_or_insert_with_key(fri_key, || async move {
                     let index_details =
                         load_frag_reuse_index_details(self, frag_reuse_index_meta).await?;
-                    open_frag_reuse_index(frag_reuse_index_meta.uuid, index_details.as_ref()).await
+                    open_frag_reuse_index_with_mode(
+                        frag_reuse_index_meta.uuid,
+                        index_details.as_ref(),
+                        mode,
+                    )
+                    .await
                 })
                 .await?;
             let mut indices = indices.as_ref().clone();
@@ -2740,6 +2751,7 @@ impl DatasetIndexInternalExt for Dataset {
     ) -> Result<Option<Arc<FragReuseIndex>>> {
         if let Some(frag_reuse_index_meta) = self.load_index_by_name(FRAG_REUSE_INDEX_NAME).await? {
             let frag_reuse_uuid = frag_reuse_index_meta.uuid;
+            let mode = self.frag_reuse_remap_mode;
             let frag_reuse_key = FragReuseIndexKey {
                 uuid: &frag_reuse_uuid,
             };
@@ -2749,9 +2761,12 @@ impl DatasetIndexInternalExt for Dataset {
                 .get_or_insert_with_key(frag_reuse_key, || async move {
                     let index_details =
                         load_frag_reuse_index_details(self, &frag_reuse_index_meta).await?;
-                    let index =
-                        open_frag_reuse_index(frag_reuse_index_meta.uuid, index_details.as_ref())
-                            .await?;
+                    let index = open_frag_reuse_index_with_mode(
+                        frag_reuse_index_meta.uuid,
+                        index_details.as_ref(),
+                        mode,
+                    )
+                    .await?;
 
                     info!(target: TRACE_IO_EVENTS, index_uuid=%frag_reuse_uuid, r#type=IO_TYPE_OPEN_FRAG_REUSE);
                     metrics.record_index_load();
@@ -4745,8 +4760,15 @@ mod tests {
         assert!(frag_reuse_index.is_some());
     }
 
+    /// Both forms of an all-rows-deleted remap. This is the one place `fully_deleted_fragments`
+    /// decides the outcome -- `remap_index` returns `Keep` when it equals the index's fragment
+    /// bitmap -- and the two arms compute it differently: `Direct` infers the set from whichever
+    /// keys are present, `Compact` reads it off the fragments the groups cover.
+    #[rstest]
+    #[case::direct(all_deleted_direct())]
+    #[case::compact(all_deleted_compact())]
     #[tokio::test]
-    async fn test_remap_empty() {
+    async fn test_remap_empty(#[case] remap: RowAddrRemap) {
         let data = gen_batch()
             .col("int", array::step::<Int32Type>())
             .col(
@@ -4762,14 +4784,29 @@ mod tests {
             .await
             .unwrap();
 
+        // The remaps below name fragment 0 and its 256 rows; keep that honest.
+        assert_eq!(dataset.count_all_rows().await.unwrap(), 256);
+        assert_eq!(dataset.get_fragments().len(), 1);
+
         let index_uuid = dataset.load_indices().await.unwrap()[0].uuid;
-        let remap_to_empty = (0..dataset.count_all_rows().await.unwrap())
-            .map(|i| (i as u64, None))
-            .collect::<HashMap<_, _>>();
-        let new_uuid = remap_index(&dataset, &index_uuid, &RowAddrRemap::direct(remap_to_empty))
-            .await
-            .unwrap();
+        let new_uuid = remap_index(&dataset, &index_uuid, &remap).await.unwrap();
         assert_eq!(new_uuid, RemapResult::Keep(index_uuid));
+    }
+
+    /// Every row of the single fragment mapped to deleted, enumerated.
+    fn all_deleted_direct() -> RowAddrRemap {
+        RowAddrRemap::direct((0..256u64).map(|row| (row, None)).collect())
+    }
+
+    /// The same thing said structurally: fragment 0 covered, nothing rewritten out of it, so
+    /// every address it holds is deleted without enumerating any of them.
+    fn all_deleted_compact() -> RowAddrRemap {
+        RowAddrRemap::compact([lance_core::utils::row_addr_remap::GroupInput {
+            rewritten_old_row_addrs: roaring::RoaringTreemap::new(),
+            old_frag_ids: vec![0],
+            new_frags: vec![],
+        }])
+        .unwrap()
     }
 
     #[tokio::test]
@@ -5134,7 +5171,7 @@ mod tests {
             store_identity: &dataset.object_store.store_prefix,
         };
         dataset
-            .index_cache
+            .manifest_index_cache
             .insert_with_key(&metadata_key, Arc::new(indices))
             .await;
         dataset.delete("false").await.unwrap();
@@ -5202,6 +5239,81 @@ mod tests {
         );
         let descriptions = dataset.describe_indices(None).await.unwrap();
         assert_eq!(descriptions[0].index_type(), inferred_type);
+    }
+
+    /// `load_indices` reads the manifest's index list from the unpartitioned handle, because
+    /// that list is not translated through the fragment reuse index and the prefetch in
+    /// `load_manifest` writes it there before any remap form is known. The inferred list has
+    /// to go back to that same handle: on the remap-partitioned one it lands where no reader
+    /// looks, so inference is never observed and an unreachable entry is left behind.
+    ///
+    /// Seeds the cache directly rather than doctoring the manifest, because a committed
+    /// manifest gets its details inferred and persisted, after which inference is a no-op and
+    /// the write-back branch is never entered -- which is why
+    /// `test_legacy_vector_index_details_inferred_on_load_and_migration` does not cover this.
+    ///
+    /// Only the read-back half is assertable. "No unreachable entry in the partitioned
+    /// namespace" is not: there is no namespace-scoped size or key enumeration to inspect.
+    /// That half holds by inspection -- there is exactly one write, to this handle.
+    #[tokio::test]
+    async fn test_load_indices_writes_inferred_details_back_where_it_reads_them() {
+        use lance_linalg::distance::DistanceType;
+
+        let test_dir = lance_core::utils::tempfile::TempDir::default();
+        let test_uri = test_dir.path_str();
+        let data = gen_batch()
+            .col("vec", array::rand_vec::<Float32Type>(16.into()))
+            .into_reader_rows(RowCount::from(256), BatchCount::from(1));
+        let mut dataset = Dataset::write(data, &test_uri, None).await.unwrap();
+        dataset
+            .create_index(
+                &["vec"],
+                IndexType::Vector,
+                None,
+                &VectorIndexParams::ivf_pq(1, 8, 1, DistanceType::L2, 1),
+                false,
+            )
+            .await
+            .unwrap();
+
+        // A legacy-shaped list: `VectorIndexDetails` with an empty value, which is what
+        // `needs_vector_details_inference` looks for.
+        let mut legacy = dataset.load_indices().await.unwrap().as_ref().clone();
+        for idx in &mut legacy {
+            idx.index_details = Some(Arc::new(vector_index_details_default()));
+        }
+        assert!(
+            legacy[0].index_details.as_ref().unwrap().value.is_empty(),
+            "the seeded list must actually need inference"
+        );
+
+        let metadata_key = crate::session::index_caches::IndexMetadataKey {
+            version: dataset.version().version,
+            store_identity: &dataset.object_store.store_prefix,
+        };
+        dataset
+            .manifest_index_cache
+            .insert_with_key(&metadata_key, Arc::new(legacy))
+            .await;
+
+        // Reads the seeded list, infers, and writes the result back.
+        dataset.load_indices().await.unwrap();
+
+        let cached = dataset
+            .manifest_index_cache
+            .get_with_key(&metadata_key)
+            .await
+            .expect("the manifest index list is cached on this handle");
+        assert!(
+            !cached[0]
+                .index_details
+                .as_ref()
+                .expect("cached entry should carry details")
+                .value
+                .is_empty(),
+            "the cached list still has empty details, so the inferred list was written to a \
+             handle that no reader reads"
+        );
     }
 
     #[tokio::test]

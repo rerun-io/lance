@@ -12,6 +12,7 @@
 
 use std::{borrow::Cow, ops::Deref, sync::Arc};
 
+use crate::dataset::optimize::IndexRemapMode;
 use lance_core::cache::{CacheKey, CacheKeySchema, KeyBuilder, LanceCache};
 use lance_core::deepsize::{Context, DeepSizeOf};
 use lance_index::frag_reuse::FragReuseIndex;
@@ -26,6 +27,48 @@ impl GlobalIndexCache {
         // Create a sub-cache for the dataset by adding the URI as a key prefix.
         // This prevents collisions between different datasets.
         DSIndexCache(self.0.with_key_prefix(uri))
+    }
+
+    /// As [`Self::for_dataset`], keeping the two fragment-reuse remap forms apart.
+    ///
+    /// What an index caches is not the index as stored: with the remap deferred, its row
+    /// addresses are translated through the fragment reuse index as it loads. So the cached
+    /// state is the index *as translated*, and the two forms do not translate identically --
+    /// an offset past a fragment's `physical_rows`, for instance, is deleted under
+    /// [`IndexRemapMode::Compact`] and untouched under [`IndexRemapMode::Direct`].
+    ///
+    /// Datasets sharing a [`Session`](crate::session::Session) may disagree about the form,
+    /// so without this a reader would silently be served state translated the other way, and
+    /// whichever form opened first would decide for the rest.
+    ///
+    /// Costs nothing when a session sees one form, which is the ordinary case: one form means
+    /// one prefix, and the cache behaves exactly as it did before. Two forms cost a second
+    /// copy of the state for the datasets that differ.
+    ///
+    /// If `Direct` is eventually removed there is only one form left, and this collapses back
+    /// into [`Self::for_dataset`].
+    ///
+    /// The form is added as its own hierarchy segment rather than interpolated into the URI's:
+    /// [`LanceCache::with_key_prefix`] frames each call, so a dataset whose URI happens to end
+    /// in the name of a form cannot collide with the same dataset under that form.
+    pub fn for_dataset_with_remap_mode(&self, uri: &str, mode: IndexRemapMode) -> DSIndexCache {
+        DSIndexCache(
+            self.0
+                .with_key_prefix(uri)
+                .with_key_prefix(remap_mode_segment(mode)),
+        )
+    }
+}
+
+/// The cache namespace segment naming a fragment-reuse remap form.
+///
+/// Matched explicitly rather than taken from `Debug`: a new [`IndexRemapMode`] variant should
+/// fail to compile here rather than silently mint a fresh cache namespace, and a cache
+/// namespace should not depend on a `Debug` impl that anyone is free to reword.
+pub(crate) fn remap_mode_segment(mode: IndexRemapMode) -> &'static str {
+    match mode {
+        IndexRemapMode::Compact => "compact",
+        IndexRemapMode::Direct => "direct",
     }
 }
 
@@ -207,5 +250,42 @@ mod tests {
         };
 
         assert_ne!(first.key(), second.key());
+    }
+
+    /// The remap form is its own hierarchy segment, so it cannot be confused with a URI
+    /// segment that happens to spell a form.
+    ///
+    /// Interpolating `{uri}/{mode}` into one segment makes these two handles identical:
+    /// the unpartitioned handle for a dataset stored under `.../direct`, and the
+    /// partitioned handle for the dataset one level up read in `Direct`. Both would frame
+    /// the single string `memory://ds/direct`. Framing them separately keeps them apart.
+    ///
+    /// Asserted behaviourally, by whether an entry written to one is visible through the
+    /// other: there is no namespace-scoped key enumeration to inspect instead.
+    #[tokio::test]
+    async fn remap_mode_prefix_cannot_collide_with_a_uri_segment() {
+        let global = GlobalIndexCache(LanceCache::with_capacity(64 * 1024 * 1024));
+        let uuid = Uuid::new_v4();
+        let key = FragReuseIndexKey { uuid: &uuid };
+
+        let uri_named_like_a_form = global.for_dataset("memory://ds/direct");
+        let partitioned = global.for_dataset_with_remap_mode("memory://ds", IndexRemapMode::Direct);
+
+        uri_named_like_a_form
+            .insert_with_key(
+                &key,
+                Arc::new(FragReuseIndex::new(
+                    uuid,
+                    vec![],
+                    lance_index::frag_reuse::FragReuseIndexDetails { versions: vec![] },
+                )),
+            )
+            .await;
+
+        assert!(
+            partitioned.get_with_key(&key).await.is_none(),
+            "the partitioned handle read an entry written by a dataset whose URI ends in a \
+             form name, so the form is not its own cache segment"
+        );
     }
 }

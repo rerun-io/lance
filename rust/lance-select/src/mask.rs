@@ -308,10 +308,10 @@ pub enum RowAddrSelection {
 }
 
 impl DeepSizeOf for RowAddrSelection {
-    fn deep_size_of_children(&self, _context: &mut lance_core::deepsize::Context) -> usize {
+    fn deep_size_of_children(&self, context: &mut lance_core::deepsize::Context) -> usize {
         match self {
             Self::Full => 0,
-            Self::Partial(bitmap) => bitmap.serialized_size(),
+            Self::Partial(bitmap) => bitmap.deep_size_of_children(context),
         }
     }
 }

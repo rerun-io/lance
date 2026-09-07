@@ -1080,7 +1080,7 @@ pub(crate) async fn commit_transaction(
                         store_identity: &dataset.object_store.store_prefix,
                     };
                     dataset
-                        .index_cache
+                        .manifest_index_cache
                         .insert_with_key(&key, Arc::new(indices))
                         .await;
                 }

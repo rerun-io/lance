@@ -341,10 +341,27 @@ impl<'a> CommitBuilder<'a> {
             validate_operation(None, &transaction.operation)?;
         }
 
-        let (metadata_cache, index_cache) = match &dest {
-            WriteDestination::Dataset(ds) => (ds.metadata_cache.clone(), ds.index_cache.clone()),
+        // A commit against a bare URI has no dataset to inherit the remap form from, so it
+        // takes the process default; committing against an open dataset reuses that dataset's
+        // caches, which are already partitioned by its form.
+        let frag_reuse_remap_mode = match &dest {
+            WriteDestination::Dataset(ds) => ds.frag_reuse_remap_mode,
+            WriteDestination::Uri(_) => crate::dataset::default_frag_reuse_remap_mode(),
+        };
+
+        let (metadata_cache, index_cache, manifest_index_cache) = match &dest {
+            WriteDestination::Dataset(ds) => (
+                ds.metadata_cache.clone(),
+                ds.index_cache.clone(),
+                ds.manifest_index_cache.clone(),
+            ),
             WriteDestination::Uri(uri) => (
                 Arc::new(session.metadata_cache.for_dataset(uri)),
+                Arc::new(
+                    session
+                        .index_cache
+                        .for_dataset_with_remap_mode(uri, frag_reuse_remap_mode),
+                ),
                 Arc::new(session.index_cache.for_dataset(uri)),
             ),
         };
@@ -478,9 +495,11 @@ impl<'a> CommitBuilder<'a> {
                     commit_handler,
                     refs,
                     index_cache,
+                    manifest_index_cache,
                     fragment_bitmap,
                     metadata_cache,
                     file_reader_options: None,
+                    frag_reuse_remap_mode,
                     store_params: self.store_params.clone().map(Box::new),
                     base_store_params: None,
                 })

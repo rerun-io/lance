@@ -48,6 +48,7 @@ use crate::utils::address::RowAddress;
 use crate::{Error, Result};
 use roaring::{RoaringBitmap, RoaringTreemap};
 use std::collections::HashMap;
+use std::hash::{BuildHasherDefault, Hasher};
 
 /// A queryable row-address remapping with the exact semantics of
 /// `HashMap<u64, Option<u64>>::get(&addr).copied()`:
@@ -55,7 +56,12 @@ use std::collections::HashMap;
 /// * `None` — the address is not affected by this remap (keep it unchanged)
 /// * `Some(None)` — the row was deleted
 /// * `Some(Some(addr))` — the row moved to `addr`
-#[derive(Clone)]
+///
+/// Equality is *representational*, not behavioural: a `Compact` and a `Direct` remap that
+/// resolve every address identically are still unequal, because they are different variants.
+/// Use it to compare two remaps of the same provenance, not to decide whether two remaps
+/// agree.
+#[derive(Clone, PartialEq, Eq)]
 pub enum RowAddrRemap {
     /// Compact, `O(#fragments)` remap built from per-group rewritten-row
     /// bitmaps and new-fragment layouts.
@@ -129,18 +135,55 @@ pub struct GroupInput {
     pub new_frags: Vec<(u32, u32)>,
 }
 
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Eq, crate::deepsize::DeepSizeOf)]
 struct GroupRemap {
     /// Old fragment id -> (rewritten old row offsets in that fragment,
     /// rewritten row count before this fragment in the group).
-    frags: HashMap<u32, (RoaringBitmap, u64)>,
+    frags: IntMap<u32, (RoaringBitmap, u64)>,
     /// New fragment ranges as `(fragment_id, rewritten_rows_before, physical_rows)`,
     /// used to map a rewritten row's group-local index to its new address via binary search.
     new_frag_row_ranges: Vec<(u32, u64, u32)>,
 }
 
+/// Average runs per run container above which run encoding costs more to `rank` than it
+/// saves. A container holding a single run ranks as cheaply as a cached `len()` read and
+/// is far smaller, so it is worth keeping; beyond a handful the interval rescan dominates.
+///
+/// Deliberately at the low end: the error is asymmetric. Keeping runs that should be
+/// stripped costs a term that grows with fragment width, while stripping runs that should
+/// be kept costs a small constant.
+const MAX_RUNS_PER_CONTAINER: u64 = 4;
+
+/// Bytes roaring spends per run when serializing a run container: an `Interval` is two
+/// `u16`. Needed because `statistics()` reports run bytes but not a run count.
+const RUN_BYTES: u64 = 4;
+
+/// Bytes of run count roaring writes per run container.
+const RUN_COUNT_BYTES: u64 = 2;
+
+/// Whether stripping run encoding from `bitmap` would make `get` cheaper.
+///
+/// `RoaringBitmap::rank` sums `len()` over every container below the target. That is a
+/// cached field for bitmap containers and an interval rescan for run containers, so the
+/// encoding chosen for the *serialized* payload (which `optimize` picks by size) can be
+/// the wrong one to keep resident.
+fn should_strip_runs(bitmap: &RoaringBitmap) -> bool {
+    let stats = bitmap.statistics();
+    // `n_bytes_run_containers` is `sum(RUN_COUNT_BYTES + RUN_BYTES * runs)` over the run
+    // containers, so recover the run count from it. With no run containers both terms are
+    // zero and this answers false, which is the right answer -- there is nothing to strip.
+    let run_containers = stats.n_run_containers as u64;
+    let runs = (stats.n_bytes_run_containers - RUN_COUNT_BYTES * run_containers) / RUN_BYTES;
+    runs > MAX_RUNS_PER_CONTAINER * run_containers
+}
+
 impl GroupRemap {
     fn new(input: GroupInput) -> Result<Self> {
+        // Note the asymmetry between the two fragment lists. `old_frag_ids` carries no
+        // ordering requirement beyond being the order the fragments were read: positions are
+        // assigned by walking it, so any order is handled correctly and none is rejected.
+        // `new_frags` is different, and is checked below.
+        //
         // `compute_new_addr` maps a rewritten row's group-local index to a new
         // address by accumulating `physical_rows` in `new_frags` order, so that
         // order must be the order rows were written. New fragment ids are
@@ -167,12 +210,18 @@ impl GroupRemap {
         }
         let total_new_rows = rewritten_rows_before;
 
-        let mut per_frag: HashMap<u32, RoaringBitmap> = input
+        let mut per_frag: IntMap<u32, RoaringBitmap> = input
             .rewritten_old_row_addrs
             .bitmaps()
-            .map(|(frag_id, bitmap)| (frag_id, bitmap.clone()))
+            .map(|(frag_id, bitmap)| {
+                let mut bitmap = bitmap.clone();
+                if should_strip_runs(&bitmap) {
+                    bitmap.remove_run_compression();
+                }
+                (frag_id, bitmap)
+            })
             .collect();
-        let mut frags = HashMap::new();
+        let mut frags = IntMap::default();
         let mut rewritten_rows_before = 0u64;
         for &frag_id in &input.old_frag_ids {
             // A fragment with no rewritten rows (fully deleted) contributes
@@ -237,17 +286,78 @@ impl GroupRemap {
     }
 }
 
+/// Hasher for this module's integer-keyed maps.
+///
+/// `remap_row_id` probes these maps once per reuse version per row address, so at
+/// hundreds of millions of rows the default SipHash dominates consolidation CPU.
+/// The keys are internal fragment ids, never attacker-supplied, so the hash-flooding
+/// resistance it buys is worth nothing here.
+///
+/// Only single-integer keys are hashed well: `write_u32`/`write_u64`/`write_usize`
+/// replace the state rather than mixing into it, so a composite key would collide on
+/// its last field alone. Correct either way — `Eq` still decides — but keep these maps
+/// keyed by one integer.
+#[derive(Clone, Copy)]
+struct IntHasher(u64);
+
+/// FNV-1a offset basis, so the byte fallback does not absorb leading zero bytes.
+const FNV_OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
+
+impl Default for IntHasher {
+    #[inline]
+    fn default() -> Self {
+        Self(FNV_OFFSET_BASIS)
+    }
+}
+
+impl Hasher for IntHasher {
+    /// Folds the high half down: multiplication only carries upward, so without this
+    /// the low bits — which hashbrown uses to pick the bucket — would ignore the high
+    /// bits of the key, and fragment ids strided by a power of two would all land in
+    /// one bucket.
+    #[inline]
+    fn finish(&self) -> u64 {
+        self.0 ^ (self.0 >> 32)
+    }
+
+    #[inline]
+    fn write(&mut self, bytes: &[u8]) {
+        // Fallback for key types this module does not use.
+        for &b in bytes {
+            self.0 = (self.0 ^ u64::from(b)).wrapping_mul(0x0000_0100_0000_01b3);
+        }
+    }
+
+    #[inline]
+    fn write_u32(&mut self, value: u32) {
+        self.0 = u64::from(value).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    }
+
+    #[inline]
+    fn write_u64(&mut self, value: u64) {
+        self.0 = value.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    }
+
+    #[inline]
+    fn write_usize(&mut self, value: usize) {
+        self.write_u64(value as u64);
+    }
+}
+
+/// `HashMap` over single-integer keys, hashed with [`IntHasher`].
+type IntMap<K, V> = HashMap<K, V, BuildHasherDefault<IntHasher>>;
+
 /// Compact remap backed by per-group rewritten row bitmaps + new-fragment layouts.
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Eq, crate::deepsize::DeepSizeOf)]
 pub struct CompactRowAddrRemap {
     groups: Vec<GroupRemap>,
     /// Old fragment id -> index into `groups`. Size is O(#fragments), not rows.
-    frag_to_group: HashMap<u32, usize>,
+    frag_to_group: IntMap<u32, usize>,
 }
 
 impl CompactRowAddrRemap {
     fn new(groups: impl IntoIterator<Item = GroupInput>) -> Result<Self> {
-        let mut frag_to_group = HashMap::new();
+        let mut frag_to_group = IntMap::default();
         let mut group_remaps = Vec::new();
         for input in groups {
             let gi = group_remaps.len();
@@ -274,6 +384,16 @@ impl CompactRowAddrRemap {
         self.groups.is_empty()
     }
 
+    /// Number of rewrite groups held.
+    pub fn num_groups(&self) -> usize {
+        self.groups.len()
+    }
+
+    /// Number of old fragments covered. This is what the structure scales with.
+    pub fn num_fragments(&self) -> usize {
+        self.frag_to_group.len()
+    }
+
     fn fully_deleted_fragments(&self) -> Option<RoaringBitmap> {
         // A group with any rewritten row moved at least one row.
         if self.groups.iter().any(|g| !g.frags.is_empty()) {
@@ -283,9 +403,38 @@ impl CompactRowAddrRemap {
     }
 }
 
+// `Debug` is written by hand rather than derived because the payload is bitmaps and
+// hash maps of unbounded size: a derived impl would print the whole remap. The shape
+// and scale are what a caller logging a remap actually wants.
+impl std::fmt::Debug for RowAddrRemap {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Compact(compact) => f
+                .debug_struct("RowAddrRemap::Compact")
+                .field("groups", &compact.num_groups())
+                .field("fragments", &compact.num_fragments())
+                .finish(),
+            Self::Direct(map) => f
+                .debug_struct("RowAddrRemap::Direct")
+                .field("entries", &map.len())
+                .finish(),
+        }
+    }
+}
+
+impl crate::deepsize::DeepSizeOf for RowAddrRemap {
+    fn deep_size_of_children(&self, cx: &mut crate::deepsize::Context) -> usize {
+        match self {
+            Self::Compact(compact) => compact.deep_size_of_children(cx),
+            Self::Direct(map) => map.deep_size_of_children(cx),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::{prop_assert, prop_assert_eq};
 
     fn addr(frag: u32, offset: u32) -> u64 {
         u64::from(RowAddress::new_from_parts(frag, offset))
@@ -391,6 +540,199 @@ mod tests {
     }
 
     #[test]
+    fn test_deep_size_of_reaches_the_bitmaps() {
+        use crate::deepsize::DeepSizeOf;
+
+        // The derived impl has to walk Vec -> HashMap -> tuple -> RoaringBitmap. If any
+        // link stopped short the two remaps below would report the same size, since they
+        // differ only in how many rows their bitmaps hold.
+        let remap_over = |rows: u32| {
+            RowAddrRemap::compact([GroupInput {
+                rewritten_old_row_addrs: RoaringTreemap::from_iter(
+                    (0..rows).map(|offset| addr(0, offset)),
+                ),
+                old_frag_ids: vec![0],
+                new_frags: vec![(10, rows)],
+            }])
+            .unwrap()
+        };
+
+        // 8 values fit an array container; 40k promote to a bitmap container.
+        let small = remap_over(8).deep_size_of();
+        let large = remap_over(40_000).deep_size_of();
+        assert!(small > 0, "a non-empty remap must report a non-zero size");
+        assert!(
+            large > small,
+            "size must grow with bitmap contents, got {large} vs {small}"
+        );
+    }
+
+    /// Equality is representational, which is what the type documents and all it can offer:
+    /// the compact form cannot enumerate its keys, so there is nothing to compare a
+    /// materialized map against address by address.
+    #[test]
+    fn test_equality_compares_representation_not_resolved_addresses() {
+        let rows = 4u32;
+        let compact = RowAddrRemap::compact([GroupInput {
+            rewritten_old_row_addrs: RoaringTreemap::from_iter(
+                (0..rows).map(|offset| addr(0, offset)),
+            ),
+            old_frag_ids: vec![0],
+            new_frags: vec![(10, rows)],
+        }])
+        .unwrap();
+
+        // The same mapping written out by hand: every row of fragment 0 moved to fragment 10
+        // at the same offset. Both resolve these addresses identically...
+        let direct = RowAddrRemap::direct(
+            (0..rows)
+                .map(|offset| (addr(0, offset), Some(addr(10, offset))))
+                .collect(),
+        );
+        for offset in 0..rows {
+            assert_eq!(
+                compact.get(addr(0, offset)),
+                direct.get(addr(0, offset)),
+                "the two forms should agree on a rewritten address"
+            );
+        }
+
+        // ...but they are still unequal, because equality is over the representation.
+        assert_ne!(compact, direct);
+        assert_eq!(compact.clone(), compact);
+        assert_eq!(direct.clone(), direct);
+    }
+
+    #[test]
+    fn test_resident_bitmaps_are_not_run_encoded() {
+        // Compaction run-optimizes the address set before writing it, so what arrives
+        // here is run-encoded. Keeping that encoding resident makes `get` O(#containers x
+        // #runs), because `RoaringBitmap::rank` sums `len()` over preceding containers and
+        // `len()` rescans the interval list for run containers. Two fragments wide enough
+        // to span several containers, with periodic holes so run-encoding is what
+        // `optimize` picks.
+        let mut rewritten = RoaringTreemap::new();
+        let mut kept = 0u32;
+        for frag in 0..2u32 {
+            for offset in 0..200_000u32 {
+                if offset % 128 < 125 {
+                    rewritten.insert(addr(frag, offset));
+                    kept += 1;
+                }
+            }
+        }
+        assert!(rewritten.optimize(), "payload should be run-encodable");
+        for (frag_id, bitmap) in rewritten.bitmaps() {
+            assert!(
+                bitmap.statistics().n_run_containers > 0,
+                "fragment {frag_id} should arrive run-encoded, or this test proves nothing"
+            );
+        }
+
+        let remap = CompactRowAddrRemap::new([GroupInput {
+            rewritten_old_row_addrs: rewritten,
+            old_frag_ids: vec![0, 1],
+            new_frags: vec![(10, kept)],
+        }])
+        .unwrap();
+
+        for group in &remap.groups {
+            for (frag_id, (bitmap, _)) in &group.frags {
+                let stats = bitmap.statistics();
+                assert_eq!(
+                    stats.n_run_containers, 0,
+                    "fragment {frag_id} kept {} run containers; `rank` would pay \
+                     O(containers x runs) per lookup",
+                    stats.n_run_containers
+                );
+                assert!(
+                    stats.n_containers > 1,
+                    "test needs a multi-container bitmap"
+                );
+            }
+        }
+
+        // Stripping the encoding must not move any address.
+        assert_eq!(remap.get(addr(0, 0)), Some(Some(addr(10, 0))));
+        assert_eq!(remap.get(addr(0, 124)), Some(Some(addr(10, 124))));
+        assert_eq!(remap.get(addr(0, 125)), Some(None), "hole in the pattern");
+        assert_eq!(remap.get(addr(0, 128)), Some(Some(addr(10, 125))));
+        // First surviving offset of fragment 1 follows all of fragment 0's survivors.
+        assert_eq!(remap.get(addr(1, 0)), Some(Some(addr(10, kept / 2))));
+    }
+
+    #[test]
+    fn test_no_run_containers_needs_no_special_case() {
+        // `should_strip_runs` has no zero guard: with no run containers both terms of the
+        // comparison are zero. Pins that, since without it the byte arithmetic would be a
+        // subtraction waiting to underflow.
+        let scattered: Vec<u64> = (0..500u32).map(|i| addr(0, i * 977)).collect();
+        let mut rewritten = RoaringTreemap::from_iter(scattered.iter().copied());
+        rewritten.optimize();
+        for (_, bitmap) in rewritten.bitmaps() {
+            assert_eq!(
+                bitmap.statistics().n_run_containers,
+                0,
+                "a scattered set should not be run-encoded, or this test proves nothing"
+            );
+            assert!(!should_strip_runs(bitmap), "nothing to strip");
+        }
+
+        let remap = CompactRowAddrRemap::new([GroupInput {
+            rewritten_old_row_addrs: rewritten,
+            old_frag_ids: vec![0],
+            new_frags: vec![(10, scattered.len() as u32)],
+        }])
+        .unwrap();
+        assert_eq!(remap.get(scattered[0]), Some(Some(addr(10, 0))));
+        assert_eq!(remap.get(scattered[499]), Some(Some(addr(10, 499))));
+        assert_eq!(
+            remap.get(addr(0, 1)),
+            Some(None),
+            "not in the scattered set"
+        );
+    }
+
+    #[test]
+    fn test_run_encoding_kept_when_runs_are_few() {
+        // The other side of `should_strip_runs`. A fragment rewritten whole is one
+        // contiguous run per container, which ranks as cheaply as a cached `len()` read
+        // and costs 6 bytes against a bitmap container's fixed 8 KiB. Stripping that
+        // would be a regression on both axes, so it must be left alone.
+        let rows = 200_000u32;
+        let mut rewritten = RoaringTreemap::new();
+        for offset in 0..rows {
+            rewritten.insert(addr(0, offset));
+        }
+        assert!(rewritten.optimize());
+
+        let remap = CompactRowAddrRemap::new([GroupInput {
+            rewritten_old_row_addrs: rewritten,
+            old_frag_ids: vec![0],
+            new_frags: vec![(10, rows)],
+        }])
+        .unwrap();
+
+        for group in &remap.groups {
+            for (frag_id, (bitmap, _)) in &group.frags {
+                let stats = bitmap.statistics();
+                assert!(
+                    stats.n_containers > 1,
+                    "test needs a multi-container bitmap"
+                );
+                assert_eq!(
+                    stats.n_run_containers, stats.n_containers,
+                    "fragment {frag_id} should stay run-encoded: one run per container is \
+                     both cheaper to rank and far smaller"
+                );
+            }
+        }
+
+        assert_eq!(remap.get(addr(0, 0)), Some(Some(addr(10, 0))));
+        assert_eq!(remap.get(addr(0, rows - 1)), Some(Some(addr(10, rows - 1))));
+    }
+
+    #[test]
     fn test_direct_and_empty() {
         // Direct covers arbitrary maps the compact form can't express.
         let mut map = HashMap::new();
@@ -409,5 +751,189 @@ mod tests {
         let empty = RowAddrRemap::empty();
         assert!(empty.is_empty());
         assert_eq!(empty.get(addr(0, 0)), None);
+    }
+
+    fn int_hash_of<K: std::hash::Hash>(key: &K) -> u64 {
+        use std::hash::BuildHasher;
+        BuildHasherDefault::<IntHasher>::default().hash_one(key)
+    }
+
+    #[test]
+    fn test_int_hasher_is_stateless_and_spreads_low_bits() {
+        // A `BuildHasherDefault` carries no seed, so a key must hash the same at insert,
+        // at lookup and after a resize; if it did not, a key could become unreachable.
+        for value in [0u32, 1, 7, 12345, 1 << 31, u32::MAX] {
+            assert_eq!(int_hash_of(&value), int_hash_of(&value));
+        }
+        // `get` borrows the key, so the borrowed form has to agree with the owned one.
+        let key = 424242u32;
+        assert_eq!(int_hash_of(&key), int_hash_of(&&key));
+
+        // Multiplication only carries upward, so without the fold in `finish` the low
+        // bits would ignore the high bits of the key and every fragment id below would
+        // land in the same bucket.
+        let buckets = |ids: &[u32]| -> usize {
+            let table_mask = 2048 - 1;
+            ids.iter()
+                .map(|id| int_hash_of(id) & table_mask)
+                .collect::<std::collections::HashSet<_>>()
+                .len()
+        };
+        let strided: Vec<u32> = (0..1024).map(|i| i << 20).collect();
+        let dense: Vec<u32> = (0..1024).collect();
+        assert!(
+            buckets(&strided) > 512,
+            "power-of-two-strided fragment ids clustered into {} of 2048 buckets",
+            buckets(&strided)
+        );
+        assert!(buckets(&dense) > 512, "dense fragment ids clustered");
+    }
+
+    #[test]
+    fn test_int_hasher_composite_keys_collide_on_last_field() {
+        // `write_u32`/`write_u64` replace the state instead of mixing into it, so a
+        // composite key keeps only its last integer field. Pinned because it is the
+        // documented reason these maps are single-integer-keyed: the map still answers
+        // correctly, it just degenerates to one bucket.
+        assert_eq!(int_hash_of(&(1u32, 5u32)), int_hash_of(&(999u32, 5u32)));
+        assert_eq!(int_hash_of(&("abc", 4u32)), int_hash_of(&("zzzzzz", 4u32)));
+
+        let mut map: IntMap<(u32, u32), u32> = IntMap::default();
+        for a in 0..48u32 {
+            for b in 0..48u32 {
+                map.insert((a, b), a * 1000 + b);
+            }
+        }
+        assert_eq!(map.len(), 48 * 48);
+        for a in 0..48u32 {
+            for b in 0..48u32 {
+                assert_eq!(map.get(&(a, b)), Some(&(a * 1000 + b)));
+            }
+        }
+        assert_eq!(map.get(&(48, 0)), None);
+    }
+
+    #[test]
+    fn test_outputs_do_not_depend_on_fragment_insertion_order() {
+        // The maps are hashed with a fixed seed, so their iteration order is stable but
+        // different from the default hasher's. Nothing observable may depend on it.
+        let remap_over = |old_frag_ids: Vec<u32>| {
+            let rewritten = RoaringTreemap::from_iter(old_frag_ids.iter().map(|f| addr(*f, 0)));
+            let num_rows = old_frag_ids.len() as u32;
+            RowAddrRemap::compact([GroupInput {
+                rewritten_old_row_addrs: rewritten,
+                old_frag_ids,
+                new_frags: vec![(1000, num_rows)],
+            }])
+            .unwrap()
+        };
+        let forward = remap_over(vec![3, 1, 4, 1 << 20, 2 << 20, 9, 700_000]);
+        let reverse = remap_over(vec![700_000, 9, 2 << 20, 1 << 20, 4, 1, 3]);
+
+        // `old_frag_ids` order is load-bearing for the row-to-row mapping, so only the
+        // set-shaped outputs are comparable across the two.
+        assert_eq!(
+            forward.affected_fragments(),
+            reverse.affected_fragments(),
+            "affected fragments must not depend on insertion order"
+        );
+        assert_eq!(
+            forward.fully_deleted_fragments(),
+            reverse.fully_deleted_fragments()
+        );
+    }
+
+    proptest::proptest! {
+        /// The compact remap must answer exactly like a materialized old-to-new map. A
+        /// wrong answer here silently points an index at the wrong physical row, so this
+        /// compares the two forms address by address over randomized rewrites.
+        #[test]
+        fn test_compact_matches_direct_over_random_rewrites(
+            // Fragment id shapes: dense, strided by a power of two (the integer hasher's
+            // worst case), and sparse.
+            frag_seeds in proptest::collection::vec((0..3usize, 0..64u32), 1..7),
+            rows_per_frag in 1..24u32,
+            keep in proptest::collection::vec(proptest::bool::weighted(0.75), 6 * 24),
+            gaps in proptest::collection::vec(1..4u32, 1..5),
+        ) {
+            let mut old_frag_ids: Vec<u32> = Vec::new();
+            for (shape, seed) in &frag_seeds {
+                let frag_id = match shape {
+                    0 => *seed,
+                    1 => (*seed + 1) << 20,
+                    _ => seed.wrapping_mul(7919),
+                };
+                if !old_frag_ids.contains(&frag_id) {
+                    old_frag_ids.push(frag_id);
+                }
+            }
+
+            // Rewritten rows are read fragment by fragment in `old_frag_ids` order, and
+            // by ascending offset within each fragment.
+            let mut rewritten = RoaringTreemap::new();
+            let mut read_order: Vec<u64> = Vec::new();
+            let mut covered: Vec<u64> = Vec::new();
+            for (frag_index, frag_id) in old_frag_ids.iter().enumerate() {
+                for offset in 0..rows_per_frag {
+                    covered.push(addr(*frag_id, offset));
+                    if keep[frag_index * rows_per_frag as usize + offset as usize] {
+                        rewritten.insert(addr(*frag_id, offset));
+                        read_order.push(addr(*frag_id, offset));
+                    }
+                }
+            }
+            let total_rewritten = read_order.len() as u32;
+            proptest::prop_assume!(total_rewritten > 0);
+
+            // Spread the rewritten rows over ascending new fragment ids, every fragment
+            // non-empty so the row counts still add up.
+            let parts = gaps.len().min(total_rewritten as usize);
+            let base = total_rewritten / parts as u32;
+            let remainder = total_rewritten % parts as u32;
+            let mut new_frags: Vec<(u32, u32)> = Vec::with_capacity(parts);
+            let mut new_frag_id = 10_000u32;
+            for (part, gap) in gaps.iter().take(parts).enumerate() {
+                let rows = base + u32::from((part as u32) < remainder);
+                new_frags.push((new_frag_id, rows));
+                new_frag_id += gap;
+            }
+
+            // The same mapping, materialized one address at a time.
+            let mut direct: HashMap<u64, Option<u64>> = HashMap::new();
+            let mut read_order_iter = read_order.iter();
+            for (new_frag_id, rows) in &new_frags {
+                for offset in 0..*rows {
+                    let old = read_order_iter.next().unwrap();
+                    direct.insert(*old, Some(addr(*new_frag_id, offset)));
+                }
+            }
+            prop_assert!(read_order_iter.next().is_none());
+            for old in &covered {
+                direct.entry(*old).or_insert(None);
+            }
+
+            let compact = RowAddrRemap::compact([GroupInput {
+                rewritten_old_row_addrs: rewritten,
+                old_frag_ids: old_frag_ids.clone(),
+                new_frags,
+            }])
+            .unwrap();
+            let direct = RowAddrRemap::direct(direct);
+
+            for old in &covered {
+                prop_assert_eq!(
+                    compact.get(*old),
+                    direct.get(*old),
+                    "address {:#x} in fragments {:?}",
+                    old,
+                    old_frag_ids
+                );
+            }
+            // Fragments no group covers are left alone.
+            for frag_id in [0xFFFF_FFF0u32, 0x7EEE_EEEE] {
+                prop_assert_eq!(compact.get(addr(frag_id, 0)), None);
+            }
+            prop_assert_eq!(compact.affected_fragments(), direct.affected_fragments());
+        }
     }
 }
