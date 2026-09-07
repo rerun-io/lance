@@ -3991,10 +3991,10 @@ mod tests {
             .unwrap()
             .expect("a deferred-remap compaction leaves a reuse index behind");
         assert_eq!(
-            matches!(fri.row_addr_maps[0], RowAddrRemap::Compact(_)),
+            matches!(fri.row_addr_maps()[0], RowAddrRemap::Compact(_)),
             mode == IndexRemapMode::Compact,
             "reader asked for {mode:?} but was served {:?}",
-            fri.row_addr_maps[0]
+            fri.row_addr_maps()[0]
         );
     }
 

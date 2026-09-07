@@ -230,7 +230,7 @@ async fn remap_index(dataset: &mut Dataset, index_id: &Uuid) -> Result<()> {
     .await
     .unwrap();
 
-    if frag_reuse_index.row_addr_maps.is_empty() {
+    if frag_reuse_index.row_addr_maps().is_empty() {
         return Ok(());
     }
 
