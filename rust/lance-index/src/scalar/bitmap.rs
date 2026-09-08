@@ -606,7 +606,7 @@ impl BitmapIndex {
 
         for segment in segments.iter().skip(1) {
             if segment.value_type != first.value_type {
-                return Err(Error::index(format!(
+                return Err(Error::invalid_input(format!(
                     "cannot merge bitmap segments with different value types ({:?} vs {:?})",
                     first.value_type, segment.value_type
                 )));
@@ -715,10 +715,12 @@ impl<'a> OldSegments<'a> {
         let mut merged = self.load_filtered(item.shard_idx, item.key).await?;
         self.advance(item.shard_idx);
 
-        while self.peek_key() == Some(item.key) {
-            let Some(Reverse(next)) = self.heap.pop() else {
+        // Peek before popping, so there is no branch for a pop that cannot fail.
+        while let Some(Reverse(next)) = self.heap.peek().copied() {
+            if next.key != item.key {
                 break;
-            };
+            }
+            self.heap.pop();
             merged |= &self.load_filtered(next.shard_idx, item.key).await?;
             self.advance(next.shard_idx);
         }
@@ -1880,10 +1882,9 @@ impl BitmapIndexPlugin {
             }
 
             // If the old side also has this key, merge its postings.
-            if old.peek_key() == Some(&orderable) {
-                let Some((_, old_bitmap)) = old.take_smallest().await? else {
-                    unreachable!("peeked key must be takeable")
-                };
+            if old.peek_key() == Some(&orderable)
+                && let Some((_, old_bitmap)) = old.take_smallest().await?
+            {
                 *bitmap |= &old_bitmap;
             }
         }
