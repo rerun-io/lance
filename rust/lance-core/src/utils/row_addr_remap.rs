@@ -109,7 +109,9 @@ impl RowAddrRemap {
     pub fn affected_fragments(&self) -> RoaringBitmap {
         match self {
             Self::Compact(c) => RoaringBitmap::from_iter(c.frag_to_group.keys().copied()),
-            Self::Direct(m) => RoaringBitmap::from_iter(m.keys().map(|addr| (addr >> 32) as u32)),
+            Self::Direct(m) => {
+                RoaringBitmap::from_iter(m.keys().map(|&addr| RowAddress::from(addr).fragment_id()))
+            }
         }
     }
 
@@ -119,7 +121,7 @@ impl RowAddrRemap {
             Self::Direct(m) => {
                 if m.values().all(|v| v.is_none()) {
                     Some(RoaringBitmap::from_iter(
-                        m.keys().map(|addr| (addr >> 32) as u32),
+                        m.keys().map(|&addr| RowAddress::from(addr).fragment_id()),
                     ))
                 } else {
                     None
@@ -380,10 +382,11 @@ impl CompactRowAddrRemap {
 
     #[inline]
     pub fn get(&self, addr: u64) -> Option<Option<u64>> {
-        let addr = RowAddress::from(addr);
         // Not in any rewrite group -> unaffected by this remap.
-        let gi = *self.frag_to_group.get(&addr.fragment_id())?;
-        Some(self.groups[gi].get(addr.fragment_id(), addr.row_offset()))
+        let gi = *self
+            .frag_to_group
+            .get(&RowAddress::from(addr).fragment_id())?;
+        self.get_in_group(gi, addr)
     }
 
     /// `(fragment id, group index)` for every old fragment this remap rewrote or deleted --

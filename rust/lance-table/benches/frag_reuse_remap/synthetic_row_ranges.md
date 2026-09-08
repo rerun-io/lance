@@ -686,9 +686,10 @@ design, verified for `b` in `{0, 3, 6, 12}`:
 ## What the M region is for
 
 Probes drawn from `N..M` land in fragments that appear in no group, so the
-per-fragment table answers in one lookup and no version is probed. That is the dominant production case: most rows live in
-large settled fragments that compaction has not touched, and the interesting
-question is what walking a deep chain costs for them.
+per-fragment table answers in one bounds check and no version is probed. That is
+the dominant production case: most rows live in large settled fragments that
+compaction has not touched. These cells are depth-independent by construction;
+they measure the fixed cost of a lookup that finds nothing to do.
 
 `M` must map to fragment ids above the highest the cascade mints, or the probe
 becomes a hit and measures the wrong path.

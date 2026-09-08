@@ -217,7 +217,9 @@ pub struct FragReuseIndex {
     /// [`RowAddrRemap::Compact`] scales with fragment count instead. The index is opened on
     /// the read path and the result cached, so readers pay whichever cost.
     row_addr_maps: Vec<RowAddrRemap>,
-    versions_by_fragment: VersionsByFragment,
+    /// `None` when the fragment ids listed are too spread out to index directly; the walk
+    /// then visits every version, as it did before the table existed.
+    versions_by_fragment: Option<VersionsByFragment>,
     pub details: FragReuseIndexDetails,
 }
 
@@ -227,7 +229,7 @@ pub struct FragReuseIndex {
 /// index covers form a band high in the id space. The table spans that band, indexed by
 /// `frag - base` where `base` is the lowest fragment any version rewrote: a lookup is a
 /// bounds check and one load, and an id outside the band was rewritten by no version.
-#[derive(Debug, Clone, PartialEq, Eq, DeepSizeOf)]
+#[derive(Clone, PartialEq, Eq, DeepSizeOf)]
 struct VersionsByFragment {
     base: u32,
     /// `slots[frag - base] = (start, len)`, a window into `entries`.
@@ -238,37 +240,73 @@ struct VersionsByFragment {
     entries: Vec<(u32, u32)>,
 }
 
+/// Widest band the table is built for, as a multiple of the (version, fragment) pairs it
+/// would hold, with a floor so small indexes are never refused. A well-formed reuse index
+/// lists fragments within a few multiples of its own size; a band far wider than that means
+/// a corrupt fragment id, and building the table would turn one bad id into gigabytes.
+const MAX_SPAN_PER_PAIR: u64 = 64;
+const MIN_SPAN: u64 = 1 << 16;
+
+impl std::fmt::Debug for VersionsByFragment {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("VersionsByFragment")
+            .field("base", &self.base)
+            .field("slots", &self.slots.len())
+            .field("entries", &self.entries.len())
+            .finish()
+    }
+}
+
 impl VersionsByFragment {
-    fn new(row_addr_maps: &[RowAddrRemap]) -> Self {
+    /// `Ok(None)` when the listed fragment ids span more than the table is built for.
+    fn new(row_addr_maps: &[RowAddrRemap]) -> Result<Option<Self>> {
         // `version + 1` in the walk must not wrap.
-        assert!(
-            row_addr_maps.len() < u32::MAX as usize,
-            "fragment reuse index has {} versions, more than a u32 can index",
-            row_addr_maps.len()
-        );
-        let per_version: Vec<Vec<(u32, u32)>> = row_addr_maps
-            .iter()
-            .map(|m| match m {
+        if row_addr_maps.len() >= u32::MAX as usize {
+            return Err(Error::invalid_input(format!(
+                "fragment reuse index has {} versions, more than a u32 can index",
+                row_addr_maps.len()
+            )));
+        }
+        let mut per_version: Vec<Vec<(u32, u32)>> = Vec::with_capacity(row_addr_maps.len());
+        for remap in row_addr_maps {
+            per_version.push(match remap {
                 RowAddrRemap::Compact(c) => c
                     .frag_groups()
-                    .map(|(f, g)| (f, u32::try_from(g).expect("group index fits in u32")))
-                    .collect(),
-                RowAddrRemap::Direct(_) => m
+                    .map(|(f, g)| {
+                        u32::try_from(g).map(|g| (f, g)).map_err(|_| {
+                            Error::invalid_input("more rewrite groups than a u32 can index")
+                        })
+                    })
+                    .collect::<Result<_>>()?,
+                RowAddrRemap::Direct(_) => remap
                     .affected_fragments()
                     .iter()
                     .map(|f| (f, u32::MAX))
                     .collect(),
-            })
-            .collect();
+            });
+        }
         let ids = || per_version.iter().flatten().map(|&(f, _)| f);
         let (Some(base), Some(max)) = (ids().min(), ids().max()) else {
-            return Self {
+            return Ok(Some(Self {
                 base: 0,
                 slots: Vec::new(),
                 entries: Vec::new(),
-            };
+            }));
         };
-        let mut slots = vec![(0u32, 0u32); (max - base) as usize + 1];
+        let pairs = per_version.iter().map(Vec::len).sum::<usize>() as u64;
+        let span = u64::from(max - base) + 1;
+        if span > (pairs * MAX_SPAN_PER_PAIR).max(MIN_SPAN) {
+            tracing::warn!(
+                span,
+                pairs,
+                "fragment reuse index lists fragment ids too spread out to index; \
+                 lookups will visit every version"
+            );
+            return Ok(None);
+        }
+        let width = usize::try_from(span)
+            .map_err(|_| Error::invalid_input("fragment id span exceeds the address space"))?;
+        let mut slots = vec![(0u32, 0u32); width];
         for frags in &per_version {
             for &(f, _) in frags {
                 slots[(f - base) as usize].1 += 1;
@@ -276,13 +314,16 @@ impl VersionsByFragment {
         }
         let mut start = 0u64;
         for slot in slots.iter_mut() {
-            slot.0 = u32::try_from(start).expect(
-                "fragment reuse index lists more (version, fragment) pairs than u32 can index",
-            );
+            slot.0 = start as u32;
             start += u64::from(slot.1);
             slot.1 = 0;
         }
-        let mut entries = vec![(0u32, 0u32); start as usize];
+        let total = u32::try_from(start).map_err(|_| {
+            Error::invalid_input(
+                "fragment reuse index lists more (version, fragment) pairs than a u32 can index",
+            )
+        })?;
+        let mut entries = vec![(0u32, 0u32); total as usize];
         for (vi, frags) in per_version.iter().enumerate() {
             for &(f, g) in frags {
                 let slot = &mut slots[(f - base) as usize];
@@ -290,11 +331,11 @@ impl VersionsByFragment {
                 slot.1 += 1;
             }
         }
-        Self {
+        Ok(Some(Self {
             base,
             slots,
             entries,
-        }
+        }))
     }
 
     /// First version at or after `from` that rewrote `frag`, with that version's group.
@@ -309,17 +350,18 @@ impl VersionsByFragment {
 
     /// Every version that can answer for a fragment must be listed against it: the walk
     /// skips a version for any fragment it is not listed against.
-    #[cfg(debug_assertions)]
-    fn check_complete(&self, row_addr_maps: &[RowAddrRemap]) {
+    #[cfg(test)]
+    fn check_complete(&self, row_addr_maps: &[RowAddrRemap]) -> Result<()> {
         for (vi, m) in row_addr_maps.iter().enumerate() {
             for frag in m.affected_fragments() {
-                assert_eq!(
-                    self.first_affecting(frag, vi as u32).map(|(v, _)| v),
-                    Some(vi as u32),
-                    "version {vi} answers for fragment {frag} but is not indexed against it"
-                );
+                if self.first_affecting(frag, vi as u32).map(|(v, _)| v) != Some(vi as u32) {
+                    return Err(Error::invalid_input(format!(
+                        "version {vi} answers for fragment {frag} but is not indexed against it"
+                    )));
+                }
             }
         }
+        Ok(())
     }
 }
 
@@ -341,7 +383,7 @@ impl FragReuseIndex {
         uuid: Uuid,
         row_id_maps: Vec<HashMap<u64, Option<u64>>>,
         details: FragReuseIndexDetails,
-    ) -> Self {
+    ) -> Result<Self> {
         Self::new_from_remaps(
             uuid,
             row_id_maps.into_iter().map(RowAddrRemap::direct).collect(),
@@ -353,16 +395,18 @@ impl FragReuseIndex {
         uuid: Uuid,
         row_addr_maps: Vec<RowAddrRemap>,
         details: FragReuseIndexDetails,
-    ) -> Self {
-        let versions_by_fragment = VersionsByFragment::new(&row_addr_maps);
-        #[cfg(debug_assertions)]
-        versions_by_fragment.check_complete(&row_addr_maps);
-        Self {
+    ) -> Result<Self> {
+        let versions_by_fragment = VersionsByFragment::new(&row_addr_maps)?;
+        #[cfg(test)]
+        if let Some(table) = &versions_by_fragment {
+            table.check_complete(&row_addr_maps)?;
+        }
+        Ok(Self {
             uuid,
             row_addr_maps,
             versions_by_fragment,
             details,
-        }
+        })
     }
 
     /// One remap per reuse version, oldest first.
@@ -375,29 +419,39 @@ impl FragReuseIndex {
     /// current fragment are visited; a version absent from a fragment answers `None` for
     /// every address in it, which the walk treats as a no-op anyway.
     pub fn remap_row_id(&self, row_id: u64) -> Option<u64> {
+        let Some(table) = &self.versions_by_fragment else {
+            return self.remap_row_id_linear(row_id);
+        };
         let mut addr = row_id;
         // Versions are applied in ascending order and never revisited: a remap can land an
         // address in a fragment an earlier version also rewrote.
         let mut next_version = 0u32;
         loop {
             let frag = RowAddress::from(addr).fragment_id();
-            let Some((vi, gi)) = self
-                .versions_by_fragment
-                .first_affecting(frag, next_version)
-            else {
+            let Some((vi, gi)) = table.first_affecting(frag, next_version) else {
                 return Some(addr);
             };
             let hit = match &self.row_addr_maps[vi as usize] {
                 RowAddrRemap::Compact(c) => c.get_in_group(gi as usize, addr),
                 RowAddrRemap::Direct(m) => m.get(&addr).copied(),
             };
-            match hit {
-                None => {}
-                Some(None) => return None,
-                Some(Some(new_addr)) => addr = new_addr,
+            if let Some(hit) = hit {
+                addr = hit?;
             }
             next_version = vi + 1;
         }
+    }
+
+    /// [`Self::remap_row_id`] without the per-fragment table: every version is probed.
+    fn remap_row_id_linear(&self, row_id: u64) -> Option<u64> {
+        let mut addr = Some(row_id);
+        for remap in &self.row_addr_maps {
+            let Some(a) = addr else { break };
+            if let Some(hit) = remap.get(a) {
+                addr = hit;
+            }
+        }
+        addr
     }
 
     pub fn remap_row_addrs_tree_map(&self, row_addrs: &RowAddrTreeMap) -> RowAddrTreeMap {
@@ -548,6 +602,7 @@ mod tests {
             maps,
             FragReuseIndexDetails { versions: vec![] },
         )
+        .unwrap()
     }
 
     /// frag 0 offsets {0,2} -> frag 10; then frag 10 offset {0} -> frag 20.
@@ -574,7 +629,7 @@ mod tests {
     #[test]
     fn test_chaining_works_with_a_direct_link() {
         // Nothing in-tree builds a mixed chain -- `new` produces all `Direct`, the open
-        // path all `Compact` -- but `new_from_remaps` and the public field permit one, and
+        // path all `Compact` -- but `new_from_remaps` permits one, and
         // the walk must not care which form a link takes. Asserted against absolute
         // expectations: a differential check against an all-compact chain would also pass
         // against a stubbed `remap_row_id`.
@@ -787,17 +842,9 @@ mod tests {
         );
     }
 
-    /// The pre-index loop, kept verbatim as the oracle for the fuzz below.
+    /// The pre-table walk is the oracle for the fuzz below.
     fn remap_row_id_reference(index: &FragReuseIndex, row_id: u64) -> Option<u64> {
-        let mut mapped_value = Some(row_id);
-        for row_addr_map in index.row_addr_maps.iter() {
-            if mapped_value.is_some() {
-                mapped_value = row_addr_map
-                    .get(mapped_value.unwrap())
-                    .unwrap_or(mapped_value);
-            }
-        }
-        mapped_value
+        index.remap_row_id_linear(row_id)
     }
 
     /// How many versions answered for `row_id` along the reference walk; proves the fuzz
@@ -818,6 +865,7 @@ mod tests {
     fn first_version(index: &FragReuseIndex, frag: u32, from: u32) -> Option<u32> {
         index
             .versions_by_fragment
+            .as_ref()?
             .first_affecting(frag, from)
             .map(|(vi, _)| vi)
     }
@@ -989,7 +1037,10 @@ mod tests {
 
             // The table's own shape: it ends at the last rewritten fragment, and each
             // window is strictly ascending by version or `first_affecting` misdirects.
-            let vbf = &index.versions_by_fragment;
+            let vbf = index
+                .versions_by_fragment
+                .as_ref()
+                .expect("fuzz shapes stay within the span cap");
             if let (Some(&(_, first_len)), Some(&(_, last_len))) =
                 (vbf.slots.first(), vbf.slots.last())
             {
@@ -1019,26 +1070,6 @@ mod tests {
                     "seed {seed}, addr {probe:#x}, index {index:?}"
                 );
 
-                // Requirement the optimization rests on: any version that answers for an
-                // address must be listed against that address' fragment -- checked along
-                // the addresses actually reached, not just the starting one.
-                let mut cur = Some(probe);
-                for (vi, map) in index.row_addr_maps.iter().enumerate() {
-                    let Some(a) = cur else { break };
-                    if let Some(answer) = map.get(a) {
-                        let frag = RowAddress::from(a).fragment_id();
-                        let listed = vbf
-                            .first_affecting(frag, vi as u32)
-                            .is_some_and(|(v, _)| v == vi as u32);
-                        assert!(
-                            listed,
-                            "seed {seed}: version {vi} answers for fragment {frag} but is not \
-                             indexed against it"
-                        );
-                        cur = answer;
-                    }
-                }
-
                 probes += 1;
                 match expected {
                     None => deleted += 1,
@@ -1067,8 +1098,9 @@ mod tests {
             vec![1_000_000],
             vec![(1_000_001, 1)],
         )]);
-        assert_eq!(index.versions_by_fragment.base, 1_000_000);
-        assert_eq!(index.versions_by_fragment.slots.len(), 1);
+        let table = index.versions_by_fragment.as_ref().unwrap();
+        assert_eq!(table.base, 1_000_000);
+        assert_eq!(table.slots.len(), 1);
         assert_eq!(
             index.remap_row_id(addr(1_000_000, 0)),
             Some(addr(1_000_001, 0))
@@ -1079,17 +1111,99 @@ mod tests {
         assert_eq!(first_version(&index, 1_000_002, 0), None);
     }
 
-    #[cfg(debug_assertions)]
     #[test]
-    #[should_panic(expected = "not indexed against it")]
     fn test_incomplete_table_is_caught() {
-        let mut index = two_round_index();
-        index.versions_by_fragment.entries.clear();
-        for slot in index.versions_by_fragment.slots.iter_mut() {
+        let index = two_round_index();
+        let mut table = index.versions_by_fragment.clone().unwrap();
+        assert!(table.check_complete(&index.row_addr_maps).is_ok());
+        table.entries.clear();
+        for slot in table.slots.iter_mut() {
             *slot = (0, 0);
         }
-        index
-            .versions_by_fragment
-            .check_complete(&index.row_addr_maps);
+        assert!(table.check_complete(&index.row_addr_maps).is_err());
+    }
+
+    #[test]
+    fn test_spread_out_fragment_ids_fall_back_to_the_linear_walk() {
+        // Two fragments a million ids apart: a table would be 8 MB for two entries, so
+        // none is built and the walk probes every version instead. Answers are unchanged.
+        let index = index_from(vec![
+            compact_round(&[(3, 0)], vec![3], vec![(4, 1)]),
+            compact_round(&[(1_000_000, 0)], vec![1_000_000], vec![(1_000_001, 1)]),
+        ]);
+        assert!(index.versions_by_fragment.is_none());
+        assert!(
+            index.deep_size_of() < 4096,
+            "{} bytes",
+            index.deep_size_of()
+        );
+        for probe in [
+            addr(3, 0),
+            addr(3, 1),
+            addr(1_000_000, 0),
+            addr(500_000, 7),
+            addr(0, 0),
+        ] {
+            assert_eq!(
+                index.remap_row_id(probe),
+                remap_row_id_reference(&index, probe)
+            );
+        }
+        assert_eq!(index.remap_row_id(addr(3, 0)), Some(addr(4, 0)));
+        assert_eq!(
+            index.remap_row_id(addr(1_000_000, 0)),
+            Some(addr(1_000_001, 0))
+        );
+    }
+
+    #[test]
+    fn test_remap_row_id_matches_reference_with_a_high_base() {
+        // Same shapes as the main fuzz, shifted to where an aged dataset's ids live, so the
+        // `frag - base` arithmetic and the below-base early return are what is exercised.
+        const SHIFT: u32 = 3_000_000;
+        let shift = |m: RowAddrRemap| -> RowAddrRemap {
+            match m {
+                RowAddrRemap::Direct(map) => RowAddrRemap::direct(
+                    map.into_iter()
+                        .map(|(k, v)| {
+                            let up = |a: u64| {
+                                let a = RowAddress::from(a);
+                                addr(a.fragment_id() + SHIFT, a.row_offset())
+                            };
+                            (up(k), v.map(up))
+                        })
+                        .collect(),
+                ),
+                RowAddrRemap::Compact(_) => m,
+            }
+        };
+        let mut probes = 0u64;
+        for seed in 0..300u64 {
+            let mut rng = SmallRng::seed_from_u64(seed);
+            let maps = (0..rng.random_range(1..8))
+                .map(|_| shift(random_direct(&mut rng)))
+                .collect::<Vec<_>>();
+            let index = index_from(maps);
+            for frag in [
+                0,
+                1,
+                SHIFT - 1,
+                SHIFT,
+                SHIFT + 3,
+                SHIFT + FUZZ_FRAGS + 1,
+                u32::MAX,
+            ] {
+                for offset in 0..=FUZZ_ROWS {
+                    let probe = addr(frag, offset);
+                    assert_eq!(
+                        index.remap_row_id(probe),
+                        remap_row_id_reference(&index, probe),
+                        "seed {seed}, addr {probe:#x}"
+                    );
+                    probes += 1;
+                }
+            }
+        }
+        assert!(probes > 10_000, "only {probes} probes");
     }
 }

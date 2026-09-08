@@ -376,7 +376,8 @@ pub fn build(p: BuildParams, form: Form) -> (FragReuseIndex, BuildStats) {
     }
 
     let index =
-        FragReuseIndex::new_from_remaps(Uuid::new_v4(), maps, FragReuseIndexDetails { versions });
+        FragReuseIndex::new_from_remaps(Uuid::new_v4(), maps, FragReuseIndexDetails { versions })
+            .unwrap();
     stats.build_millis = started.elapsed().as_millis();
     stats.deep_size = lance_core::deepsize::DeepSizeOf::deep_size_of(&index);
     (index, stats)

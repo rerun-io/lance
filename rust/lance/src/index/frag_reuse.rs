@@ -98,11 +98,7 @@ pub(crate) async fn open_frag_reuse_index_with_mode(
             }
             row_id_maps.push(RowAddrRemap::direct(row_id_map));
         }
-        return Ok(FragReuseIndex::new_from_remaps(
-            uuid,
-            row_id_maps,
-            details.clone(),
-        ));
+        return FragReuseIndex::new_from_remaps(uuid, row_id_maps, details.clone());
     }
 
     // Build the compact form rather than a materialized per-row map. This runs on every
@@ -153,11 +149,7 @@ pub(crate) async fn open_frag_reuse_index_with_mode(
         row_addr_maps.push(RowAddrRemap::compact(groups)?);
     }
 
-    Ok(FragReuseIndex::new_from_remaps(
-        uuid,
-        row_addr_maps,
-        details.clone(),
-    ))
+    FragReuseIndex::new_from_remaps(uuid, row_addr_maps, details.clone())
 }
 
 pub(crate) async fn build_new_frag_reuse_index(

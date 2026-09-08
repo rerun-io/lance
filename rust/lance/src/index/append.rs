@@ -1359,7 +1359,8 @@ mod tests {
                     }],
                 }],
             },
-        );
+        )
+        .unwrap();
 
         assert!(fragment_reuse_affects_segments(
             &frag_reuse_index,

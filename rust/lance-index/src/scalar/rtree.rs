@@ -1435,14 +1435,17 @@ mod tests {
         let remapped_null = RowAddress::new_from_parts(2, 1).into();
         expected_geometry = RowAddrTreeMap::new();
         expected_geometry.insert(remapped_geometry);
-        let remapper = FragReuseIndexHandle(Arc::new(FragReuseIndex::new(
-            uuid::Uuid::new_v4(),
-            vec![HashMap::from([
-                (0, Some(remapped_geometry)),
-                (1, Some(remapped_null)),
-            ])],
-            FragReuseIndexDetails { versions: vec![] },
-        )));
+        let remapper = FragReuseIndexHandle(Arc::new(
+            FragReuseIndex::new(
+                uuid::Uuid::new_v4(),
+                vec![HashMap::from([
+                    (0, Some(remapped_geometry)),
+                    (1, Some(remapped_null)),
+                ])],
+                FragReuseIndexDetails { versions: vec![] },
+            )
+            .unwrap(),
+        ));
         let mut first_index = first_index.as_ref().clone();
         first_index.frag_reuse_index = Some(Arc::new(remapper));
 
