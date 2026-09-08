@@ -61,6 +61,24 @@ use crate::dataset::fragment::{FileFragment, FragReadConfig, GenericFileReader};
 /// only non-indexed fields contributes nothing. An overlay whose
 /// `committed_version <= index_version` is already incorporated by the index and
 /// is ignored.
+/// Whether `fragment` carries an overlay on one of `indexed_fields` that was committed after
+/// `index_version`, i.e. an overlay whose values an index segment stamped `index_version` has
+/// not incorporated. Write-side counterpart of the reader gate in [`overlay_exclusion_offsets`].
+pub fn fragment_has_newer_indexed_overlay(
+    fragment: &Fragment,
+    indexed_fields: &[i32],
+    index_version: u64,
+) -> bool {
+    fragment.overlays.iter().any(|overlay| {
+        overlay.committed_version > index_version
+            && overlay
+                .data_file
+                .fields
+                .iter()
+                .any(|field_id| indexed_fields.contains(field_id))
+    })
+}
+
 pub fn overlay_exclusion_offsets(
     overlays: &[DataOverlayFile],
     indexed_field_ids: &[i32],
