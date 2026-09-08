@@ -648,7 +648,7 @@ struct OldSegments<'a> {
     segments: Vec<OldSegment<'a>>,
     keys: Vec<Vec<&'a OrderableScalarValue>>,
     pos: Vec<usize>,
-    heap: BinaryHeap<Reverse<BitmapHeapItem>>,
+    heap: BinaryHeap<Reverse<SegmentHeapItem<'a>>>,
     null_taken: bool,
 }
 
@@ -661,10 +661,7 @@ impl<'a> OldSegments<'a> {
         let mut heap = BinaryHeap::with_capacity(segments.len());
         for (shard_idx, segment_keys) in keys.iter().enumerate() {
             if let Some(key) = segment_keys.first() {
-                heap.push(Reverse(BitmapHeapItem {
-                    key: (*key).clone(),
-                    shard_idx,
-                }));
+                heap.push(Reverse(SegmentHeapItem { key, shard_idx }));
             }
         }
         Self {
@@ -676,8 +673,8 @@ impl<'a> OldSegments<'a> {
         }
     }
 
-    fn peek_key(&self) -> Option<&OrderableScalarValue> {
-        self.heap.peek().map(|Reverse(item)| &item.key)
+    fn peek_key(&self) -> Option<&'a OrderableScalarValue> {
+        self.heap.peek().map(|Reverse(item)| item.key)
     }
 
     /// Union every segment's posting for the smallest pending key.
@@ -685,18 +682,20 @@ impl<'a> OldSegments<'a> {
         let Some(Reverse(item)) = self.heap.pop() else {
             return Ok(None);
         };
-        let mut merged = self.load_filtered(item.shard_idx, &item.key).await?;
+        let mut merged = self.load_filtered(item.shard_idx, item.key).await?;
         self.advance(item.shard_idx);
 
-        while self.peek_key() == Some(&item.key) {
+        while self.peek_key() == Some(item.key) {
             let Some(Reverse(next)) = self.heap.pop() else {
                 break;
             };
-            merged |= &self.load_filtered(next.shard_idx, &item.key).await?;
+            merged |= &self.load_filtered(next.shard_idx, item.key).await?;
             self.advance(next.shard_idx);
         }
 
-        Ok(Some((item.key.0, merged)))
+        // The only clone left is this one, per key emitted rather than per key
+        // per segment, because the caller needs an owned key to write.
+        Ok(Some((item.key.0.clone(), merged)))
     }
 
     /// Union of every segment's null postings, or `None` once taken or if no
@@ -734,10 +733,7 @@ impl<'a> OldSegments<'a> {
     fn advance(&mut self, shard_idx: usize) {
         self.pos[shard_idx] += 1;
         if let Some(key) = self.keys[shard_idx].get(self.pos[shard_idx]) {
-            self.heap.push(Reverse(BitmapHeapItem {
-                key: (*key).clone(),
-                shard_idx,
-            }));
+            self.heap.push(Reverse(SegmentHeapItem { key, shard_idx }));
         }
     }
 }
@@ -1333,6 +1329,33 @@ impl Ord for BitmapHeapItem {
 }
 
 impl PartialOrd for BitmapHeapItem {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+/// [`BitmapHeapItem`] for a merge whose keys outlive the heap.
+///
+/// [`merge_shards`](BitmapIndexPlugin::merge_shards) reads its keys out of a
+/// per-shard batch that is replaced as the cursor advances, so it has to own
+/// them. [`OldSegments`] instead walks each segment's resident `index_map`, so
+/// borrowing avoids a `ScalarValue` clone -- an allocation apiece for string
+/// keys -- for every key of every segment.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct SegmentHeapItem<'a> {
+    key: &'a OrderableScalarValue,
+    shard_idx: usize,
+}
+
+impl Ord for SegmentHeapItem<'_> {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.key
+            .cmp(other.key)
+            .then_with(|| self.shard_idx.cmp(&other.shard_idx))
+    }
+}
+
+impl PartialOrd for SegmentHeapItem<'_> {
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
         Some(self.cmp(other))
     }
