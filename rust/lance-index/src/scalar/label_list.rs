@@ -492,8 +492,9 @@ async fn write_label_list_bitmap_index(
 /// A [`LabelListIndex`] is a [`BitmapIndex`] over the unnested list values plus a
 /// separate `list_nulls` row set. Because distributed segments cover disjoint rows
 /// (distinct fragments), merging is a cheap union of the underlying bitmap states
-/// and of the `list_nulls` sets — no re-scan of source data is required. This
-/// mirrors [`crate::scalar::bitmap::merge_bitmap_indices`] but also carries the
+/// and of the `list_nulls` sets — no re-scan of source data is required. Unlike
+/// [`crate::scalar::bitmap::BitmapIndex::merge_segments`], which streams a k-way
+/// merge, this unions the bitmap states in memory and also carries the
 /// per-segment `list_nulls`. When `old_data_filter` is provided, rows from
 /// retired fragments are removed from both the value bitmaps and `list_nulls`.
 pub async fn merge_label_list_indices(
