@@ -4555,6 +4555,13 @@ mod tests {
             .unwrap();
 
         let dataset = DatasetBuilder::from_uri(test_uri).load().await.unwrap();
+        // Two segments went in, so this exercised the K-way path rather than the
+        // single-segment `update` this change does not touch.
+        assert_eq!(
+            dataset.load_indices_by_name("cat_idx").await.unwrap().len(),
+            1,
+            "the optimize must have consolidated both segments"
+        );
         // ids 0..25 are now 'Z'; the remaining A/B/C counts come from ids 25..100.
         assert_eq!(count_cat(&dataset, "Z").await, 25, "updated rows missing");
         for (cat, expected) in [("A", 25), ("B", 25), ("C", 25)] {
