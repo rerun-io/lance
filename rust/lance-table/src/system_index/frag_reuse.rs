@@ -244,8 +244,13 @@ struct VersionsByFragment {
 /// would hold, with a floor so small indexes are never refused. A well-formed reuse index
 /// lists fragments within a few multiples of its own size; a band far wider than that means
 /// a corrupt fragment id, and building the table would turn one bad id into gigabytes.
+///
+/// This bounds the table at 8 B × 64 × pairs -- 512 bytes per listed pair, 512 KB at the
+/// floor: 5 MB for a 10k-pair index, 51 MB for 100k. Only an index whose fragments are
+/// spread 64× wider than their count reaches it; a corrupt id overshoots it by orders of
+/// magnitude and gets no table at all. Whatever is built is reported through `DeepSizeOf`.
 const MAX_SPAN_PER_PAIR: u64 = 64;
-const MIN_SPAN: u64 = 1 << 16;
+const MIN_SPAN: u64 = 65_536;
 
 impl std::fmt::Debug for VersionsByFragment {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
