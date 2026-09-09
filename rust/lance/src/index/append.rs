@@ -626,21 +626,31 @@ async fn merge_scalar_indices<'a>(
             .min()
             .unwrap_or(dataset.manifest.version);
         let new_dataset_version = if reference_index.can_remap() {
-            for segment in selected_old_indices.iter() {
-                let Some(carried_over) =
-                    segment.effective_fragment_bitmap(&dataset.fragment_bitmap)
-                else {
-                    continue;
-                };
-                for fragment in dataset.manifest.fragments.iter() {
-                    if carried_over.contains(fragment.id as u32)
-                        && fragment_has_newer_indexed_overlay(
-                            fragment,
-                            &segment.fields,
-                            segment.dataset_version,
-                        )
-                    {
-                        frag_bitmap.remove(fragment.id as u32);
+            // Only a fragment that carries an overlay can leave the coverage, so walk
+            // those rather than every fragment in the manifest per source segment.
+            let overlaid: Vec<&Fragment> = dataset
+                .manifest
+                .fragments
+                .iter()
+                .filter(|fragment| !fragment.overlays.is_empty())
+                .collect();
+            if !overlaid.is_empty() {
+                for segment in selected_old_indices.iter() {
+                    let Some(carried_over) =
+                        segment.effective_fragment_bitmap(&dataset.fragment_bitmap)
+                    else {
+                        continue;
+                    };
+                    for fragment in overlaid.iter() {
+                        if carried_over.contains(fragment.id as u32)
+                            && fragment_has_newer_indexed_overlay(
+                                fragment,
+                                &segment.fields,
+                                segment.dataset_version,
+                            )
+                        {
+                            frag_bitmap.remove(fragment.id as u32);
+                        }
                     }
                 }
             }
