@@ -35,6 +35,7 @@ use super::vector::{LogicalVectorIndex, fresh_vector_segment_params};
 use super::{CreateIndexBuilder, DatasetIndexInternalExt};
 use crate::dataset::Dataset;
 use crate::dataset::index::LanceIndexStoreExt;
+use crate::dataset::overlay::fragment_has_newer_indexed_overlay;
 use crate::dataset::rowids::load_row_id_sequences;
 use crate::index::scalar::{IndexDetails, fetch_index_details, load_training_data};
 use crate::index::vector_index_details_default;
@@ -612,12 +613,52 @@ async fn merge_scalar_indices<'a>(
                 }
             }
         };
+        // `dataset_version` gates two readers: `cleanup_frag_reuse_index` retires reuse versions
+        // at or below it, and overlay masking treats overlays committed at or below it as
+        // incorporated. A type that remaps through the fragment-reuse index (`can_remap`) merges
+        // caught up with this manifest, but the entries it carries over from a source never
+        // incorporate overlays committed after that source was built, so those fragments leave
+        // the coverage: readers scan them and the next optimize re-indexes them. Types that do
+        // not remap keep the oldest source's stamp.
         let source_dataset_version = selected_old_indices
             .iter()
             .map(|index| index.dataset_version)
             .min()
             .unwrap_or(dataset.manifest.version);
-        (created_index, source_dataset_version)
+        let new_dataset_version = if reference_index.can_remap() {
+            // Only a fragment that carries an overlay can leave the coverage, so walk
+            // those rather than every fragment in the manifest per source segment.
+            let overlaid: Vec<&Fragment> = dataset
+                .manifest
+                .fragments
+                .iter()
+                .filter(|fragment| !fragment.overlays.is_empty())
+                .collect();
+            if !overlaid.is_empty() {
+                for segment in selected_old_indices.iter() {
+                    let Some(carried_over) =
+                        segment.effective_fragment_bitmap(&dataset.fragment_bitmap)
+                    else {
+                        continue;
+                    };
+                    for fragment in overlaid.iter() {
+                        if carried_over.contains(fragment.id as u32)
+                            && fragment_has_newer_indexed_overlay(
+                                fragment,
+                                &segment.fields,
+                                segment.dataset_version,
+                            )
+                        {
+                            frag_bitmap.remove(fragment.id as u32);
+                        }
+                    }
+                }
+            }
+            dataset.manifest.version
+        } else {
+            source_dataset_version
+        };
+        (created_index, new_dataset_version)
     };
 
     Ok(Some((

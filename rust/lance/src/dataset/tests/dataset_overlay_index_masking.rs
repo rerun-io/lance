@@ -831,14 +831,51 @@ async fn test_ngram_optimize_preserves_overlay_staleness() {
         vec![Arc::new(StringArray::from(vec![Some("cherry mango")]))],
     )
     .await;
+    let overlay_version = dataset.manifest.version;
+
+    // The merge is stamped with the manifest it read, so the overlay's staleness can no longer
+    // hide behind the version gate: the overlaid fragment must leave the coverage instead,
+    // while the fragment the overlay did not touch stays covered.
+    let built_from = dataset.manifest.version;
     dataset
         .optimize_indices(&OptimizeOptions::merge(2))
         .await
         .unwrap();
-
     let committed = dataset.load_indices_by_name("text_ngram").await.unwrap();
     assert_eq!(committed.len(), 1);
-    assert_eq!(committed[0].dataset_version, source_version);
+    assert!(committed[0].dataset_version > source_version);
+    assert_eq!(committed[0].dataset_version, built_from);
+    let coverage = committed[0].fragment_bitmap.as_ref().unwrap();
+    assert!(
+        !coverage.contains(0),
+        "fragment 0 carries a newer overlay on the indexed field and must leave the coverage"
+    );
+    assert!(
+        coverage.contains(1),
+        "fragment 1 has no overlay and must stay covered"
+    );
+    assert_eq!(
+        ids_matching(&dataset, "contains(text, 'apple')").await,
+        vec![0]
+    );
+    assert_eq!(
+        ids_matching(&dataset, "contains(text, 'mango')").await,
+        vec![1, 6]
+    );
+
+    // The uncovered fragment is unindexed again, so the next optimize re-reads it with the
+    // overlay applied and folds it back into a segment that is now past the overlay.
+    dataset
+        .optimize_indices(&OptimizeOptions::merge(2))
+        .await
+        .unwrap();
+    let committed = dataset.load_indices_by_name("text_ngram").await.unwrap();
+    assert_eq!(committed.len(), 1);
+    assert!(committed[0].dataset_version >= overlay_version);
+    assert!(
+        committed[0].fragment_bitmap.as_ref().unwrap().contains(0),
+        "re-indexing must restore fragment 0's coverage"
+    );
     assert_eq!(
         ids_matching(&dataset, "contains(text, 'apple')").await,
         vec![0]

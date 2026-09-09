@@ -5,6 +5,7 @@
 //!
 
 use crate::Result;
+use crate::dataset::overlay::fragment_has_newer_indexed_overlay;
 use crate::dataset::transaction::{Operation, Transaction};
 use crate::index::DatasetIndexExt;
 use crate::index::frag_reuse::{load_frag_reuse_index_details, open_frag_reuse_index_with_mode};
@@ -351,15 +352,11 @@ async fn remap_index(dataset: &mut Dataset, index_id: &Uuid) -> Result<()> {
     // Exclude those fragments so queries scan their current values instead.
     if let Some(fragment_bitmap) = &mut bitmap_after_remap {
         for fragment in dataset.manifest.fragments.iter() {
-            let has_newer_indexed_overlay = fragment.overlays.iter().any(|overlay| {
-                overlay.committed_version > curr_index_meta.dataset_version
-                    && overlay
-                        .data_file
-                        .fields
-                        .iter()
-                        .any(|field_id| curr_index_meta.fields.contains(field_id))
-            });
-            if has_newer_indexed_overlay {
+            if fragment_has_newer_indexed_overlay(
+                fragment,
+                &curr_index_meta.fields,
+                curr_index_meta.dataset_version,
+            ) {
                 fragment_bitmap.remove(fragment.id as u32);
             }
         }

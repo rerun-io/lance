@@ -50,6 +50,24 @@ use lance_table::utils::stream::ReadBatchFut;
 
 use crate::dataset::fragment::{FileFragment, FragReadConfig, GenericFileReader};
 
+/// Whether `fragment` carries an overlay on one of `indexed_fields` that was committed after
+/// `index_version`, i.e. an overlay whose values an index segment stamped `index_version` has
+/// not incorporated. Write-side counterpart of the reader gate in [`overlay_exclusion_offsets`].
+pub fn fragment_has_newer_indexed_overlay(
+    fragment: &Fragment,
+    indexed_fields: &[i32],
+    index_version: u64,
+) -> bool {
+    fragment.overlays.iter().any(|overlay| {
+        overlay.committed_version > index_version
+            && overlay
+                .data_file
+                .fields
+                .iter()
+                .any(|field_id| indexed_fields.contains(field_id))
+    })
+}
+
 /// The physical offsets within a fragment whose value for an indexed field may be
 /// stale relative to an index built at `index_version`, and so must be excluded
 /// from that index's results and re-evaluated against current values on the flat
