@@ -50,17 +50,6 @@ use lance_table::utils::stream::ReadBatchFut;
 
 use crate::dataset::fragment::{FileFragment, FragReadConfig, GenericFileReader};
 
-/// The physical offsets within a fragment whose value for an indexed field may be
-/// stale relative to an index built at `index_version`, and so must be excluded
-/// from that index's results and re-evaluated against current values on the flat
-/// path.
-///
-/// The set is the union, over every overlay whose `committed_version` is newer
-/// than `index_version`, of that overlay's coverage **restricted to the indexed
-/// fields**. The restriction makes exclusion field-aware: an overlay that touches
-/// only non-indexed fields contributes nothing. An overlay whose
-/// `committed_version <= index_version` is already incorporated by the index and
-/// is ignored.
 /// Whether `fragment` carries an overlay on one of `indexed_fields` that was committed after
 /// `index_version`, i.e. an overlay whose values an index segment stamped `index_version` has
 /// not incorporated. Write-side counterpart of the reader gate in [`overlay_exclusion_offsets`].
@@ -79,6 +68,17 @@ pub fn fragment_has_newer_indexed_overlay(
     })
 }
 
+/// The physical offsets within a fragment whose value for an indexed field may be
+/// stale relative to an index built at `index_version`, and so must be excluded
+/// from that index's results and re-evaluated against current values on the flat
+/// path.
+///
+/// The set is the union, over every overlay whose `committed_version` is newer
+/// than `index_version`, of that overlay's coverage **restricted to the indexed
+/// fields**. The restriction makes exclusion field-aware: an overlay that touches
+/// only non-indexed fields contributes nothing. An overlay whose
+/// `committed_version <= index_version` is already incorporated by the index and
+/// is ignored.
 pub fn overlay_exclusion_offsets(
     overlays: &[DataOverlayFile],
     indexed_field_ids: &[i32],
