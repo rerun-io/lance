@@ -4066,6 +4066,7 @@ mod tests {
                 meta: self.object_meta(location),
                 range,
                 attributes: Attributes::default(),
+                extensions: Default::default(),
             })
         }
 
