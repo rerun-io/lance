@@ -247,8 +247,13 @@ pub struct CompactionOptions {
     /// is updated and will be used to perform remapping later.
     pub defer_index_remap: bool,
     /// How the old-to-new row-address mapping used to remap indices is built.
-    /// Defaults to [`IndexRemapMode::Direct`].
-    #[serde(default)]
+    ///
+    /// Defaults to the same `LANCE_FRAG_REUSE_REMAP_MODE` setting readers use (see
+    /// [`ReadParams::frag_reuse_remap_mode`](crate::dataset::ReadParams::frag_reuse_remap_mode)),
+    /// and to [`IndexRemapMode::Direct`] when that is unset. Both sides expand the same reuse
+    /// payload, so a deployment that moved readers off the direct form to bound memory wants
+    /// compaction to follow rather than keep building the per-row map it was trying to avoid.
+    #[serde(default = "crate::dataset::default_frag_reuse_remap_mode")]
     pub index_remap_mode: IndexRemapMode,
     /// The compaction mode to use. When set, this takes priority over the
     /// deprecated `enable_binary_copy` and `enable_binary_copy_force` fields.
@@ -294,7 +299,7 @@ impl Default for CompactionOptions {
             batch_size: None,
             io_buffer_size: None,
             defer_index_remap: false,
-            index_remap_mode: IndexRemapMode::Direct,
+            index_remap_mode: crate::dataset::default_frag_reuse_remap_mode(),
             compaction_mode: None,
             enable_binary_copy: false,
             enable_binary_copy_force: false,
@@ -6488,7 +6493,10 @@ mod tests {
         );
         assert_eq!(opts.defer_index_remap, defaults.defer_index_remap);
         assert_eq!(opts.index_remap_mode, defaults.index_remap_mode);
-        assert_eq!(opts.index_remap_mode, IndexRemapMode::Direct);
+        assert_eq!(
+            opts.index_remap_mode,
+            crate::dataset::default_frag_reuse_remap_mode()
+        );
         assert_eq!(opts.batch_size, defaults.batch_size);
         assert_eq!(opts.compaction_mode, defaults.compaction_mode);
         assert_eq!(
