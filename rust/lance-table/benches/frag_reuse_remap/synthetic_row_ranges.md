@@ -23,7 +23,7 @@ row addresses go stale. Rather than rewrite every index immediately, Lance
 records the old-address to new-address mapping in the **fragment reuse index**
 (FRI) and translates addresses as index state is read. `FragReuseIndex` holds one
 remap per compaction round, oldest first, in `row_addr_maps`; a lookup walks the
-whole chain, feeding each version's output into the next.
+versions that rewrote its fragment, feeding each version's output into the next.
 
 Each link is a `RowAddrRemap`, which comes in two forms:
 
@@ -306,12 +306,13 @@ row band     │ init      │ v1 │ v2 │ v3 │ v4 │ v5 │ hops
 8192..M      │ --        │ ·  │ ·  │ ·  │ ·  │ ·  │  0
 ```
 
-`·` means the address is unchanged by that version. For `Compact` that is the
-cheap early-out — `frag_to_group.get(&frag)` misses and returns immediately,
-before any bitmap or range work.
+`·` means the address is unchanged by that version. Such a version is never visited:
+the per-fragment table lists only the versions that rewrote the address's current
+fragment, so the walk skips straight past it.
 
-**Every probe walks all 5 versions**; `remap_row_id` has no early exit. `hops` is
-how many of those versions do real work; `depth - hops` are cheap misses.
+**A probe visits only the versions listed for its fragment**; `remap_row_id` returns
+as soon as none remain. `hops` is how many versions do real work; the `depth - hops`
+versions that did not touch the fragment are never probed.
 
 Size-weighted average: `(4096·1 + 2048·2 + 1024·3 + 512·4 + 512·5) / 8192` =
 **1.9375 hops**. Half the rows hop once. In the limit the geometric layout converges
@@ -424,8 +425,8 @@ start           16:1
 ```
 
 `24:7681` — offset equals the original row number, as the oracle predicts. This is
-the 5-hop worst case in this configuration; a row in `f0..f3` cheap-misses v1
-through v4 and does real work only at v5.
+the 5-hop worst case in this configuration; a row in `f0..f3` skips v1 through v4 —
+they are not listed for its fragment — and does real work only at v5.
 
 ## Deletions
 
@@ -571,8 +572,8 @@ higher minimum rate (`b >= 1` gives 3.1%/round at a period of 32).
 ### Choose probes by survival
 
 A deleted row is **cheaper** to look up, not more expensive: once the chain hits a
-deletion, every remaining version does no work, because `remap_row_id`'s
-`if mapped_value.is_some()` guard skips the body for the rest of the loop.
+deletion, every remaining version does no work, because `remap_row_id` returns at
+the first version that reports the row deleted.
 
 So at high `b` the deep tail is mostly deletions, and probing it would measure
 *early termination* — how fast a dead row is discovered — rather than the deep live
@@ -653,7 +654,8 @@ things that look like they need tables do not:
   fill in `new_frags`' `physical_rows`, which is untimed setup.
 
 The only loop is over rounds — inherent, since the answer is the composition of
-`depth` links, and `remap_row_id` loops the same way. The loop body is O(1).
+`depth` links, and `remap_row_id` loops over the versions listed for the fragment.
+The loop body is O(1).
 
 ### Keep the oracle out of the timed loop
 
@@ -683,10 +685,11 @@ design, verified for `b` in `{0, 3, 6, 12}`:
 
 ## What the M region is for
 
-Probes drawn from `N..M` land in fragments that appear in no group, so every
-version cheap-misses. That is the dominant production case: most rows live in
-large settled fragments that compaction has not touched, and the interesting
-question is what walking a deep chain costs for them.
+Probes drawn from `N..M` land in fragments that appear in no group, so the
+per-fragment table answers in one bounds check and no version is probed. That is
+the dominant production case: most rows live in large settled fragments that
+compaction has not touched. These cells are depth-independent by construction;
+they measure the fixed cost of a lookup that finds nothing to do.
 
 `M` must map to fragment ids above the highest the cascade mints, or the probe
 becomes a hit and measures the wrong path.

@@ -101,10 +101,17 @@ impl RowAddrRemap {
         }
     }
 
+    /// Every fragment whose addresses this remap can answer non-`None` for.
+    ///
+    /// Must never under-report: callers skip a remap entirely for fragments absent from
+    /// this set, so a missing fragment silently drops that fragment's remaps. Over-reporting
+    /// only costs a `get` that answers `None`.
     pub fn affected_fragments(&self) -> RoaringBitmap {
         match self {
             Self::Compact(c) => RoaringBitmap::from_iter(c.frag_to_group.keys().copied()),
-            Self::Direct(m) => RoaringBitmap::from_iter(m.keys().map(|addr| (addr >> 32) as u32)),
+            Self::Direct(m) => {
+                RoaringBitmap::from_iter(m.keys().map(|&addr| RowAddress::from(addr).fragment_id()))
+            }
         }
     }
 
@@ -114,7 +121,7 @@ impl RowAddrRemap {
             Self::Direct(m) => {
                 if m.values().all(|v| v.is_none()) {
                     Some(RoaringBitmap::from_iter(
-                        m.keys().map(|addr| (addr >> 32) as u32),
+                        m.keys().map(|&addr| RowAddress::from(addr).fragment_id()),
                     ))
                 } else {
                     None
@@ -288,8 +295,9 @@ impl GroupRemap {
 
 /// Hasher for this module's integer-keyed maps.
 ///
-/// `remap_row_id` probes these maps once per reuse version per row address, so at
-/// hundreds of millions of rows the default SipHash dominates consolidation CPU.
+/// `CompactRowAddrRemap::get` probes `frag_to_group` once per call and `GroupRemap::get`
+/// probes `frags` once per hop of the reuse-index walk, so across hundreds of millions of
+/// lookups the default SipHash is a measurable cost that buys nothing.
 /// The keys are internal fragment ids, never attacker-supplied, so the hash-flooding
 /// resistance it buys is worth nothing here.
 ///
@@ -374,10 +382,35 @@ impl CompactRowAddrRemap {
 
     #[inline]
     pub fn get(&self, addr: u64) -> Option<Option<u64>> {
-        let frag = (addr >> 32) as u32;
         // Not in any rewrite group -> unaffected by this remap.
-        let gi = *self.frag_to_group.get(&frag)?;
-        Some(self.groups[gi].get(frag, addr as u32))
+        let gi = *self
+            .frag_to_group
+            .get(&RowAddress::from(addr).fragment_id())?;
+        self.get_in_group(gi, addr)
+    }
+
+    /// `(fragment id, group index)` for every old fragment this remap rewrote or deleted --
+    /// exactly the fragments [`Self::get`] answers `Some` for.
+    ///
+    /// Must never under-report: the reuse-index walk visits a remap only for fragments
+    /// listed here, so a missing fragment silently drops that fragment's remaps.
+    pub fn frag_groups(&self) -> impl Iterator<Item = (u32, usize)> + '_ {
+        self.frag_to_group.iter().map(|(&f, &g)| (f, g))
+    }
+
+    /// [`Self::get`] for a caller that already knows the fragment's group, skipping the
+    /// `frag_to_group` probe. `gi` must be what [`Self::frag_groups`] reports for `addr`'s
+    /// fragment; anything else is a caller bug, caught in debug builds.
+    #[inline]
+    pub fn get_in_group(&self, gi: usize, addr: u64) -> Option<Option<u64>> {
+        let addr = RowAddress::from(addr);
+        debug_assert_eq!(
+            self.frag_to_group.get(&addr.fragment_id()),
+            Some(&gi),
+            "group {gi} does not hold fragment {}",
+            addr.fragment_id()
+        );
+        Some(self.groups[gi].get(addr.fragment_id(), addr.row_offset()))
     }
 
     pub fn is_empty(&self) -> bool {

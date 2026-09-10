@@ -3776,12 +3776,12 @@ mod tests {
                 .await
                 .unwrap()
                 .expect("the deferred-remap compactions above leave a reuse index");
-            let served_compact = matches!(fri.row_addr_maps[0], RowAddrRemap::Compact(_));
+            let served_compact = matches!(fri.row_addr_maps()[0], RowAddrRemap::Compact(_));
             assert_eq!(
                 served_compact,
                 mode == IndexRemapMode::Compact,
                 "a shared session served {mode:?} the other form: {:?}",
-                fri.row_addr_maps[0]
+                fri.row_addr_maps()[0]
             );
             let total = reopened.count_rows(None).await.unwrap();
             let range = reopened

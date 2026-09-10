@@ -274,11 +274,14 @@ mod tests {
         uri_named_like_a_form
             .insert_with_key(
                 &key,
-                Arc::new(FragReuseIndex::new(
-                    uuid,
-                    vec![],
-                    lance_index::frag_reuse::FragReuseIndexDetails { versions: vec![] },
-                )),
+                Arc::new(
+                    FragReuseIndex::new(
+                        uuid,
+                        vec![],
+                        lance_index::frag_reuse::FragReuseIndexDetails { versions: vec![] },
+                    )
+                    .unwrap(),
+                ),
             )
             .await;
 

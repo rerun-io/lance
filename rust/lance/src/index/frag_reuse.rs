@@ -98,11 +98,7 @@ pub(crate) async fn open_frag_reuse_index_with_mode(
             }
             row_id_maps.push(RowAddrRemap::direct(row_id_map));
         }
-        return Ok(FragReuseIndex::new_from_remaps(
-            uuid,
-            row_id_maps,
-            details.clone(),
-        ));
+        return FragReuseIndex::new_from_remaps(uuid, row_id_maps, details.clone());
     }
 
     // Build the compact form rather than a materialized per-row map. This runs on every
@@ -153,11 +149,7 @@ pub(crate) async fn open_frag_reuse_index_with_mode(
         row_addr_maps.push(RowAddrRemap::compact(groups)?);
     }
 
-    Ok(FragReuseIndex::new_from_remaps(
-        uuid,
-        row_addr_maps,
-        details.clone(),
-    ))
+    FragReuseIndex::new_from_remaps(uuid, row_addr_maps, details.clone())
 }
 
 pub(crate) async fn build_new_frag_reuse_index(
@@ -407,7 +399,7 @@ mod tests {
         )
         .await
         .unwrap();
-        assert!(matches!(index.row_addr_maps[0], RowAddrRemap::Direct(_)));
+        assert!(matches!(index.row_addr_maps()[0], RowAddrRemap::Direct(_)));
     }
 
     #[tokio::test]
@@ -444,7 +436,7 @@ mod tests {
             vec![digest(10, 2)],
         )]]))
         .await;
-        assert!(matches!(index.row_addr_maps[0], RowAddrRemap::Compact(_)));
+        assert!(matches!(index.row_addr_maps()[0], RowAddrRemap::Compact(_)));
     }
 
     #[tokio::test]
@@ -708,7 +700,7 @@ mod tests {
             .collect();
         let index = open(&details(chain)).await;
 
-        assert_eq!(index.row_addr_maps.len(), VERSIONS as usize);
+        assert_eq!(index.row_addr_maps().len(), VERSIONS as usize);
         assert_eq!(index.remap_row_id(addr(0, 0)), Some(addr(VERSIONS, 0)));
         // Entering midway walks only the remaining links.
         assert_eq!(
@@ -744,7 +736,7 @@ mod tests {
         ]]))
         .await;
 
-        assert_eq!(index.row_addr_maps.len(), 1);
+        assert_eq!(index.row_addr_maps().len(), 1);
         assert_eq!(index.remap_row_id(addr(0, 1)), Some(addr(10, 1)));
         // Group 2's first row starts at its own new fragment, not offset 2 of frag 10.
         assert_eq!(index.remap_row_id(addr(1, 0)), Some(addr(11, 0)));
@@ -760,8 +752,8 @@ mod tests {
         #[case] expected_links: usize,
     ) {
         let index = open(&details(versions)).await;
-        assert_eq!(index.row_addr_maps.len(), expected_links);
-        assert!(index.row_addr_maps.iter().all(|map| map.is_empty()));
+        assert_eq!(index.row_addr_maps().len(), expected_links);
+        assert!(index.row_addr_maps().iter().all(|map| map.is_empty()));
         assert_eq!(index.remap_row_id(addr(0, 0)), Some(addr(0, 0)));
     }
 
