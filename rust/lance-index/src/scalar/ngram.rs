@@ -2416,14 +2416,17 @@ mod tests {
         // Compaction fused fragment 0 into fragment 2: row (0,0) survives at
         // (2,0), row (0,1) was deleted (maps to None). Row (1,0) isn't in the
         // map, so remap passes it through unchanged.
-        let fri = Arc::new(FragReuseIndex::new(
-            Uuid::new_v4(),
-            vec![HashMap::from([
-                (addr(0, 0), Some(addr(2, 0))),
-                (addr(0, 1), None),
-            ])],
-            FragReuseIndexDetails { versions: vec![] },
-        ));
+        let fri = Arc::new(
+            FragReuseIndex::new(
+                Uuid::new_v4(),
+                vec![HashMap::from([
+                    (addr(0, 0), Some(addr(2, 0))),
+                    (addr(0, 1), None),
+                ])],
+                FragReuseIndexDetails { versions: vec![] },
+            )
+            .unwrap(),
+        );
 
         // After remap the live rows sit in fragments 2 and 1; fragment 1 is retired.
         let filter = OldIndexDataFilter::Fragments {

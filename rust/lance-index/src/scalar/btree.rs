@@ -7153,13 +7153,15 @@ mod tests {
 
         // Querying for value == 0 should now return the remapped address, confirming
         // reconstruct threaded the FragReuseIndex through to the rebuilt BTreeIndex.
-        let frag_reuse_index: Arc<dyn crate::scalar::RowIdRemapper> = Arc::new(
-            FragReuseIndexHandle(Arc::new(FragReuseIndex::new_from_remaps(
-                Uuid::new_v4(),
-                vec![remap],
-                FragReuseIndexDetails { versions: vec![] },
-            ))),
-        );
+        let frag_reuse_index: Arc<dyn crate::scalar::RowIdRemapper> =
+            Arc::new(FragReuseIndexHandle(Arc::new(
+                FragReuseIndex::new_from_remaps(
+                    Uuid::new_v4(),
+                    vec![remap],
+                    FragReuseIndexDetails { versions: vec![] },
+                )
+                .unwrap(),
+            )));
         let reconstructed = state
             .reconstruct(
                 test_store.clone(),

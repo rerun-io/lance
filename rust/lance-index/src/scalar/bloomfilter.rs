@@ -2564,15 +2564,18 @@ mod tests {
         );
 
         let remapped_base = 2_u64 << 32;
-        let remapper = FragReuseIndexHandle(Arc::new(FragReuseIndex::new(
-            uuid::Uuid::new_v4(),
-            vec![HashMap::from([
-                (0, Some(remapped_base)),
-                (1, Some(remapped_base + 1)),
-                (2, Some(remapped_base + 2)),
-            ])],
-            FragReuseIndexDetails { versions: vec![] },
-        )));
+        let remapper = FragReuseIndexHandle(Arc::new(
+            FragReuseIndex::new(
+                uuid::Uuid::new_v4(),
+                vec![HashMap::from([
+                    (0, Some(remapped_base)),
+                    (1, Some(remapped_base + 1)),
+                    (2, Some(remapped_base + 2)),
+                ])],
+                FragReuseIndexDetails { versions: vec![] },
+            )
+            .unwrap(),
+        ));
         let remapped_first = BloomFilterIndex::load(
             first_store,
             Some(Arc::new(remapper)),

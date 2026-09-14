@@ -109,7 +109,7 @@ pub fn build_probes_n(bp: BuildParams, pp: ProbeParams, o: &Oracle, count: usize
             let a = o.start_addr(row);
             (a, o.walk(row))
         } else {
-            // Fragment ids no group covers, so every version cheap-misses.
+            // Fragment ids no group covers, so the walk finds nothing to visit.
             let off = row - bp.n;
             let a = (M_BASE + off / 128) << 32 | (off % 128);
             (a, Some(a))
