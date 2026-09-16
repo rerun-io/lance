@@ -512,6 +512,19 @@ impl BitmapIndex {
             metrics.record_part_load();
         }
 
+        let bitmap = self.read_bitmap_at(row_offset).await?;
+
+        self.index_cache
+            .insert_with_key(&cache_key, Arc::new(bitmap.clone()))
+            .await;
+
+        Ok(Arc::new(bitmap))
+    }
+
+    /// Read one row set straight from the lookup file, remapped through the
+    /// fragment-reuse index but neither served from nor written to the index
+    /// cache.
+    async fn read_bitmap_at(&self, row_offset: usize) -> Result<RowAddrTreeMap> {
         let page_lookup_file = self.lazy_reader.get().await?;
         let batch = page_lookup_file
             .read_range(row_offset..row_offset + 1, Some(&["bitmaps"]))
@@ -529,11 +542,25 @@ impl BitmapIndex {
             bitmap = fri.remap_row_addrs_tree_map(&bitmap);
         }
 
-        self.index_cache
-            .insert_with_key(&cache_key, Arc::new(bitmap.clone()))
-            .await;
+        Ok(bitmap)
+    }
 
-        Ok(Arc::new(bitmap))
+    /// Owned row set for `key`, bypassing the index cache.
+    ///
+    /// A merge reads every key of every source segment exactly once, and the
+    /// commit that follows retires those segments, so routing the reads through
+    /// the cache would only evict entries for indices that still exist. Returning
+    /// an owned value also lets the caller filter in place, where
+    /// [`Self::load_bitmap`] hands back an `Arc` to clone.
+    ///
+    /// Nulls are not in `index_map` -- [`OldSegments::take_null_bitmap`] reads
+    /// `null_map` for those -- so unlike `load_bitmap` this does not special-case
+    /// them and would return an empty set for a null key.
+    async fn read_bitmap_uncached(&self, key: &OrderableScalarValue) -> Result<RowAddrTreeMap> {
+        match self.index_map.get(key) {
+            Some(row_offset) => self.read_bitmap_at(*row_offset).await,
+            None => Ok(RowAddrTreeMap::default()),
+        }
     }
 
     pub(crate) fn value_type(&self) -> &DataType {
@@ -1411,10 +1438,14 @@ pub(crate) struct OldSegment<'a> {
 /// `index_map` order can be trusted for old and new files alike, which is what
 /// makes this work without an index version bump.
 ///
-/// Bitmaps are read one key at a time through [`BitmapIndex::load_bitmap`], the
-/// accessor that applies fragment-reuse remapping. Reading the lookup file's raw
-/// bytes would bypass it and emit row addresses pointing at fragments compaction
-/// has already retired, which under deferred index remapping is silent data loss.
+/// Bitmaps are read one key at a time through
+/// [`BitmapIndex::read_bitmap_uncached`], which applies fragment-reuse remapping
+/// like the query path's `load_bitmap` but skips the index cache: every source
+/// entry is read exactly once and the sources are retired right after, so caching
+/// them would only evict live entries. Reading the lookup file's raw bytes instead
+/// would skip the remap too and emit row addresses pointing at fragments
+/// compaction has already retired, which under deferred index remapping is silent
+/// data loss.
 ///
 /// Every source is sorted, so the smallest key any of them is currently
 /// positioned on is the next key overall. A min-heap holding one entry per live
@@ -1423,8 +1454,8 @@ pub(crate) struct OldSegment<'a> {
 /// so cloning would cost an allocation per key per source for string keys.
 ///
 /// The transient state is the merged bitmap for the current key plus one loaded
-/// bitmap per participating source. Each source's `index_map`, any bitmaps the
-/// index cache retains, and the output writer stay outside it.
+/// bitmap per participating source. Each source's `index_map` and the output
+/// writer stay outside it.
 struct OldSegments<'a> {
     segments: Vec<OldSegment<'a>>,
     key_iters: Vec<std::collections::btree_map::Keys<'a, OrderableScalarValue, usize>>,
@@ -1485,8 +1516,11 @@ impl<'a> OldSegments<'a> {
             self.heap.pop();
             self.consumed += 1;
             let segment = &self.segments[source_idx];
-            let loaded = segment.index.load_bitmap(key, None).await?;
-            merged |= &*retain_valid(Cow::Borrowed(loaded.as_ref()), segment.filter);
+            let mut bitmap = segment.index.read_bitmap_uncached(key).await?;
+            if let Some(filter) = segment.filter {
+                filter.retain_old_rows(&mut bitmap);
+            }
+            merged |= &bitmap;
             if let Some(next) = self.key_iters[source_idx].next() {
                 self.heap.push(Reverse((next, source_idx)));
             }
@@ -3888,6 +3922,49 @@ mod tests {
                 "seed {seed}: null row sets differ"
             );
         }
+    }
+
+    /// A merge must not populate the index cache with the source segments' row
+    /// sets: it reads each one once, and the commit that follows retires those
+    /// segments, so the entries would only evict live ones.
+    #[tokio::test]
+    async fn test_bitmap_merge_does_not_cache_source_bitmaps() {
+        let cache = LanceCache::with_capacity(64 * 1024 * 1024);
+        let tmpdir = TempObjDir::default();
+        let store = Arc::new(LanceIndexStore::new(
+            Arc::new(ObjectStore::local()),
+            tmpdir.clone(),
+            Arc::new(cache.clone()),
+        ));
+        BitmapIndexPlugin::train_bitmap_index(
+            value_row_id_stream(&[(Some("red"), addr(0, 0)), (Some("blue"), addr(0, 1))]),
+            store.as_ref(),
+        )
+        .await
+        .unwrap();
+        let segment = BitmapIndex::load(store, None, &cache).await.unwrap();
+        assert_eq!(cache.size().await, 0, "loading must not read row sets");
+
+        let (_dest_dir, dest_store) = test_util::index_store();
+        BitmapIndex::merge_segments(
+            std::slice::from_ref(&segment),
+            value_row_id_stream(&[(Some("green"), addr(1, 0))]),
+            dest_store.as_ref(),
+            &[None],
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            cache.size().await,
+            0,
+            "the merge cached the source segment's row sets"
+        );
+
+        // A query on the same segment still caches, so the bypass is scoped to
+        // the merge rather than disabling caching for the index.
+        let query = SargableQuery::Equals(ScalarValue::Utf8(Some("red".to_string())));
+        segment.search(&query, &NoOpMetricsCollector).await.unwrap();
+        assert!(cache.size().await > 0, "queries must still cache row sets");
     }
 
     /// Unsorted input must be rejected. It would reopen a run for a key already
