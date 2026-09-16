@@ -1716,6 +1716,47 @@ pub async fn merge_index_files(
     Ok(())
 }
 
+/// Enforce the ordering a bitmap build requires, once per value change.
+///
+/// A run is a maximal group of equal keys, so reopening a run for a key already
+/// written loses rows silently: the old-key cursor has advanced past it on an
+/// earlier, larger run, so it leaves as an old-only row and returns later
+/// carrying only new rows, and `BitmapIndex::load` keys `index_map` by value
+/// and keeps only the last of the two file offsets. The same holds for nulls,
+/// which `load` funnels into `null_map` from the last null entry it sees.
+///
+/// Only the non-null keys have to ascend. Nulls are collected separately rather
+/// than merge-joined by value, so a single null run is correct wherever it
+/// falls, which lets a caller sort nulls first or last. `null_run_closed` says
+/// whether one has already been flushed, making a second run detectable.
+///
+/// Both keys come from the same column, so they share a `ScalarValue` variant
+/// and `OrderableScalarValue`'s `Ord` cannot panic comparing them.
+fn check_run_order(
+    previous: &ScalarValue,
+    next: &ScalarValue,
+    null_run_closed: bool,
+) -> Result<()> {
+    if next.is_null() {
+        if null_run_closed {
+            return Err(Error::invalid_input(
+                "bitmap index: input is not sorted by value, it has more than one run of nulls"
+                    .to_string(),
+            ));
+        }
+        return Ok(());
+    }
+    if previous.is_null() {
+        return Ok(());
+    }
+    if OrderableScalarValue(next.clone()) <= OrderableScalarValue(previous.clone()) {
+        return Err(Error::invalid_input(format!(
+            "bitmap index: input must be sorted by value, but {next} follows {previous}"
+        )));
+    }
+    Ok(())
+}
+
 /// Build a bitmap index map from value-sorted `(value, row_id)` input, emitting
 /// one key at a time into `writer`.
 ///
@@ -1723,11 +1764,12 @@ pub async fn merge_index_files(
 /// own global buffers in the same file can reuse this. `LabelListIndex` does
 /// exactly that for its `list_nulls` set.
 ///
-/// Input must be sorted by value with nulls first. This function's transient
-/// aggregation state is one key's bitmap at a time. `old_segments` are
-/// merge-joined in through [`OldSegments`], loading each old bitmap on demand;
-/// their already-loaded `index_map`s remain resident separately, outside that
-/// state.
+/// Input must be sorted ascending by value, with nulls in a single run that may
+/// lead or trail; see [`check_run_order`] for what is rejected. This function's
+/// transient aggregation state is one key's bitmap at a time. `old_segments`
+/// are merge-joined in through [`OldSegments`], loading each old bitmap on
+/// demand; their already-loaded `index_map`s remain resident separately,
+/// outside that state.
 pub(crate) async fn build_index_map(
     mut data_source: SendableRecordBatchStream,
     old_segments: Vec<OldSegment<'_>>,
@@ -1761,23 +1803,7 @@ pub(crate) async fn build_index_map(
                 _ => {
                     // Value changed — flush the previous run.
                     if let Some(prev_key) = current_key.take() {
-                        // This function assumes value-sorted, nulls-first input
-                        // and does not check it in release builds. Violated
-                        // input emits one key twice -- the old-key cursor
-                        // advances past it on an earlier, larger run, so it
-                        // leaves as an old-only row and returns later carrying
-                        // only new rows. Neither row is complete, and
-                        // `BitmapIndex::load` inserts both into `index_map`,
-                        // so the later one shadows the earlier and its rows
-                        // are lost.
-                        debug_assert!(
-                            OrderableScalarValue(key.clone())
-                                > OrderableScalarValue(prev_key.clone()),
-                            "build_index_map input must be sorted ascending by value \
-                             with nulls first; got key {:?} after {:?}",
-                            key,
-                            prev_key
-                        );
+                        check_run_order(&prev_key, &key, emitted_null)?;
                         let mut prev_bitmap = std::mem::take(&mut current_bitmap);
                         BitmapIndexPlugin::finish_run(
                             prev_key,
@@ -3862,6 +3888,51 @@ mod tests {
                 "seed {seed}: null row sets differ"
             );
         }
+    }
+
+    /// Unsorted input must be rejected. It would reopen a run for a key already
+    /// written, and `load` keeps only the last file offset per key, so the earlier
+    /// row set would vanish silently. Nulls may lead or trail, but only once.
+    #[rstest]
+    #[case::value_reappears(vec![Some("a"), Some("b"), Some("a")], "a follows b")]
+    #[case::two_null_runs(vec![None, Some("a"), None], "more than one run of nulls")]
+    #[tokio::test]
+    async fn test_bitmap_build_rejects_unsorted_input(
+        #[case] values: Vec<Option<&str>>,
+        #[case] expected: &str,
+    ) {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new(VALUE_COLUMN_NAME, DataType::Utf8, true),
+            Field::new(ROW_ID, DataType::UInt64, false),
+        ]));
+        let row_addrs = (0..values.len() as u32)
+            .map(|i| addr(0, i))
+            .collect::<Vec<_>>();
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(StringArray::from(values)),
+                Arc::new(UInt64Array::from(row_addrs)),
+            ],
+        )
+        .unwrap();
+        // Deliberately not sorted, unlike `utf8_value_stream`.
+        let unsorted: SendableRecordBatchStream = Box::pin(RecordBatchStreamAdapter::new(
+            schema,
+            stream::once(async move { Ok(batch) }),
+        ));
+
+        let (_tmpdir, store) = test_util::index_store();
+        let Err(err) = BitmapIndexPlugin::train_bitmap_index(unsorted, store.as_ref()).await else {
+            panic!("expected unsorted input to be rejected");
+        };
+        assert!(
+            matches!(err, Error::InvalidInput { .. }),
+            "expected InvalidInput, got {err:?}"
+        );
+        let message = err.to_string();
+        assert!(message.contains("sorted by value"), "{message}");
+        assert!(message.contains(expected), "{message}");
     }
 
     /// The keys column counts toward the flush threshold, not just the bitmaps.

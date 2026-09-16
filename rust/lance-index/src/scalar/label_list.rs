@@ -485,12 +485,10 @@ fn serialize_list_nulls(null_map: &RowAddrTreeMap) -> Result<Bytes> {
 /// buffers the data volume at all.
 ///
 /// Nulls sort first because `OrderableScalarValue` orders them below every
-/// value, so [`build_index_map`]'s ascending-input `debug_assert!` rejects a
-/// stream that puts them last. Its runtime path would in fact tolerate a null
-/// run anywhere -- `finish_run` never advances the old-keys cursor for a null
-/// key -- but the assert is the contract, and null-first is also what
-/// [`remap_index_map`] emits and what the plain bitmap index's training scan
-/// produces.
+/// value. [`build_index_map`] would accept a single null run anywhere -- nulls
+/// are collected separately rather than merge-joined by value -- but null-first
+/// is also what [`remap_index_map`] emits and what the plain bitmap index's
+/// training scan produces.
 ///
 /// `mem_pool_size`, when set, overrides the session's memory pool for this
 /// sort instead of leaving it to `LANCE_MEM_POOL_SIZE`. Production callers
