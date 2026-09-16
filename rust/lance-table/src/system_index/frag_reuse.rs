@@ -343,11 +343,31 @@ impl CompactFragReuseIndex {
                     .iter()
                     .map(|frag| fragment_layout(frag, "old", version_idx, group_idx))
                     .collect::<Result<Vec<_>>>()?;
-                let new_frags = group
-                    .new_frags
-                    .iter()
-                    .map(|frag| fragment_layout(frag, "new", version_idx, group_idx))
-                    .collect::<Result<Vec<_>>>()?;
+                // Lance 0.30.0 through 4.0.0-beta.6 recorded a stable-row-id compaction whose
+                // index remap was deferred as a group with no rewritten addresses but new
+                // fragments carrying real row counts. The positional builder requires the two
+                // counts to agree, so such a group cannot be built as written. The per-row map
+                // this builder replaced resolved every address in the group's old fragments to
+                // deleted for that input; dropping the new fragments makes the compact form say
+                // the same, and the index still opens.
+                let is_legacy_empty_rewrite =
+                    changed_row_addrs.is_empty() && !group.new_frags.is_empty();
+                let new_frags = if is_legacy_empty_rewrite {
+                    tracing::warn!(
+                        version_idx,
+                        group_idx,
+                        old_frags = ?group.old_frags.iter().map(|frag| frag.id).collect::<Vec<_>>(),
+                        "fragment reuse group records no rewritten rows but non-empty new \
+                         fragments; treating its old fragments as deleted"
+                    );
+                    Vec::new()
+                } else {
+                    group
+                        .new_frags
+                        .iter()
+                        .map(|frag| fragment_layout(frag, "new", version_idx, group_idx))
+                        .collect::<Result<Vec<_>>>()?
+                };
                 groups.push(GroupInputWithLayout {
                     rewritten_old_row_addrs: changed_row_addrs,
                     old_frags,
@@ -832,5 +852,53 @@ mod tests {
                 num_deleted_rows: 0,
             }]
         );
+    }
+
+    #[test]
+    fn test_compact_fri_opens_legacy_group_with_no_rewritten_rows() {
+        // Lance 0.30.0 through 4.0.0-beta.6 wrote this shape for a stable-row-id dataset
+        // whose index remap was deferred: no rewritten addresses, but new fragments with
+        // real row counts. The two disagree, so the positional builder's exact-count check
+        // rejects the group -- and since the index is opened inside `load_indices`, a
+        // dataset that used to open would make every scan, validate and commit fail.
+        let details = FragReuseIndexDetails {
+            versions: vec![FragReuseVersion {
+                dataset_version: 1,
+                groups: vec![FragReuseGroup {
+                    changed_row_addrs: serialize_changed([]),
+                    old_frags: vec![digest(0, 400), digest(1, 400)],
+                    new_frags: vec![digest(2, 800)],
+                }],
+            }],
+        };
+        let index = CompactFragReuseIndex::try_new(Uuid::new_v4(), details).unwrap();
+
+        // The per-row map this builder replaced resolved every covered address to deleted
+        // for this input, so that is what is preserved. The rows are unreachable either way
+        // until the index is rebuilt; what matters is that opening succeeds.
+        assert_eq!(index.remap_row_id(addr(0, 0)), None);
+        assert_eq!(index.remap_row_id(addr(1, 399)), None);
+        // Fragments the group never claimed are untouched.
+        assert_eq!(index.remap_row_id(addr(2, 0)), Some(addr(2, 0)));
+        assert_eq!(index.remap_row_id(addr(9, 0)), Some(addr(9, 0)));
+    }
+
+    #[test]
+    fn test_compact_fri_genuinely_emptied_group_is_unaffected_by_the_legacy_path() {
+        // The legacy shape is distinguished by new fragments being present. A group that
+        // really did delete everything carries none, and must behave as before.
+        let details = FragReuseIndexDetails {
+            versions: vec![FragReuseVersion {
+                dataset_version: 1,
+                groups: vec![FragReuseGroup {
+                    changed_row_addrs: serialize_changed([]),
+                    old_frags: vec![digest(7, 4)],
+                    new_frags: vec![],
+                }],
+            }],
+        };
+        let index = CompactFragReuseIndex::try_new(Uuid::new_v4(), details).unwrap();
+        assert_eq!(index.remap_row_id(addr(7, 0)), None);
+        assert_eq!(index.remap_row_id(addr(8, 0)), Some(addr(8, 0)));
     }
 }
