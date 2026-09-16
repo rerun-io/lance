@@ -1777,11 +1777,13 @@ pub async fn merge_index_files(
 /// than merge-joined by value, so a single null run is correct wherever it
 /// falls, which lets a caller sort nulls first or last. `null_run_closed` says
 /// whether one has already been flushed, making a second run detectable.
+/// `last_non_null` is the most recent non-null key, carried across a null run,
+/// so that a value reappearing on the far side of the nulls is still caught.
 ///
 /// Both keys come from the same column, so they share a `ScalarValue` variant
 /// and `OrderableScalarValue`'s `Ord` cannot panic comparing them.
 fn check_run_order(
-    previous: &ScalarValue,
+    last_non_null: Option<&ScalarValue>,
     next: &ScalarValue,
     null_run_closed: bool,
 ) -> Result<()> {
@@ -1794,9 +1796,9 @@ fn check_run_order(
         }
         return Ok(());
     }
-    if previous.is_null() {
+    let Some(previous) = last_non_null else {
         return Ok(());
-    }
+    };
     if OrderableScalarValue(next.clone()) <= OrderableScalarValue(previous.clone()) {
         return Err(Error::invalid_input(format!(
             "bitmap index: input must be sorted by value, but {next} follows {previous}"
@@ -1833,6 +1835,9 @@ pub(crate) async fn build_index_map(
     // Track whether we emitted a null bitmap (old index stores nulls
     // separately in null_map, not in index_map).
     let mut emitted_null = false;
+    // The most recent non-null key, kept across a null run so the ordering check
+    // still sees the whole non-null sequence.
+    let mut last_non_null_key: Option<ScalarValue> = None;
 
     while let Some(batch) = data_source.try_next().await? {
         let values = batch.column_by_name(VALUE_COLUMN_NAME).expect_ok()?;
@@ -1851,7 +1856,7 @@ pub(crate) async fn build_index_map(
                 _ => {
                     // Value changed — flush the previous run.
                     if let Some(prev_key) = current_key.take() {
-                        check_run_order(&prev_key, &key, emitted_null)?;
+                        check_run_order(last_non_null_key.as_ref(), &key, emitted_null)?;
                         let mut prev_bitmap = std::mem::take(&mut current_bitmap);
                         BitmapIndexPlugin::finish_run(
                             prev_key,
@@ -1861,6 +1866,9 @@ pub(crate) async fn build_index_map(
                             writer,
                         )
                         .await?;
+                    }
+                    if !key.is_null() {
+                        last_non_null_key = Some(key.clone());
                     }
                     current_key = Some(key);
                     current_bitmap = RowAddrTreeMap::default();
@@ -4027,6 +4035,10 @@ mod tests {
     #[rstest]
     #[case::value_reappears(vec![Some("a"), Some("b"), Some("a")], "a follows b")]
     #[case::two_null_runs(vec![None, Some("a"), None], "more than one run of nulls")]
+    // The null run must not reset the ordering: the non-null sequence on either
+    // side of it is one sequence.
+    #[case::value_reappears_across_null(vec![Some("a"), None, Some("a")], "a follows a")]
+    #[case::value_descends_across_null(vec![Some("b"), None, Some("a")], "a follows b")]
     #[tokio::test]
     async fn test_bitmap_build_rejects_unsorted_input(
         #[case] values: Vec<Option<&str>>,
