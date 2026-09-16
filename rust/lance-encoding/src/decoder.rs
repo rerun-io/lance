@@ -639,6 +639,8 @@ impl CoreFieldDecoderStrategy {
         if !is_byte_like || !column_info.is_structural() {
             return Ok(None);
         }
+        // Pruning inspects every page, so build them all up front.
+        #[allow(deprecated)]
         let mut scheduler = StructuralPrimitiveFieldScheduler::try_new(
             column_info,
             self.decompressor_strategy.as_ref(),
@@ -858,9 +860,9 @@ impl CoreFieldDecoderStrategy {
         validate_fixed_size_list_dimensions(&field.name, &data_type)?;
         if Self::is_structural_primitive(&data_type) {
             let column_info = column_infos.expect_next()?;
-            let scheduler = Box::new(StructuralPrimitiveFieldScheduler::try_new(
-                column_info.as_ref(),
-                self.decompressor_strategy.as_ref(),
+            let scheduler = Box::new(StructuralPrimitiveFieldScheduler::try_new_lazy(
+                column_info.clone(),
+                self.decompressor_strategy.clone(),
                 self.cache_repetition_index,
                 field,
             )?);
@@ -875,9 +877,9 @@ impl CoreFieldDecoderStrategy {
                 if field.is_packed_struct() {
                     // Packed struct
                     let column_info = column_infos.expect_next()?;
-                    let scheduler = Box::new(StructuralPrimitiveFieldScheduler::try_new(
-                        column_info.as_ref(),
-                        self.decompressor_strategy.as_ref(),
+                    let scheduler = Box::new(StructuralPrimitiveFieldScheduler::try_new_lazy(
+                        column_info.clone(),
+                        self.decompressor_strategy.clone(),
                         self.cache_repetition_index,
                         field,
                     )?);
@@ -899,9 +901,9 @@ impl CoreFieldDecoderStrategy {
                         )
                     }) {
                         let column_info = column_infos.expect_next()?;
-                        let scheduler = Box::new(StructuralPrimitiveFieldScheduler::try_new(
-                            column_info.as_ref(),
-                            self.decompressor_strategy.as_ref(),
+                        let scheduler = Box::new(StructuralPrimitiveFieldScheduler::try_new_lazy(
+                            column_info.clone(),
+                            self.decompressor_strategy.clone(),
                             self.cache_repetition_index,
                             field,
                         )?);
