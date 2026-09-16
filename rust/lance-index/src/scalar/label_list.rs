@@ -46,7 +46,7 @@ use super::{BuiltinIndexType, SargableQuery, ScalarIndexParams};
 use super::{MetricsCollector, SearchResult};
 use crate::pbold;
 use crate::scalar::bitmap::{
-    BitmapIndexState, build_index_map, merge_index_maps, merge_source_entry_count,
+    BitmapIndexState, OldSegment, build_index_map, merge_index_maps, merge_source_entry_count,
     new_bitmap_batch_writer, remap_index_map, remap_row_addrs,
 };
 use crate::scalar::expression::{LabelListQueryParser, ScalarQueryParser};
@@ -615,7 +615,14 @@ async fn write_label_list_index(
     list_nulls: impl FnOnce() -> Result<RowAddrTreeMap>,
 ) -> Result<IndexFile> {
     let mut writer = new_bitmap_batch_writer(store, BITMAP_LOOKUP_NAME, value_type).await?;
-    build_index_map(sorted_labels, old_index, old_data_filter, &mut writer).await?;
+    let old_segments = old_index
+        .map(|index| OldSegment {
+            index,
+            filter: old_data_filter,
+        })
+        .into_iter()
+        .collect();
+    build_index_map(sorted_labels, old_segments, &mut writer).await?;
     writer
         .add_global_buffer(
             LABEL_LIST_NULLS_METADATA_KEY.to_string(),
@@ -726,8 +733,8 @@ async fn update_label_list_index(
 /// separate `list_nulls` row set. Because distributed segments cover disjoint rows
 /// (distinct fragments), merging streams and unions the bitmap payloads by key
 /// and separately unions the `list_nulls` sets; no source-data re-scan is
-/// required. This mirrors [`crate::scalar::bitmap::merge_bitmap_indices`] but
-/// also carries the per-segment `list_nulls`. When `old_data_filter` is provided,
+/// required. This mirrors [`crate::scalar::bitmap::BitmapIndex::merge_segments`]
+/// but also carries the per-segment `list_nulls`. When `old_data_filter` is provided,
 /// rows from retired fragments are removed from both the value bitmaps and
 /// `list_nulls`.
 pub async fn merge_label_list_indices(
