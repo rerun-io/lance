@@ -1061,7 +1061,21 @@ impl BitmapBatchWriter {
 
     /// Serialize and buffer a single (key, bitmap) pair, flushing the current
     /// batch to disk if adding it would exceed [`MAX_BUFFERED_BYTES`].
+    ///
+    /// A key whose bitmap is empty is not written at all. This is the single
+    /// choke point for every write path, so it is the one rule for all of them.
     pub(crate) async fn emit(&mut self, key: ScalarValue, bitmap: &RowAddrTreeMap) -> Result<()> {
+        // An old-data filter or a remap can remove every row of a key. Writing
+        // that key anyway would put it back into `index_map` on load -- which is
+        // built from the keys column alone and so cannot tell it from a live key
+        // -- where nothing prunes it, and each later merge would re-read and
+        // re-emit it. Absent and present-but-empty are query-equivalent, since
+        // both match no rows. Both filter variants drop emptied fragments, so an
+        // `is_empty` set really holds no rows.
+        if bitmap.is_empty() {
+            return Ok(());
+        }
+
         let mut buf = Vec::new();
         bitmap.serialize_into(&mut buf).unwrap();
         // `key.size()` already covers the `Vec<ScalarValue>` slot it moves into,
@@ -1892,12 +1906,8 @@ pub(crate) async fn build_index_map(
 /// separately. Nulls live outside `index_map`, in `null_map`, so they are
 /// remapped separately and emitted first -- a null sorts below every value.
 ///
-/// Emits every key unconditionally, even one whose remapped bitmap comes out
-/// empty -- deliberately unlike [`merge_index_maps`], which drops a key its
-/// filter empties. Both are query-equivalent, since an absent key and a
-/// present-but-empty one both match no rows; this function preserves the key
-/// to match the old materialized-map remap path, which always produced one
-/// row per source key.
+/// A key whose remapped bitmap comes out empty (every one of its rows deleted)
+/// is not written, the rule [`BitmapBatchWriter::emit`] applies to every path.
 pub(crate) async fn remap_index_map(
     index: &BitmapIndex,
     mapping: &RowAddrRemap,
@@ -1974,9 +1984,8 @@ pub(crate) fn merge_source_entry_count(sources: &[Arc<BitmapIndex>]) -> u64 {
 /// actually in, since it loads one bitmap per entry.
 ///
 /// A key whose merged bitmap comes out empty (every one of its rows retired by
-/// `old_data_filter`) is dropped rather than emitted -- deliberately unlike
-/// [`remap_index_map`], which preserves such a key. Both are query-equivalent,
-/// since an absent key and a present-but-empty one both match no rows.
+/// `old_data_filter`) is not written, the rule [`BitmapBatchWriter::emit`]
+/// applies to every path.
 pub(crate) async fn merge_index_maps(
     sources: &[Arc<BitmapIndex>],
     old_data_filter: Option<&super::OldIndexDataFilter>,
@@ -2000,9 +2009,7 @@ pub(crate) async fn merge_index_maps(
             .collect(),
     );
 
-    if let Some(merged_nulls) = old.take_null_bitmap()
-        && !merged_nulls.is_empty()
-    {
+    if let Some(merged_nulls) = old.take_null_bitmap() {
         let null_key = new_null_array(&value_type, 1);
         let null_key = ScalarValue::try_from_array(null_key.as_ref(), 0)?;
         writer.emit(null_key, &merged_nulls).await?;
@@ -2018,12 +2025,11 @@ pub(crate) async fn merge_index_maps(
     let mut last_reported = 0u64;
 
     while let Some((key, merged)) = old.take_smallest_if(|_| true).await? {
-        if !merged.is_empty() {
-            writer.emit(key, &merged).await?;
-        }
+        writer.emit(key, &merged).await?;
 
-        // Reported outside the guard above: a key the filter emptied still
-        // consumed its source entries, and skipping it would stall the count.
+        // Counted whether or not `emit` wrote the key: one the filter emptied
+        // still consumed its source entries, and skipping it would stall the
+        // count.
         let consumed = old.consumed();
         if consumed - last_reported >= report_every
             && let Some((progress, stage)) = progress
@@ -3208,15 +3214,10 @@ mod tests {
         }
     }
 
-    /// Remap must emit exactly what the pre-streaming path did: one row per
-    /// source key, nulls included, every address put through the same mapping.
-    ///
-    /// The old path materialized the index into a
-    /// `HashMap<ScalarValue, RowAddrTreeMap>`, remapped each entry and wrote the
-    /// whole map, so a key whose rows were all deleted still produced a row with
-    /// an empty bitmap. `remap_index_map` streams key-by-key instead and emits
-    /// unconditionally to preserve that -- deliberately unlike `merge_index_maps`,
-    /// which drops keys its filter empties.
+    /// Remap must put every address of every source key, nulls included, through
+    /// the same mapping, and drop a key whose rows were all deleted rather than
+    /// write it with an empty bitmap -- the one rule `BitmapBatchWriter::emit`
+    /// applies to every path.
     #[tokio::test]
     async fn test_bitmap_remap_matches_materialized_path() {
         // frag 1 - { 0: null, 1: "a", 2: "b" }
@@ -3252,8 +3253,7 @@ mod tests {
         index.remap(&mapping, dest_store.as_ref()).await.unwrap();
 
         // Read in file order, so this pins the emitted order as well as the
-        // contents: the null key first, then keys ascending. The old path wrote
-        // a `HashMap`, in no particular order.
+        // contents: the null key first, then keys ascending.
         let frag_3 =
             |offset: u32| -> Vec<u64> { vec![RowAddress::new_from_parts(3, offset).into()] };
         let written: Vec<(Option<String>, Vec<u64>)> =
@@ -3267,17 +3267,24 @@ mod tests {
             vec![
                 (None, frag_3(0)),
                 (Some("a".to_string()), frag_3(1)),
-                // Every row of "b" was deleted, and it still emits a row.
-                (Some("b".to_string()), Vec::new()),
+                // Every row of "b" was deleted, so "b" is not written at all.
                 (Some("c".to_string()), vec![addrs[4]]),
             ]
         );
 
-        // The emptied key survives the round trip as a key rather than vanishing.
+        // The emptied key does not come back as a directory entry either.
         let reloaded = BitmapIndex::load(dest_store, None, &LanceCache::no_cache())
             .await
             .unwrap();
-        assert_eq!(reloaded.index_map.len(), 3);
+        assert_eq!(reloaded.index_map.len(), 2);
+        assert!(
+            !reloaded
+                .index_map
+                .contains_key(&OrderableScalarValue(ScalarValue::Utf8(Some(
+                    "b".to_string()
+                )))),
+            "an emptied key must not survive the remap"
+        );
     }
 
     #[tokio::test]
@@ -3903,25 +3910,72 @@ mod tests {
                 .await
                 .unwrap();
 
-            // A key whose rows were all filtered out may still be materialised
-            // with an empty bitmap, so only a key outside the vocabulary is a
-            // fabrication.
+            // Exactly the keys with at least one surviving row are materialised:
+            // a key whose rows were all filtered out is not written.
             for value in VOCAB {
                 let key = OrderableScalarValue(ScalarValue::Utf8(Some(value.to_string())));
                 let want = expected.get(&Some(value)).cloned().unwrap_or_default();
                 let got = merged.load_bitmap(&key, None).await.unwrap();
                 assert_eq!(*got, want, "seed {seed}: row sets differ for {value:?}");
+                assert_eq!(
+                    merged.index_map.contains_key(&key),
+                    !want.is_empty(),
+                    "seed {seed}: key {value:?} materialised iff it has rows"
+                );
             }
-            assert!(
-                merged.index_map.len() <= VOCAB.len(),
-                "seed {seed}: merge materialised keys outside the vocabulary"
-            );
             assert_eq!(
                 *merged.null_map,
                 expected.get(&None).cloned().unwrap_or_default(),
                 "seed {seed}: null row sets differ"
             );
         }
+    }
+
+    /// A key whose every row the filter removes must not be materialised: `load`
+    /// builds `index_map` from the keys column alone, so it would come back as a
+    /// live directory entry that nothing prunes.
+    #[tokio::test]
+    async fn test_bitmap_merge_drops_emptied_keys() {
+        let (_dir, segment) = train_bitmap_segment(&[
+            (Some("kept"), addr(0, 0)),
+            (Some("gone"), addr(5, 0)),
+            (None, addr(5, 1)),
+        ])
+        .await;
+
+        // Fragment 5 is retired, so "gone" and the null row lose every row.
+        let filters = vec![Some(OldIndexDataFilter::Fragments {
+            to_keep: RoaringBitmap::from_iter([0u32]),
+            to_remove: RoaringBitmap::from_iter([5u32]),
+        })];
+
+        let (_dest_dir, dest_store) = test_util::index_store();
+        BitmapIndex::merge_segments(
+            &[segment],
+            value_row_id_stream(&[]),
+            dest_store.as_ref(),
+            &filters,
+        )
+        .await
+        .unwrap();
+        let merged = BitmapIndex::load(dest_store, None, &LanceCache::no_cache())
+            .await
+            .unwrap();
+
+        assert_eq!(
+            merged
+                .index_map
+                .keys()
+                .map(|key| key.0.to_string())
+                .collect::<Vec<_>>(),
+            vec!["kept"],
+            "an emptied key must not be materialised"
+        );
+        assert_eq!(search_addrs(&merged, Some("kept")).await, vec![addr(0, 0)]);
+        assert!(
+            merged.null_map.is_empty(),
+            "an emptied null row must not be materialised"
+        );
     }
 
     /// A merge must not populate the index cache with the source segments' row
