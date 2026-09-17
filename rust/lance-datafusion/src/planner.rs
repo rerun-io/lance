@@ -1336,6 +1336,33 @@ mod tests {
     }
 
     #[test]
+    fn test_optimize_expr_opens_filter_optimize_span() {
+        let planner = Planner::new(Arc::new(Schema::new(vec![Field::new(
+            "i",
+            DataType::Int32,
+            false,
+        )])));
+        let expr = col("i").gt(lit(3_i32));
+
+        // Filtering the mock down to the span under test keeps unrelated
+        // DataFusion spans out of its ordered expectation queue.
+        let (subscriber, handle) = tracing_mock::subscriber::mock()
+            .with_filter(|meta| meta.name() == "filter_optimize")
+            .new_span(
+                tracing_mock::expect::span()
+                    .named("filter_optimize")
+                    .at_level(tracing::Level::TRACE),
+            )
+            .run_with_handle();
+
+        tracing::subscriber::with_default(subscriber, || {
+            planner.optimize_expr(expr).unwrap();
+        });
+
+        handle.assert_finished();
+    }
+
+    #[test]
     fn test_coerce_before_simplify() {
         let planner = Planner::new(Arc::new(Schema::empty()));
         let strict_float64 = Arc::new(ScalarUDF::new_from_impl(StrictFloat64Udf::new()));
