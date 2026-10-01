@@ -2292,6 +2292,93 @@ mod tests {
         );
     }
 
+    /// The bitmap build rejects input that is not ascending by value, and it
+    /// judges that with `OrderableScalarValue`, whereas the training stream is
+    /// ordered by the scan's own sort. If the two disagreed anywhere, a valid
+    /// column would be rejected and index creation would fail for users.
+    ///
+    /// Floats are where they could plausibly diverge: `OrderableScalarValue`
+    /// uses `f64::total_cmp`, which separates `-0.0` from `0.0` and sorts `NaN`
+    /// above every finite value, while IEEE comparison calls `-0.0 == 0.0` and
+    /// leaves `NaN` unordered. The values are spread over two fragments and are
+    /// unsorted within each, so the order the build sees comes from the real
+    /// scan rather than from the order the rows were written in.
+    #[tokio::test]
+    async fn test_bitmap_build_accepts_scan_sorted_floats() {
+        use arrow_array::Float64Array;
+
+        let tmpdir = TempStrDir::default();
+        let dataset_uri = format!("file://{}", tmpdir.as_str());
+
+        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "value",
+            DataType::Float64,
+            true,
+        )]));
+        let fragments = [
+            vec![Some(f64::NAN), Some(0.0), Some(-1.0), None],
+            vec![
+                Some(-0.0),
+                Some(1.0),
+                Some(f64::NEG_INFINITY),
+                Some(f64::INFINITY),
+            ],
+        ];
+        let batches = fragments
+            .iter()
+            .map(|values| {
+                Ok(RecordBatch::try_new(
+                    schema.clone(),
+                    vec![Arc::new(Float64Array::from(values.clone()))],
+                )
+                .unwrap())
+            })
+            .collect::<Vec<std::result::Result<_, arrow_schema::ArrowError>>>();
+        let reader = RecordBatchIterator::new(batches, schema.clone());
+
+        let mut dataset = Dataset::write(
+            reader,
+            &dataset_uri,
+            Some(WriteParams {
+                max_rows_per_file: 4,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(dataset.get_fragments().len(), 2);
+
+        let params = ScalarIndexParams::for_builtin(lance_index::scalar::BuiltinIndexType::Bitmap);
+        dataset
+            .create_index(
+                &["value"],
+                IndexType::Bitmap,
+                Some("value_idx".to_string()),
+                &params,
+                false,
+            )
+            .await
+            .expect("scan-sorted float input must be accepted by the bitmap build");
+
+        // The index serves these predicates, so the postings also have to have
+        // landed under the right keys.
+        for (predicate, expected) in [
+            ("value = 1.0", 1),
+            ("value = -1.0", 1),
+            ("value IS NULL", 1),
+            ("value IS NOT NULL", 7),
+        ] {
+            let count = dataset
+                .scan()
+                .filter(predicate)
+                .unwrap()
+                .count_rows()
+                .await
+                .unwrap();
+            assert_eq!(count, expected, "wrong row count for `{predicate}`");
+        }
+    }
+
     #[tokio::test]
     async fn test_bloomfilter_distributed_segments_merge_and_query() {
         #[derive(serde::Serialize)]

@@ -4183,6 +4183,62 @@ mod tests {
         assert!(message.contains(expected), "{message}");
     }
 
+    /// The other side of the ordering check: valid input must still be accepted.
+    /// The check runs in release builds, so a false rejection would fail
+    /// `optimize_indices` outright. Nulls are collected separately from the value
+    /// runs, so a single null run is correct whether it leads or trails, and the
+    /// stream is hand-built rather than sorted here so the trailing run survives.
+    #[rstest]
+    #[case::nulls_first(
+        vec![None, Some("a"), Some("a"), Some("b")],
+        vec![(None, vec![0]), (Some("a"), vec![1, 2]), (Some("b"), vec![3])],
+    )]
+    #[case::nulls_last(
+        vec![Some("a"), Some("a"), Some("b"), None],
+        vec![(None, vec![3]), (Some("a"), vec![0, 1]), (Some("b"), vec![2])],
+    )]
+    #[tokio::test]
+    async fn test_bitmap_build_accepts_sorted_input(
+        #[case] values: Vec<Option<&str>>,
+        #[case] expected: Vec<(Option<&str>, Vec<u32>)>,
+    ) {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new(VALUE_COLUMN_NAME, DataType::Utf8, true),
+            Field::new(ROW_ID, DataType::UInt64, false),
+        ]));
+        let row_addrs = (0..values.len() as u32)
+            .map(|i| addr(0, i))
+            .collect::<Vec<_>>();
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(StringArray::from(values)),
+                Arc::new(UInt64Array::from(row_addrs)),
+            ],
+        )
+        .unwrap();
+        let sorted: SendableRecordBatchStream = Box::pin(RecordBatchStreamAdapter::new(
+            schema,
+            stream::once(async move { Ok(batch) }),
+        ));
+
+        let (_tmpdir, store) = test_util::index_store();
+        BitmapIndexPlugin::train_bitmap_index(sorted, store.as_ref())
+            .await
+            .unwrap();
+
+        let expected = expected
+            .into_iter()
+            .map(|(key, offsets)| {
+                (
+                    key.map(str::to_string),
+                    offsets.into_iter().map(|i| addr(0, i)).collect::<Vec<_>>(),
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(read_bitmap_contents(store.as_ref()).await, expected);
+    }
+
     /// The keys column counts toward the flush threshold, not just the bitmaps.
     /// A column with a very large number of tiny bitmaps used to buffer without
     /// limit: the old threshold charged the bitmap column only, so the keys could
