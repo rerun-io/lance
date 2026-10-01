@@ -4987,6 +4987,46 @@ mod tests {
             .unwrap();
     }
 
+    /// The oldest `dataset_version` across an index's segments, which is what a
+    /// segment merge carries over to the segment it produces. Checked here to
+    /// predate the current manifest, since otherwise it could not tell a merge
+    /// from a rebuild.
+    async fn oldest_segment_version(dataset: &Dataset, index_name: &str) -> u64 {
+        let oldest = dataset
+            .load_indices_by_name(index_name)
+            .await
+            .unwrap()
+            .iter()
+            .map(|segment| segment.dataset_version)
+            .min()
+            .expect("the index must have at least one segment");
+        assert!(
+            oldest < dataset.manifest.version,
+            "the source segments must predate the manifest, or their version \
+             cannot distinguish a merge from a rebuild"
+        );
+        oldest
+    }
+
+    /// Pins that `optimize_indices` took the segment-merge path. A full rebuild
+    /// produces the same rows, so the row counts these tests check cannot tell
+    /// the two apart; the stamped `dataset_version` can, because the merge keeps
+    /// the oldest source segment's version while a rebuild stamps the manifest
+    /// version current at the time of the optimize.
+    async fn assert_merged_not_rebuilt(dataset: &Dataset, index_name: &str, oldest_source: u64) {
+        let segments = dataset.load_indices_by_name(index_name).await.unwrap();
+        assert_eq!(
+            segments.len(),
+            1,
+            "the optimize must consolidate every bitmap segment, got {segments:?}"
+        );
+        assert_eq!(
+            segments[0].dataset_version, oldest_source,
+            "the optimize rebuilt the index instead of merging the segments: a \
+             merged segment carries the oldest source segment's dataset version"
+        );
+    }
+
     fn id_cat_schema() -> Arc<Schema> {
         Arc::new(Schema::new(vec![
             Field::new("id", DataType::Int32, false),
@@ -5081,17 +5121,14 @@ mod tests {
             .await
             .unwrap();
 
+        let oldest_source = oldest_segment_version(&dataset, "cat_idx").await;
         dataset
             .optimize_indices(&OptimizeOptions::merge(200))
             .await
             .unwrap();
 
         let dataset = DatasetBuilder::from_uri(test_uri).load().await.unwrap();
-        assert_eq!(
-            dataset.load_indices_by_name("cat_idx").await.unwrap().len(),
-            1,
-            "the merge must consolidate every bitmap segment"
-        );
+        assert_merged_not_rebuilt(&dataset, "cat_idx", oldest_source).await;
 
         // 48 rows cycling A/B/C/NULL: 12 of each.
         for cat in ["A", "B", "C"] {
@@ -5157,18 +5194,15 @@ mod tests {
             .await
             .unwrap();
 
+        let oldest_source = oldest_segment_version(&dataset, "cat_idx").await;
         dataset
             .optimize_indices(&OptimizeOptions::merge(200))
             .await
             .unwrap();
 
         let dataset = DatasetBuilder::from_uri(test_uri).load().await.unwrap();
+        assert_merged_not_rebuilt(&dataset, "cat_idx", oldest_source).await;
         let segments = dataset.load_indices_by_name("cat_idx").await.unwrap();
-        assert_eq!(
-            segments.len(),
-            1,
-            "a 200-way merge must consolidate every bitmap segment, got {segments:?}"
-        );
         let expected_coverage = dataset
             .get_fragments()
             .iter()
@@ -5227,18 +5261,15 @@ mod tests {
             num_segments as usize
         );
 
+        let oldest_source = oldest_segment_version(&dataset, "cat_idx").await;
         dataset
             .optimize_indices(&OptimizeOptions::merge(num_segments as usize))
             .await
             .unwrap();
 
         let dataset = DatasetBuilder::from_uri(test_uri).load().await.unwrap();
+        assert_merged_not_rebuilt(&dataset, "cat_idx", oldest_source).await;
         let segments = dataset.load_indices_by_name("cat_idx").await.unwrap();
-        assert_eq!(
-            segments.len(),
-            1,
-            "a {num_segments}-way merge must consolidate every bitmap segment, got {segments:?}"
-        );
         let expected_coverage = dataset
             .get_fragments()
             .iter()
@@ -5308,12 +5339,14 @@ mod tests {
             .await
             .unwrap();
 
+        let oldest_source = oldest_segment_version(&dataset, "cat_idx").await;
         dataset
             .optimize_indices(&OptimizeOptions::merge(200))
             .await
             .unwrap();
 
         let dataset = DatasetBuilder::from_uri(test_uri).load().await.unwrap();
+        assert_merged_not_rebuilt(&dataset, "cat_idx", oldest_source).await;
         for (cat, expected) in [("A", 67), ("B", 67), ("C", 66)] {
             assert_eq!(
                 count_cat(&dataset, cat).await,
@@ -5371,6 +5404,7 @@ mod tests {
             .unwrap();
         let mut dataset = res.new_dataset.as_ref().clone();
 
+        let oldest_source = oldest_segment_version(&dataset, "cat_idx").await;
         dataset
             .optimize_indices(&OptimizeOptions::default())
             .await
@@ -5379,11 +5413,7 @@ mod tests {
         let dataset = DatasetBuilder::from_uri(test_uri).load().await.unwrap();
         // Two segments went in, so this exercised the K-way path rather than the
         // single-segment `update` this change does not touch.
-        assert_eq!(
-            dataset.load_indices_by_name("cat_idx").await.unwrap().len(),
-            1,
-            "the optimize must have consolidated both segments"
-        );
+        assert_merged_not_rebuilt(&dataset, "cat_idx", oldest_source).await;
         // ids 0..25 are now 'Z'; the remaining A/B/C counts come from ids 25..100.
         assert_eq!(count_cat(&dataset, "Z").await, 25, "updated rows missing");
         for (cat, expected) in [("A", 25), ("B", 25), ("C", 25)] {
