@@ -4964,18 +4964,23 @@ mod tests {
 
     /// Build one Bitmap segment per fragment of `dataset` under `index_name`.
     async fn commit_bitmap_segment_per_fragment(dataset: &mut Dataset, index_name: &str) {
-        let params = ScalarIndexParams::for_builtin(BuiltinIndexType::Bitmap);
-        let frag_ids = dataset
+        let groups = dataset
             .get_fragments()
             .iter()
-            .map(|frag| frag.id() as u32)
+            .map(|frag| vec![frag.id() as u32])
             .collect::<Vec<_>>();
-        let mut staged = Vec::with_capacity(frag_ids.len());
-        for frag_id in frag_ids {
+        commit_bitmap_segments(dataset, index_name, &groups).await;
+    }
+
+    /// One committed Bitmap segment per fragment group.
+    async fn commit_bitmap_segments(dataset: &mut Dataset, index_name: &str, groups: &[Vec<u32>]) {
+        let params = ScalarIndexParams::for_builtin(BuiltinIndexType::Bitmap);
+        let mut staged = Vec::with_capacity(groups.len());
+        for group in groups {
             staged.push(
                 CreateIndexBuilder::new(dataset, &["cat"], IndexType::Bitmap, &params)
                     .name(index_name.into())
-                    .fragments(vec![frag_id])
+                    .fragments(group.clone())
                     .execute_uncommitted()
                     .await
                     .unwrap(),
@@ -5293,17 +5298,36 @@ mod tests {
     /// Deferred-remap compaction leaves the bitmap segments pointing at retired
     /// fragment ids; a K-way segment merge must remap them through the
     /// FragReuseIndex instead of dropping or misattributing the rows.
+    ///
+    /// Null rows ride in `null_map`, which the merge fills separately from the
+    /// value row sets, so they need remapping of their own and the nullable
+    /// case is not covered by the other one.
+    #[rstest]
+    #[case::non_null(false)]
+    #[case::nullable(true)]
     #[tokio::test]
-    async fn test_optimize_bitmap_merge_remaps_deferred_compaction() {
+    async fn test_optimize_bitmap_merge_remaps_deferred_compaction(#[case] nullable: bool) {
         let test_dir = TempStrDir::default();
         let test_uri = test_dir.as_str();
-        let schema = id_cat_schema();
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("cat", DataType::Utf8, nullable),
+        ]));
+        // A/B/C cycling, with every fourth row null in the nullable case.
+        let batch = |range: std::ops::Range<i32>| {
+            if nullable {
+                id_cat_nullable_batch(&schema, range)
+            } else {
+                id_cat_batch(&schema, range)
+            }
+        };
 
         let reader = RecordBatchIterator::new(
             vec![
-                Ok(id_cat_batch(&schema, 0..50)),
-                Ok(id_cat_batch(&schema, 50..100)),
-                Ok(id_cat_batch(&schema, 100..150)),
+                Ok(batch(0..50)),
+                Ok(batch(50..100)),
+                Ok(batch(100..150)),
+                Ok(batch(150..200)),
             ],
             schema.clone(),
         );
@@ -5317,7 +5341,10 @@ mod tests {
         )
         .await
         .unwrap();
-        commit_bitmap_segment_per_fragment(&mut dataset, "cat_idx").await;
+        // Two fragments per segment: compaction only ever bins fragments that
+        // carry the same set of index segments, so one segment per fragment
+        // would leave every bin a single fragment and plan no work at all.
+        commit_bitmap_segments(&mut dataset, "cat_idx", &[vec![0, 1], vec![2, 3]]).await;
 
         compact_files(
             &mut dataset,
@@ -5331,9 +5358,15 @@ mod tests {
         .unwrap();
 
         let mut dataset = DatasetBuilder::from_uri(test_uri).load().await.unwrap();
+        // Every original fragment was retired, so each segment's postings now
+        // need the FragReuseIndex to reach a live row.
+        assert!(
+            dataset.get_fragments().iter().all(|frag| frag.id() >= 4),
+            "compaction must have retired every indexed fragment"
+        );
         dataset
             .append(
-                RecordBatchIterator::new(vec![Ok(id_cat_batch(&schema, 150..200))], schema.clone()),
+                RecordBatchIterator::new(vec![Ok(batch(200..240))], schema.clone()),
                 None,
             )
             .await
@@ -5347,7 +5380,13 @@ mod tests {
 
         let dataset = DatasetBuilder::from_uri(test_uri).load().await.unwrap();
         assert_merged_not_rebuilt(&dataset, "cat_idx", oldest_source).await;
-        for (cat, expected) in [("A", 67), ("B", 67), ("C", 66)] {
+        // 240 rows: A/B/C/NULL evenly when nullable, A/B/C otherwise.
+        let (expected_per_cat, expected_nulls) = if nullable {
+            ([60, 60, 60], 60)
+        } else {
+            ([80, 80, 80], 0)
+        };
+        for (cat, expected) in ["A", "B", "C"].into_iter().zip(expected_per_cat) {
             assert_eq!(
                 count_cat(&dataset, cat).await,
                 expected,
@@ -5355,8 +5394,18 @@ mod tests {
             );
         }
         assert_eq!(
+            count_rows_where(&dataset, "cat IS NULL").await,
+            expected_nulls,
+            "null rows were not remapped across deferred compaction + bitmap merge"
+        );
+        assert_eq!(
+            count_rows_where(&dataset, "cat IS NOT NULL").await,
+            240 - expected_nulls,
+            "IS NOT NULL disagrees with the value row sets after the remap"
+        );
+        assert_eq!(
             dataset.scan().count_rows().await.unwrap(),
-            200,
+            240,
             "no rows may be lost across compaction + bitmap merge"
         );
     }
