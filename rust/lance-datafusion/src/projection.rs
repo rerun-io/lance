@@ -16,7 +16,7 @@ use tracing::instrument;
 use lance_core::{
     Error, ROW_ADDR, ROW_CREATED_AT_VERSION, ROW_ID, ROW_LAST_UPDATED_AT_VERSION, ROW_OFFSET,
     Result, WILDCARD,
-    datatypes::{OnMissing, Projectable, Projection, Schema},
+    datatypes::{OnMissing, OnTypeMismatch, Projectable, Projection, Schema},
 };
 
 use crate::{
@@ -339,6 +339,19 @@ impl ProjectionPlan {
             metadata: projection.metadata.clone(),
         };
 
+        // Resolve the requested fields against the base schema first.
+        // `union_schema` records any field carrying a non-negative id without
+        // checking that the base knows that id, so a schema numbered
+        // independently of the dataset -- `Schema::try_from(&ArrowSchema)` gives
+        // every field a fresh id -- yields a projection that silently resolves
+        // to fewer columns than were asked for, or to the wrong ones. Matching
+        // by name and type here reports that instead.
+        let data_schema = base.schema().project_by_schema(
+            &data_schema,
+            OnMissing::Error,
+            OnTypeMismatch::Error,
+        )?;
+
         // Calculate the physical projection from data columns only
         let mut physical_projection = Projection::empty(base).union_schema(&data_schema);
         physical_projection.with_row_id = with_row_id;
@@ -517,6 +530,7 @@ mod tests {
     use super::*;
 
     use arrow_array::{ArrayRef, Float32Array, Int64Array};
+    use arrow_schema::Fields;
     use lance_arrow::json::{is_json_field, json_field};
 
     #[test]
@@ -729,5 +743,85 @@ mod tests {
         let output = plan.output_schema().unwrap();
         let output_field = output.field_with_name("meta").unwrap();
         assert!(is_json_field(output_field));
+    }
+
+    fn nested_base_schema() -> Schema {
+        Schema::try_from(&ArrowSchema::new(vec![
+            ArrowField::new("id", DataType::Int32, false),
+            ArrowField::new(
+                "meta",
+                DataType::Struct(Fields::from(vec![
+                    ArrowField::new("a", DataType::Int32, true),
+                    ArrowField::new("b", DataType::Int32, true),
+                ])),
+                true,
+            ),
+        ]))
+        .unwrap()
+    }
+
+    /// A nested child the base does not have must be reported, not dropped.
+    ///
+    /// Only top-level names are checked before the projection is built, so
+    /// `meta` passes and the walk then records every id beneath it. `c` carries
+    /// a non-negative id the base never issued, which resolves to nothing: the
+    /// caller asked for two children, silently got one.
+    #[test]
+    fn test_from_schema_rejects_a_nested_child_the_base_does_not_have() {
+        let requested = Schema::try_from(&ArrowSchema::new(vec![ArrowField::new(
+            "meta",
+            DataType::Struct(Fields::from(vec![
+                ArrowField::new("a", DataType::Int32, true),
+                ArrowField::new("c", DataType::Int32, true),
+            ])),
+            true,
+        )]))
+        .unwrap();
+
+        let error = ProjectionPlan::from_schema(Arc::new(nested_base_schema()), &requested)
+            .expect_err("a nested child outside the base schema must be rejected");
+        assert!(
+            error.to_string().contains('c'),
+            "the error should name the offending child: {error}"
+        );
+    }
+
+    /// Ids must be resolved against the base, not trusted.
+    ///
+    /// A schema built on its own numbers from scratch, so `meta.b` here carries
+    /// the id the base issued to `meta.a`. Taken at face value the projection
+    /// reads the wrong column and reports no error at all.
+    #[test]
+    fn test_from_schema_resolves_independently_numbered_ids() {
+        let requested = Schema::try_from(&ArrowSchema::new(vec![ArrowField::new(
+            "meta",
+            DataType::Struct(Fields::from(vec![ArrowField::new(
+                "b",
+                DataType::Int32,
+                true,
+            )])),
+            true,
+        )]))
+        .unwrap();
+        let base_schema = nested_base_schema();
+        // Numbered alone, `b` takes an id the base issued to a different field.
+        let requested_b = requested.fields[0].children[0].id;
+        let base_b = base_schema.fields[1].children[1].id;
+        assert_ne!(
+            requested_b, base_b,
+            "the requested id must differ from the base's for this to bite"
+        );
+
+        let plan = ProjectionPlan::from_schema(Arc::new(base_schema), &requested).unwrap();
+        let projected = plan.physical_projection.to_bare_schema();
+        assert_eq!(
+            projected.fields[0]
+                .children
+                .iter()
+                .map(|child| child.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["b"],
+            "the projection must follow the requested name, not the colliding id"
+        );
     }
 }
