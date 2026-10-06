@@ -45,7 +45,7 @@ protobuf-src = { workspace = true, optional = true }
 lance-datagen.workspace = true
 rstest.workspace = true
 tracing-mock.workspace = true
-tracing-subscriber = "0.3.17"
+tracing-subscriber.workspace = true
 
 [features]
 datagen = ["dep:lance-datagen"]
