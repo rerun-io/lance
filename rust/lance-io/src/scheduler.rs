@@ -119,6 +119,17 @@ struct IoQueueState {
     last_warn: AtomicU64,
     // When true, skip all byte-based backpressure checks (set when io_buffer_size == 0)
     no_backpressure: bool,
+    // High-water mark of bytes debited but not yet credited back.
+    //
+    // This is the quantity the byte budget is supposed to bound, and nothing reported
+    // it: callers could only observe whole-process RSS, which cannot separate scheduler
+    // prefetch from decode buffers.
+    max_bytes_in_flight: u64,
+    // Chunks admitted even though the remaining budget did not cover them, because
+    // `can_deliver` matched on a ground other than the budget: nothing of lower priority is
+    // in flight (the path that guarantees forward progress), or the chunk belongs to a
+    // request already in flight. Each one is a place where the budget is soft, not hard.
+    over_budget_admissions: u64,
 }
 
 impl IoQueueState {
@@ -134,7 +145,21 @@ impl IoQueueState {
             start: Instant::now(),
             last_warn: AtomicU64::from(0),
             no_backpressure: io_buffer_size == 0,
+            max_bytes_in_flight: 0,
+            over_budget_admissions: 0,
         }
+    }
+
+    /// Bytes currently debited and not yet credited back.
+    ///
+    /// Zero when `no_backpressure` is set: that mode skips the debit in `next_task` but
+    /// still credits on completion, so `bytes_avail` drifts upward without bound and the
+    /// difference is meaningless rather than merely zero.
+    fn bytes_in_flight(&self) -> u64 {
+        if self.no_backpressure {
+            return 0;
+        }
+        (self.io_buffer_size as i64 - self.bytes_avail).max(0) as u64
     }
 
     fn scheduler_state_event(&self) -> Option<SchedulerStateEvent> {
@@ -252,7 +277,12 @@ impl IoQueueState {
             self.priorities_in_flight.push(task.priority);
             self.iops_avail -= 1;
             if !skip_bytes_accounting {
+                if task.num_bytes() as i64 > self.bytes_avail {
+                    // `can_deliver` let this through on a priority ground, not on budget.
+                    self.over_budget_admissions += 1;
+                }
                 self.bytes_avail -= task.num_bytes() as i64;
+                self.max_bytes_in_flight = self.max_bytes_in_flight.max(self.bytes_in_flight());
                 if self.bytes_avail < 0 {
                     // This can happen when we admit special priority requests
                     log::debug!(
@@ -655,6 +685,50 @@ impl ScanStats {
             bytes_read: stats.bytes_read(),
         }
     }
+}
+
+/// What the backpressure budget actually did, as opposed to what it was configured to do.
+///
+/// Counters are cumulative for the lifetime of the [`ScanScheduler`], like [`ScanStats`],
+/// and are not reset between scans.
+///
+/// Reads submitted through a `bypass_backpressure` file scheduler are excluded from every
+/// field here: they are never debited against the budget and are bounded by nothing, so
+/// they are invisible to these numbers by design.
+///
+/// ```
+/// # use lance_io::scheduler::{ScanScheduler, SchedulerConfig};
+/// # use lance_io::object_store::ObjectStore;
+/// # use std::sync::Arc;
+/// # fn example(object_store: Arc<ObjectStore>) {
+/// let scheduler = ScanScheduler::new(object_store, SchedulerConfig::default_for_testing());
+/// let stats = scheduler.backpressure_stats();
+/// // How close the budget came to its ceiling, and whether it was crossed.
+/// assert!(stats.max_bytes_in_flight <= stats.io_buffer_size || stats.over_budget_admissions > 0);
+/// # }
+/// ```
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct BackpressureStats {
+    /// The configured byte budget, carried here as the denominator for the measurements
+    /// below. This is configuration, not a measurement.
+    pub io_buffer_size: u64,
+    /// Peak of [`Self::bytes_in_flight`] over the scheduler's lifetime: the high-water
+    /// mark of the quantity `io_buffer_size` is meant to bound. May exceed the budget,
+    /// which is what [`Self::over_budget_admissions`] counts.
+    pub max_bytes_in_flight: u64,
+    /// Chunks admitted although the remaining budget did not cover them, because the
+    /// scheduler matched on a ground other than the budget: nothing of lower priority was
+    /// in flight (which is how the budget stays soft enough to guarantee forward progress),
+    /// or the chunk belonged to a request already in flight. A non-zero count means the
+    /// ceiling was crossed deliberately. Counts post-coalescing chunks, not caller
+    /// requests, so one read may contribute several.
+    pub over_budget_admissions: u64,
+    /// Bytes debited and not yet credited *right now*. Unlike [`Self::max_bytes_in_flight`]
+    /// this falls back towards zero as outstanding reads are consumed or dropped.
+    ///
+    /// Always zero when `io_buffer_size` is 0, which disables byte accounting entirely.
+    pub bytes_in_flight: u64,
 }
 
 fn split_priority(priority: Option<u128>) -> (Option<u64>, Option<u64>) {
@@ -1126,6 +1200,26 @@ impl ScanScheduler {
 
     pub fn stats(&self) -> ScanStats {
         self.stats.snapshot()
+    }
+
+    /// Backpressure usage for this scheduler; see [`BackpressureStats`].
+    ///
+    /// Both scheduler implementations report these, so the numbers mean the same thing
+    /// whichever one is in use. This briefly contends with the mutex the I/O loop holds on
+    /// its hot path, so sample it rather than polling it tightly.
+    pub fn backpressure_stats(&self) -> BackpressureStats {
+        match &self.io_queue {
+            IoQueueType::Standard(queue) => {
+                let state = queue.state.lock().expect("io queue mutex poisoned");
+                BackpressureStats {
+                    io_buffer_size: state.io_buffer_size,
+                    max_bytes_in_flight: state.max_bytes_in_flight,
+                    over_budget_admissions: state.over_budget_admissions,
+                    bytes_in_flight: state.bytes_in_flight(),
+                }
+            }
+            IoQueueType::Lite(queue) => queue.backpressure_stats(),
+        }
     }
 
     #[cfg(test)]
@@ -2131,6 +2225,26 @@ mod tests {
         assert_eq!(fourth_fut.await.unwrap().len(), 5);
         wait_for_bytes_read_and_idle(28).await;
 
+        // Every read above is priority 0, so `can_deliver` admits each one on the
+        // equal-priority forward-progress ground before the budget is ever consulted. That
+        // pushes the in-flight total past the 10-byte ceiling, which is exactly the
+        // condition these counters exist to expose: `bytes_avail` alone cannot say how far
+        // over the budget went, nor how often it was crossed.
+        let backpressure = scan_scheduler.backpressure_stats();
+        assert_eq!(backpressure.io_buffer_size, 10);
+        assert!(
+            backpressure.max_bytes_in_flight > backpressure.io_buffer_size,
+            "expected the peak to exceed the {}-byte budget, got {}",
+            backpressure.io_buffer_size,
+            backpressure.max_bytes_in_flight
+        );
+        assert!(
+            backpressure.over_budget_admissions > 0,
+            "expected at least one chunk admitted on priority rather than budget"
+        );
+        // Every request above has been consumed, so the budget is whole again.
+        assert_eq!(backpressure.bytes_in_flight, 0);
+
         // Ensure deadlock prevention timeout can be disabled
         let config = SchedulerConfig {
             io_buffer_size_bytes: 10,
@@ -2316,6 +2430,22 @@ mod tests {
         assert_eq!(fut1.await.unwrap()[0].len(), 100);
         assert_eq!(fut2.await.unwrap()[0].len(), 100);
         assert_eq!(fut3.await.unwrap()[0].len(), 100);
+
+        // The lite scheduler reports the same measurements as the standard one, so a
+        // caller reading them need not know which is in use. A zero here would be
+        // indistinguishable from "no I/O happened", which is why it is asserted non-zero.
+        let backpressure = scheduler.backpressure_stats();
+        assert_eq!(
+            backpressure.io_buffer_size,
+            SchedulerConfig::default_for_testing().io_buffer_size_bytes
+        );
+        assert_eq!(
+            backpressure.max_bytes_in_flight, 300,
+            "all three eagerly submitted reads were reserved at once"
+        );
+        // The budget is far larger than 300 bytes, so nothing was admitted over it.
+        assert_eq!(backpressure.over_budget_admissions, 0);
+        assert_eq!(backpressure.bytes_in_flight, 0);
     }
 
     #[tokio::test]
@@ -2439,6 +2569,16 @@ mod tests {
         assert_eq!(bytes2[0].len(), 1000);
         assert_eq!(bytes3[0].len(), 1000);
         assert_eq!(get_range_count.load(Ordering::Acquire), 3);
+
+        // A zero budget disables byte accounting, so the counters stay at zero even though
+        // 3000 bytes went through: there is no ceiling to peak against and none to cross.
+        // Pins that `io_buffer_size == 0` reports "not measured" rather than a measured
+        // ceiling of zero.
+        let backpressure = scheduler.backpressure_stats();
+        assert_eq!(backpressure.io_buffer_size, 0);
+        assert_eq!(backpressure.max_bytes_in_flight, 0);
+        assert_eq!(backpressure.over_budget_admissions, 0);
+        assert_eq!(backpressure.bytes_in_flight, 0);
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -2512,6 +2652,17 @@ mod tests {
             bytes_dispatched.load(Ordering::Acquire),
             20,
             "normal read should still be blocked while budget is exhausted"
+        );
+
+        // 20 bytes are outstanding but only the blocker's 10 were ever debited: bypass
+        // reads are exempt from the budget and so are invisible to these counters. The
+        // budget is full, not over, so nothing was admitted over it.
+        let backpressure = scan_scheduler.backpressure_stats();
+        assert_eq!(backpressure.bytes_in_flight, 10);
+        assert_eq!(backpressure.max_bytes_in_flight, 10);
+        assert_eq!(
+            backpressure.over_budget_admissions, 0,
+            "a bypass read is exempt from the budget, not admitted over it"
         );
 
         // Consuming the blocker releases its 10-byte budget → normal read can proceed.

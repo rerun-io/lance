@@ -304,6 +304,8 @@ struct BackpressureState {
     bytes_available: i64,
     priorities_in_flight: u64,
     no_backpressure: bool,
+    max_bytes_in_flight: u64,
+    over_budget_admissions: u64,
 }
 
 struct SimpleBackpressureThrottle {
@@ -314,6 +316,11 @@ struct SimpleBackpressureThrottle {
     priorities_in_flight: PrioritiesInFlight,
     // When true, skip all byte-based backpressure checks (set when max_bytes == 0)
     no_backpressure: bool,
+    // High-water mark of bytes reserved but not yet released, and the number of
+    // reservations granted on a ground other than the budget. See
+    // `super::BackpressureStats`, which these feed.
+    max_bytes_in_flight: u64,
+    over_budget_admissions: u64,
 }
 
 impl SimpleBackpressureThrottle {
@@ -329,7 +336,17 @@ impl SimpleBackpressureThrottle {
             bytes_available: max_bytes as i64,
             priorities_in_flight: PrioritiesInFlight::new(max_concurrency),
             no_backpressure: max_bytes == 0,
+            max_bytes_in_flight: 0,
+            over_budget_admissions: 0,
         }
+    }
+
+    /// Bytes reserved and not yet released, or 0 when byte accounting is disabled.
+    fn bytes_in_flight(&self) -> u64 {
+        if self.no_backpressure {
+            return 0;
+        }
+        (self.max_bytes as i64 - self.bytes_available).max(0) as u64
     }
 
     fn warn_if_needed(&self) {
@@ -361,7 +378,12 @@ impl BackpressureThrottle for SimpleBackpressureThrottle {
             // unconsumed while the caller awaits this request.
             || self.priorities_in_flight.contains(priority)
         {
+            if !self.no_backpressure && self.bytes_available < num_bytes as i64 {
+                // One of the priority grounds above let this through, not the budget.
+                self.over_budget_admissions += 1;
+            }
             self.bytes_available -= num_bytes as i64;
+            self.max_bytes_in_flight = self.max_bytes_in_flight.max(self.bytes_in_flight());
             self.priorities_in_flight.push(priority);
             Some(BackpressureReservation {
                 num_bytes,
@@ -392,6 +414,8 @@ impl BackpressureThrottle for SimpleBackpressureThrottle {
             bytes_available: self.bytes_available,
             priorities_in_flight: self.priorities_in_flight.len() as u64,
             no_backpressure: self.no_backpressure,
+            max_bytes_in_flight: self.max_bytes_in_flight,
+            over_budget_admissions: self.over_budget_admissions,
         }
     }
 }
@@ -535,6 +559,21 @@ impl IoQueue {
         Self {
             state: Arc::new(Mutex::new(IoQueueState::new(max_concurrency, max_bytes))),
             stats,
+        }
+    }
+
+    pub(super) fn backpressure_stats(&self) -> super::BackpressureStats {
+        let state = self.state.lock().unwrap();
+        let backpressure = state.backpressure_throttle.state();
+        super::BackpressureStats {
+            io_buffer_size: backpressure.max_bytes,
+            max_bytes_in_flight: backpressure.max_bytes_in_flight,
+            over_budget_admissions: backpressure.over_budget_admissions,
+            bytes_in_flight: if backpressure.no_backpressure {
+                0
+            } else {
+                (backpressure.max_bytes as i64 - backpressure.bytes_available).max(0) as u64
+            },
         }
     }
 
