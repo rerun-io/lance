@@ -309,8 +309,10 @@ impl ProjectionPlan {
             if lance_core::is_system_column(&field.name) {
                 // Handle known system columns that can be included in projections
                 if field.name == ROW_ID {
+                    // Only `_rowoffset` needs `AddRowOffsetExec`. Requesting that node for
+                    // `_rowid` leaves it without the `_rowaddr` column it reads, so the scan
+                    // fails to plan with "Input plan does not have a _rowaddr column".
                     with_row_id = true;
-                    must_add_row_offset = true;
                 } else if field.name == ROW_ADDR {
                     with_row_addr = true;
                 } else if field.name == ROW_OFFSET {
