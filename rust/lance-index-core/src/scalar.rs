@@ -359,11 +359,10 @@ pub trait IndexStore: std::fmt::Debug + Send + Sync + DeepSizeOf {
     /// store's own byte budget rather than by readahead. That budget is per store, so a
     /// caller holding N stores open holds N budgets unless it rescopes them.
     ///
-    /// The default returns the store unchanged: a store with no byte budget to divide has
-    /// nothing to do here, and its callers are bounded by readahead as before.
-    fn with_io_buffer_size(&self, _bytes: u64) -> Arc<dyn IndexStore> {
-        self.clone_arc()
-    }
+    /// A store that prefetches nothing may return itself unchanged, but it must say so
+    /// explicitly: a caller that asks for a bound and silently does not get one has no way
+    /// to tell.
+    fn with_io_buffer_size(&self, bytes: u64) -> Arc<dyn IndexStore>;
 
     /// Copy a range of batches from an index file from this store to another
     ///
