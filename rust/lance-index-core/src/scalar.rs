@@ -352,6 +352,19 @@ pub trait IndexStore: std::fmt::Debug + Send + Sync + DeepSizeOf {
     /// Return a store that submits its I/O at the given base priority.
     fn with_io_priority(&self, io_priority: u64) -> Arc<dyn IndexStore>;
 
+    /// Return a store whose reads are bounded by `bytes` of outstanding data, for callers
+    /// that read several stores at once and need the total bounded rather than each one.
+    ///
+    /// A whole-file read is scheduled eagerly, so its outstanding bytes are bounded by the
+    /// store's own byte budget rather than by readahead. That budget is per store, so a
+    /// caller holding N stores open holds N budgets unless it rescopes them.
+    ///
+    /// The default returns the store unchanged: a store with no byte budget to divide has
+    /// nothing to do here, and its callers are bounded by readahead as before.
+    fn with_io_buffer_size(&self, _bytes: u64) -> Arc<dyn IndexStore> {
+        self.clone_arc()
+    }
+
     /// Copy a range of batches from an index file from this store to another
     ///
     /// This is often useful when remapping or updating

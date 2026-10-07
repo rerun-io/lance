@@ -91,6 +91,10 @@ mod flat;
 
 pub const BTREE_LOOKUP_NAME: &str = "page_lookup.lance";
 const BTREE_PAGES_NAME: &str = "page_data.lance";
+
+/// Floor for a merge source's share of the byte budget: enough to keep one storage page in
+/// flight, so a source can always make progress no matter how many sources there are.
+const MERGE_BYTES_PER_IO_THREAD: u64 = 32 * 1024 * 1024;
 pub const DEFAULT_BTREE_BATCH_SIZE: u64 = 4096;
 const BATCH_SIZE_META_KEY: &str = "batch_size";
 const DEFAULT_RANGE_PARTITIONED: bool = false;
@@ -1669,6 +1673,15 @@ impl DeepSizeOf for BTreeIndex {
 }
 
 impl BTreeIndex {
+    /// The same index, reading through a store whose outstanding bytes are capped at
+    /// `bytes`. Only the store differs; the lookup and caches are shared.
+    fn with_io_buffer_size(&self, bytes: u64) -> Self {
+        Self {
+            store: self.store.with_io_buffer_size(bytes),
+            ..self.clone()
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn new(
         page_lookup: Arc<BTreeLookup>,
@@ -2237,11 +2250,24 @@ impl BTreeIndex {
             )));
         }
 
+        // Every source stream below is built before any of them is consumed, and
+        // `data_stream` schedules a whole-file read eagerly. Each segment carries its own
+        // store, so without rescoping the merge holds one full byte budget per source at
+        // once, none of it visible to the memory pool. Divide one scan's budget between the
+        // sources this merge will actually read.
+        let num_sources = segments
+            .iter()
+            .zip(old_data_filters)
+            .filter(|(_, filter)| !filter_keeps_nothing(filter))
+            .count() as u64;
+        let source_io_buffer_size = merge_io_buffer_size(first.store.io_parallelism(), num_sources);
+
         let mut inputs: Vec<Arc<dyn ExecutionPlan>> = Vec::with_capacity(segments.len() + 1);
         for (segment, old_data_filter) in segments.iter().zip(old_data_filters) {
             if filter_keeps_nothing(old_data_filter) {
                 continue;
             }
+            let segment = segment.with_io_buffer_size(source_io_buffer_size);
             let stream = segment.data_stream().await?;
             let stream = if let Some(frag_reuse_index) = segment.frag_reuse_index.clone() {
                 // Legacy synchronous remapping path.
@@ -2309,6 +2335,16 @@ fn filter_row_ids(
         Ok(arrow_select::filter::filter_record_batch(&batch, &mask)?)
     });
     Box::pin(RecordBatchStreamAdapter::new(schema, filtered))
+}
+
+/// One merge source's share of the byte budget a single scan would have been given.
+///
+/// Conserves that budget across sources until the per-source floor binds. Past
+/// `io_parallelism` sources the floor wins and the aggregate grows again, which is the point
+/// at which a caller wanting a fixed total would have to merge in several passes.
+fn merge_io_buffer_size(io_parallelism: usize, num_sources: u64) -> u64 {
+    let total = MERGE_BYTES_PER_IO_THREAD * io_parallelism.max(1) as u64;
+    (total / num_sources.max(1)).max(MERGE_BYTES_PER_IO_THREAD)
 }
 
 /// True if `filter` would keep no rows at all (its keep-set is empty), letting
@@ -7736,5 +7772,34 @@ mod tests {
             data_stream_iops,
             num_pages
         );
+    }
+
+    #[test]
+    fn test_merge_io_buffer_size_divides_one_scans_budget() {
+        use super::{MERGE_BYTES_PER_IO_THREAD as FLOOR, merge_io_buffer_size};
+
+        // One source gets what a single scan would have had.
+        let one_scan = FLOOR * 64;
+        assert_eq!(merge_io_buffer_size(64, 1), one_scan);
+
+        // Several sources divide that budget rather than each taking it whole, so the
+        // merge's total stays what one scan would have used.
+        for sources in [2, 4, 8, 16, 32, 64] {
+            assert_eq!(
+                merge_io_buffer_size(64, sources) * sources,
+                one_scan,
+                "{sources} sources should still total one scan's budget"
+            );
+        }
+
+        // Past that the floor binds: a source always keeps enough for one storage page, so
+        // it can make progress, and the aggregate grows again rather than starving.
+        assert_eq!(merge_io_buffer_size(64, 128), FLOOR);
+        assert_eq!(merge_io_buffer_size(64, 1024), FLOOR);
+
+        // Degenerate inputs do not divide by zero or hand out a zero budget, which the
+        // scheduler would read as "no backpressure" rather than "the smallest budget".
+        assert_eq!(merge_io_buffer_size(0, 0), FLOOR);
+        assert_eq!(merge_io_buffer_size(8, 0), FLOOR * 8);
     }
 }
