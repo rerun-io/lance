@@ -573,9 +573,8 @@ impl IndexStore for LanceIndexStore {
     }
 
     fn with_io_buffer_size(&self, bytes: u64) -> Arc<dyn IndexStore> {
-        // Unlike `with_io_priority`, this cannot share `scheduler`: the budget belongs to
-        // the scheduler, so a smaller one needs a scheduler of its own. The object store
-        // underneath is still shared, so no connection or credential work is repeated.
+        // Unlike `with_io_priority`, this cannot share `scheduler`: the budget belongs to the
+        // scheduler. The object store underneath is still shared.
         Arc::new(Self {
             scheduler: ScanScheduler::new(
                 self.object_store.clone(),

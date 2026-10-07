@@ -3066,7 +3066,7 @@ mod tests {
         }
 
         fn with_io_buffer_size(&self, _bytes: u64) -> Arc<dyn IndexStore> {
-            // No backing scheduler, so there is no prefetch to bound.
+            // Write-only store: `open_index_file` is unsupported, so there is no read to bound.
             self.clone_arc()
         }
 
