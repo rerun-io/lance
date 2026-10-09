@@ -498,11 +498,19 @@ mod tests {
 
     #[test]
     fn test_deep_size_counts_index_details() {
-        let details = Arc::new(prost_types::Any {
-            type_url: "/lance.table.FragmentReuseIndexDetails".to_string(),
-            value: vec![0u8; 10_000],
-        });
-        let mut meta = IndexMetadata {
+        // Spare capacity on both buffers, so counting `len()` instead of `capacity()` fails.
+        fn details() -> Arc<prost_types::Any> {
+            let mut type_url = String::with_capacity(128);
+            type_url.push_str("/lance.table.FragmentReuseIndexDetails");
+            let mut value = Vec::with_capacity(12_000);
+            value.resize(10_000, 0u8);
+            assert_eq!((type_url.capacity(), value.capacity()), (128, 12_000));
+            Arc::new(prost_types::Any { type_url, value })
+        }
+        // `Any` struct + `type_url` heap + `value` heap.
+        let details_size = std::mem::size_of::<prost_types::Any>() + 128 + 12_000;
+
+        let meta = IndexMetadata {
             uuid: Uuid::new_v4(),
             name: "__lance_frag_reuse".to_string(),
             fields: vec![],
@@ -515,15 +523,26 @@ mod tests {
             base_id: None,
             files: None,
         };
-        let without = meta.deep_size_of();
-        let two_without = vec![meta.clone(), meta.clone()];
-        meta.index_details = Some(details);
-        assert!(meta.deep_size_of() >= without + 10_000);
+        let with = |details: Arc<prost_types::Any>| IndexMetadata {
+            index_details: Some(details),
+            ..meta.clone()
+        };
+
+        assert_eq!(
+            with(details()).deep_size_of() - meta.deep_size_of(),
+            details_size
+        );
+
+        let two_without = vec![meta.clone(), meta.clone()].deep_size_of();
 
         // A shared Arc is charged once per measured value.
-        let shared = vec![meta.clone(), meta];
-        let delta = shared.deep_size_of() - two_without.deep_size_of();
-        assert!((10_000..20_000).contains(&delta), "delta = {delta}");
+        let shared = details();
+        let shared = vec![with(shared.clone()), with(shared)];
+        assert_eq!(shared.deep_size_of() - two_without, details_size);
+
+        // Independent Arcs are each charged.
+        let independent = vec![with(details()), with(details())];
+        assert_eq!(independent.deep_size_of() - two_without, 2 * details_size);
     }
 
     /// Demonstrates the pattern a disk-backed cache backend would use:
