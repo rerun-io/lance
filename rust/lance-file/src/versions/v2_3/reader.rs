@@ -4,7 +4,9 @@
 use std::{collections::BTreeMap, sync::Arc};
 
 use lance_core::{Error, Result, datatypes::Schema};
-use lance_encoding::{decoder::ColumnInfo, format::pb21};
+use lance_encoding::{
+    decoder::ColumnInfo, encodings::physical::binary::BinaryMiniBlockDecompressor, format::pb21,
+};
 
 use crate::{
     format::pbfile,
@@ -60,6 +62,10 @@ fn validate_compressive_encoding(
         Some(Compression::Flat(_))
         | Some(Compression::InlineBitpacking(_))
         | Some(Compression::Constant(_)) => Ok(()),
+        Some(Compression::Variable(variable)) if position == EncodingPosition::MiniBlock => {
+            // Variable mini-blocks own the optional offset payload and typed codec grammar.
+            BinaryMiniBlockDecompressor::from_variable(variable).map(|_| ())
+        }
         Some(Compression::Variable(variable)) => validate_compressive_encoding(
             required(variable.offsets.as_deref(), "variable offsets")?,
             position.child(),
@@ -140,50 +146,40 @@ fn validate_compressive_encoding(
     }
 }
 
-fn validate_sparse_positions(positions: Option<&pb21::SparsePositionSet>) -> Result<()> {
-    use pb21::sparse_position_set::Positions;
-
-    if let Some(Positions::Explicit(encoding)) =
-        positions.and_then(|positions| positions.positions.as_ref())
-    {
-        validate_compressive_encoding(encoding, EncodingPosition::BufferBackedBlock)?;
-    }
-    Ok(())
+fn validate_sparse_sequence(
+    positions: Option<&pb21::CompressiveEncoding>,
+    count: u64,
+) -> Result<()> {
+    lance_encoding::compression::validate_fixed_width_block_sequence(
+        required(positions, "sparse structural sequence")?,
+        64,
+        count,
+    )
 }
 
 fn validate_sparse_validity(validity: Option<&pb21::SparseValiditySet>) -> Result<()> {
     if let Some(validity) = validity {
-        validate_sparse_positions(validity.positions.as_ref())?;
+        validate_sparse_sequence(validity.positions.as_ref(), validity.num_positions)?;
     }
     Ok(())
 }
 
 fn validate_sparse_layout(layout: &pb21::SparseLayout) -> Result<()> {
-    use pb21::{sparse_count_set::Counts, sparse_structural_layer::Layer};
+    use pb21::sparse_structural_layer::Layer;
 
-    if !layout.has_large_chunk {
-        return Err(Error::invalid_input_source(
-            "Lance v2.3 sparse pages require the u32 chunk grammar".into(),
-        ));
-    }
     validate_compressive_encoding(
         required(layout.value_compression.as_ref(), "sparse values")?,
         EncodingPosition::MiniBlock,
     )?;
     for layer in &layout.structural_layers {
         match layer.layer.as_ref() {
-            Some(Layer::Validity(validity)) => {
-                validate_sparse_validity(validity.validity.as_ref())?
-            }
+            Some(Layer::Validity(validity)) => validate_sparse_validity(Some(validity))?,
             Some(Layer::List(list)) => {
-                validate_sparse_positions(list.non_empty_positions.as_ref())?;
-                if let Some(Counts::Explicit(encoding)) = list
-                    .counts
-                    .as_ref()
-                    .and_then(|counts| counts.counts.as_ref())
-                {
-                    validate_compressive_encoding(encoding, EncodingPosition::BufferBackedBlock)?;
-                }
+                validate_sparse_sequence(
+                    list.non_empty_positions.as_ref(),
+                    list.num_non_empty_positions,
+                )?;
+                validate_sparse_sequence(list.counts.as_ref(), list.num_non_empty_positions)?;
                 validate_sparse_validity(list.validity.as_ref())?;
             }
             Some(Layer::FixedSizeList(list)) => validate_sparse_validity(list.validity.as_ref())?,
