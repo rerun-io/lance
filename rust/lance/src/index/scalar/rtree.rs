@@ -44,8 +44,13 @@ pub(in crate::index) async fn merge_segments(
         .min()
         .unwrap_or(dataset.manifest.version);
     let segment_refs = segments.iter().collect::<Vec<_>>();
-    let (fragment_bitmap, old_data_filters) =
-        crate::index::append::build_per_segment_filters(dataset, &segment_refs, staged).await?;
+    let (fragment_bitmap, old_data_filters) = crate::index::append::build_per_segment_filters(
+        dataset,
+        &segment_refs,
+        staged,
+        &roaring::RoaringBitmap::new(),
+    )
+    .await?;
 
     let mut source_indices = Vec::with_capacity(segments.len());
     let mut source_filters = Vec::with_capacity(old_data_filters.len());

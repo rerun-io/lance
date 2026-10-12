@@ -69,8 +69,13 @@ pub(in crate::index) async fn merge_segments(
     let field_path = dataset.schema().field_path(field_id)?;
 
     let segment_refs: Vec<&IndexMetadata> = segments.iter().collect();
-    let (fragment_bitmap, old_data_filters) =
-        crate::index::append::build_per_segment_filters(dataset, &segment_refs, staged).await?;
+    let (fragment_bitmap, old_data_filters) = crate::index::append::build_per_segment_filters(
+        dataset,
+        &segment_refs,
+        staged,
+        &roaring::RoaringBitmap::new(),
+    )
+    .await?;
 
     let new_uuid = Uuid::new_v4();
     let new_store = LanceIndexStore::from_dataset_for_new(dataset, &new_uuid)?;

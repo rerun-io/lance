@@ -275,26 +275,32 @@ pub fn fragment_reuse_affects_segment(
 /// Build one [`OldIndexDataFilter`] per segment and return their effective coverage.
 ///
 /// `staged` carries the plans of segments the manifest does not list (see
-/// [`tagged_segment_coverage`]); committed merges pass `None`.
+/// [`tagged_segment_coverage`]); committed merges pass `None`. `excluded`
+/// names live fragments whose entries the merge must not carry over even
+/// though a segment covers them; they leave the returned coverage as well.
 pub async fn build_per_segment_filters(
     dataset: &Dataset,
     segments: &[&IndexMetadata],
     staged: Option<&crate::index::frag_reuse::StagedRemappingPlans>,
+    excluded: &RoaringBitmap,
 ) -> Result<(RoaringBitmap, Vec<Option<OldIndexDataFilter>>)> {
     if let Some(coverage) = tagged_segment_coverage(dataset, segments, staged).await? {
         // Translated addresses live in the derived coverage; retired source
-        // fragments never appear in them, so there is nothing to remove.
+        // fragments never appear in them, so only the excluded fragments the
+        // segment answers for are removed.
         let mut effective_union = RoaringBitmap::new();
         let mut filters = Vec::with_capacity(segments.len());
         for segment in segments {
-            let effective = coverage.get(&segment.uuid).cloned().ok_or_else(|| {
+            let mut effective = coverage.get(&segment.uuid).cloned().ok_or_else(|| {
                 Error::internal(format!(
                     "tagged coverage missing for segment {}",
                     segment.uuid
                 ))
             })?;
+            let removed = &effective & excluded;
+            effective -= &removed;
             effective_union |= &effective;
-            filters.push(build_old_data_filter(dataset, &effective, &RoaringBitmap::new()).await?);
+            filters.push(build_old_data_filter(dataset, &effective, &removed).await?);
         }
         return Ok((effective_union, filters));
     }
@@ -302,7 +308,7 @@ pub async fn build_per_segment_filters(
         let mut effective_union = RoaringBitmap::new();
         let mut filters = Vec::with_capacity(segments.len());
         for segment in segments {
-            let effective = segment
+            let mut effective = segment
                 .effective_fragment_bitmap(&dataset.fragment_bitmap)
                 .ok_or_else(|| {
                     Error::invalid_input(format!(
@@ -310,8 +316,10 @@ pub async fn build_per_segment_filters(
                         segment.uuid
                     ))
                 })?;
+            let removed = &effective & excluded;
+            effective -= &removed;
             effective_union |= &effective;
-            filters.push(build_old_data_filter(dataset, &effective, &RoaringBitmap::new()).await?);
+            filters.push(build_old_data_filter(dataset, &effective, &removed).await?);
         }
         return Ok((effective_union, filters));
     }
@@ -325,12 +333,14 @@ pub async fn build_per_segment_filters(
                 segment.uuid
             )));
         }
-        let effective = segment
+        let mut effective = segment
             .effective_fragment_bitmap(&dataset.fragment_bitmap)
             .unwrap_or_default();
-        let deleted = segment
+        let mut deleted = segment
             .deleted_fragment_bitmap(&dataset.fragment_bitmap)
             .unwrap_or_default();
+        deleted |= &effective & excluded;
+        effective -= excluded;
         effective_union |= &effective;
         filters.push(build_old_data_filter(dataset, &effective, &deleted).await?);
     }
@@ -587,6 +597,31 @@ async fn merge_scalar_indices<'a>(
         None => split_segment_coverage(dataset.as_ref(), selected_old_indices.iter().copied()),
     };
 
+    // `dataset_version` gates two readers: `cleanup_frag_reuse_index` retires reuse versions
+    // at or below it, and overlay masking treats overlays committed at or below it as
+    // incorporated. A type that remaps through the fragment-reuse index (`can_remap`) merges
+    // stamped with this manifest, but the entries it would carry over from a source never
+    // incorporate overlays committed after that source was built. Those fragments are left
+    // out of the merge and of the coverage: readers scan them and the next optimize
+    // re-indexes them. Types that do not remap keep the oldest source's stamp and carry
+    // everything over. A freshly scanned fragment already reflects its overlays, so only
+    // carried-over coverage can be stale.
+    let mut overlay_stale_frags = RoaringBitmap::new();
+    if reference_index.can_remap() {
+        let overlaid = overlaid_fragments(&dataset.manifest.fragments);
+        if !overlaid.is_empty() {
+            for segment in selected_old_indices.iter() {
+                collect_overlay_stale_frags(
+                    segment,
+                    &overlaid,
+                    &mut overlay_stale_frags,
+                    dataset.schema(),
+                )?;
+            }
+            overlay_stale_frags &= &effective_old_frags;
+        }
+    }
+
     // The fragments a from-scratch rebuild must scan: everything the merged
     // segment will answer for, all of it live.
     let mut rebuild_frags = base_unindexed_bitmap.clone();
@@ -694,9 +729,13 @@ async fn merge_scalar_indices<'a>(
 
             match index_type {
                 IndexType::BTree => {
-                    let (_, old_data_filters) =
-                        build_per_segment_filters(dataset.as_ref(), &selected_old_indices, None)
-                            .await?;
+                    let (_, old_data_filters) = build_per_segment_filters(
+                        dataset.as_ref(),
+                        &selected_old_indices,
+                        None,
+                        &overlay_stale_frags,
+                    )
+                    .await?;
                     crate::index::scalar::btree::open_and_merge_segments(
                         dataset.as_ref(),
                         field_path,
@@ -709,9 +748,13 @@ async fn merge_scalar_indices<'a>(
                     .await?
                 }
                 IndexType::Bitmap => {
-                    let (_, old_data_filters) =
-                        build_per_segment_filters(dataset.as_ref(), &selected_old_indices, None)
-                            .await?;
+                    let (_, old_data_filters) = build_per_segment_filters(
+                        dataset.as_ref(),
+                        &selected_old_indices,
+                        None,
+                        &overlay_stale_frags,
+                    )
+                    .await?;
                     crate::index::scalar::bitmap::open_and_merge_segments(
                         dataset.as_ref(),
                         field_path,
@@ -724,9 +767,13 @@ async fn merge_scalar_indices<'a>(
                     .await?
                 }
                 IndexType::NGram => {
-                    let (_, old_data_filters) =
-                        build_per_segment_filters(dataset.as_ref(), &selected_old_indices, None)
-                            .await?;
+                    let (_, old_data_filters) = build_per_segment_filters(
+                        dataset.as_ref(),
+                        &selected_old_indices,
+                        None,
+                        &overlay_stale_frags,
+                    )
+                    .await?;
                     crate::index::scalar::ngram::open_and_merge_segments(
                         dataset.as_ref(),
                         &selected_old_indices,
@@ -740,8 +787,8 @@ async fn merge_scalar_indices<'a>(
                 _ => {
                     let old_data_filter = build_old_data_filter(
                         dataset.as_ref(),
-                        &effective_old_frags,
-                        &deleted_old_frags,
+                        &(&effective_old_frags - &overlay_stale_frags),
+                        &(&deleted_old_frags | &overlay_stale_frags),
                     )
                     .await?;
                     reference_index
@@ -750,33 +797,15 @@ async fn merge_scalar_indices<'a>(
                 }
             }
         };
-        // `dataset_version` gates two readers: `cleanup_frag_reuse_index` retires reuse versions
-        // at or below it, and overlay masking treats overlays committed at or below it as
-        // incorporated. A type that remaps through the fragment-reuse index (`can_remap`) merges
-        // caught up with this manifest, but the entries it carries over from a source never
-        // incorporate overlays committed after that source was built, so those fragments leave
-        // the coverage: readers scan them and the next optimize re-indexes them. Types that do
-        // not remap keep the oldest source's stamp.
-        let source_dataset_version = selected_old_indices
-            .iter()
-            .map(|index| index.dataset_version)
-            .min()
-            .unwrap_or(dataset.manifest.version);
         let new_dataset_version = if reference_index.can_remap() {
-            let overlaid = overlaid_fragments(&dataset.manifest.fragments);
-            if !overlaid.is_empty() {
-                let mut stale = RoaringBitmap::new();
-                for segment in selected_old_indices.iter() {
-                    collect_overlay_stale_frags(segment, &overlaid, &mut stale, dataset.schema())?;
-                }
-                // Only carried-over entries can be stale: a freshly scanned fragment already
-                // reflects its overlays.
-                stale &= &effective_old_frags;
-                frag_bitmap -= &stale;
-            }
+            frag_bitmap -= &overlay_stale_frags;
             dataset.manifest.version
         } else {
-            source_dataset_version
+            selected_old_indices
+                .iter()
+                .map(|index| index.dataset_version)
+                .min()
+                .unwrap_or(dataset.manifest.version)
         };
         (created_index, new_dataset_version)
     };
