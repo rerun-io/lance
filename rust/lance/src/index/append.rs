@@ -5,6 +5,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use futures::{FutureExt, TryStreamExt};
+use lance_core::utils::address::RowAddress;
 use lance_core::{Error, Result};
 use lance_file::reader::FileReaderOptions;
 use lance_index::{
@@ -23,7 +24,7 @@ use lance_index::{
 };
 use lance_io::scheduler::{ScanScheduler, SchedulerConfig};
 use lance_io::utils::CachedFileSize;
-use lance_select::{RowAddrTreeMap, RowSetOps};
+use lance_select::{RowAddrMask, RowAddrTreeMap, RowSetOps};
 use lance_table::format::{Fragment, IndexMetadata};
 use prost::Message;
 use roaring::RoaringBitmap;
@@ -37,9 +38,11 @@ use super::vector::{LogicalVectorIndex, VectorIndexParams, details, fresh_vector
 use super::{CreateIndexBuilder, DatasetIndexExt, DatasetIndexInternalExt};
 use crate::dataset::Dataset;
 use crate::dataset::index::LanceIndexStoreExt;
-use crate::dataset::rowids::load_row_id_sequences;
+use crate::dataset::overlay::{collect_overlay_stale_rows_for_segment, overlaid_fragments};
+use crate::dataset::rowids::{load_row_id_sequences, translate_addr_treemap_to_row_ids};
 use crate::index::scalar::{
     IndexDetails, fetch_index_details, load_fts_training_data, load_training_data,
+    scan_training_data,
 };
 use crate::index::vector_index_details_default;
 
@@ -336,6 +339,47 @@ pub async fn build_per_segment_filters(
     Ok((effective_union, filters))
 }
 
+/// Remove `stale_rows` from a segment's old-data filter: the rows an overlay replaced after
+/// the segment was built, keyed like the filter (row ids under stable row ids, addresses
+/// otherwise). The merge re-reads them.
+fn block_stale_rows(
+    dataset: &Dataset,
+    filter: Option<OldIndexDataFilter>,
+    stale_rows: &RowAddrTreeMap,
+) -> Option<OldIndexDataFilter> {
+    match filter {
+        // `to_remove` is bookkeeping no scalar merge reads.
+        Some(OldIndexDataFilter::Fragments {
+            to_keep,
+            to_remove: _,
+        }) if to_keep
+            .iter()
+            .any(|fragment_id| stale_rows.get(&fragment_id).is_some()) =>
+        {
+            // Every row of the kept fragments, one run each, minus the stale ones.
+            let mut allow = RowAddrTreeMap::new();
+            for fragment_id in to_keep.iter() {
+                let physical_rows = dataset
+                    .get_fragment(fragment_id as usize)
+                    .and_then(|fragment| fragment.metadata().physical_rows);
+                match physical_rows {
+                    Some(physical_rows) => {
+                        let start = u64::from(RowAddress::new_from_parts(fragment_id, 0));
+                        allow.insert_range(start..start + physical_rows as u64);
+                    }
+                    None => allow.insert_fragment(fragment_id),
+                }
+            }
+            allow -= stale_rows;
+            Some(OldIndexDataFilter::RowIds(allow))
+        }
+        Some(OldIndexDataFilter::RowIds(valid)) => {
+            Some(OldIndexDataFilter::RowIds(valid - stale_rows))
+        }
+        other => other,
+    }
+}
+
 /// Attempt to read seed buffers for `column_name` from `fragments`' data files.
 ///
 /// Returns `Some(vec)` only if every fragment has a seed entry; returns `None`
@@ -423,19 +467,19 @@ async fn load_unindexed_training_data(
     field_path: &str,
     update_criteria: &lance_index::scalar::UpdateCriteria,
     unindexed: &[Fragment],
+    rows: Option<RowAddrMask>,
 ) -> Result<datafusion::execution::SendableRecordBatchStream> {
     let fragments = if update_criteria.requires_old_data {
         None
     } else {
         Some(unindexed.to_vec())
     };
-    load_training_data(
+    scan_training_data(
         dataset,
         field_path,
         &update_criteria.data_criteria,
         fragments,
-        true,
-        None,
+        rows,
     )
     .await
 }
@@ -586,6 +630,57 @@ async fn merge_scalar_indices<'a>(
         None => split_segment_coverage(dataset.as_ref(), selected_old_indices.iter().copied()),
     };
 
+    // A remapping merge is stamped with the manifest it read (below): its sources were
+    // translated through the fragment-reuse index, so the trim may retire the versions they
+    // predate, and overlay masking will trust it for every overlay up to that manifest.
+    // Entries carried over from a source never incorporate overlays committed after it was
+    // built, so those rows are dropped from the carried-over data and re-read instead.
+    let mut stale_rows = RowAddrTreeMap::new();
+    if reference_index.can_remap() {
+        // The same per-row, field-aware, version-gated check the scanner masks by.
+        let overlaid = overlaid_fragments(&dataset.manifest.fragments);
+        let mut stale_offsets: HashMap<u32, RoaringBitmap> = HashMap::new();
+        for segment in selected_old_indices.iter() {
+            collect_overlay_stale_rows_for_segment(
+                segment,
+                &overlaid,
+                &mut stale_offsets,
+                dataset.schema(),
+            )?;
+        }
+        for (fragment_id, offsets) in stale_offsets {
+            if effective_old_frags.contains(fragment_id) {
+                stale_rows.insert_bitmap(fragment_id, offsets);
+            }
+        }
+    }
+    // One selection, so the scan sorts the unindexed fragments and the stale rows together.
+    let mut scan_fragments = unindexed.to_vec();
+    let mut scan_rows = None;
+    if !stale_rows.is_empty() {
+        scan_fragments.extend(
+            dataset
+                .manifest
+                .fragments
+                .iter()
+                .filter(|fragment| stale_rows.get(&(fragment.id as u32)).is_some())
+                .cloned(),
+        );
+        let mut selection = stale_rows.clone();
+        for fragment in unindexed {
+            selection.insert_fragment(fragment.id as u32);
+        }
+        scan_rows = Some(selection);
+    }
+    // The scan's row source and the old-data filters are keyed by row id under stable row ids.
+    if dataset.manifest.uses_stable_row_ids() {
+        stale_rows = translate_addr_treemap_to_row_ids(dataset.as_ref(), &stale_rows).await?;
+        if let Some(selection) = scan_rows.as_mut() {
+            *selection = translate_addr_treemap_to_row_ids(dataset.as_ref(), selection).await?;
+        }
+    }
+    let scan_rows = scan_rows.map(RowAddrMask::from_allowed);
+
     // The fragments a from-scratch rebuild must scan: everything the merged
     // segment will answer for, all of it live.
     let mut rebuild_frags = base_unindexed_bitmap.clone();
@@ -666,8 +761,9 @@ async fn merge_scalar_indices<'a>(
         let details = IndexDetails(index_details.clone());
         let plugin = details.get_plugin()?;
         // Only open data files looking for seeds when the plugin confirms this
-        // index type and configuration can actually produce them.
-        let maybe_created = if plugin.might_use_seeds(&index_details) {
+        // index type and configuration can actually produce them, and never when
+        // overlaid rows must be read: a seed predates any overlay.
+        let maybe_created = if plugin.might_use_seeds(&index_details) && stale_rows.is_empty() {
             if let Some(seeds) = try_harvest_seeds(dataset.as_ref(), unindexed, column_name).await?
             {
                 plugin
@@ -687,15 +783,23 @@ async fn merge_scalar_indices<'a>(
                 dataset.as_ref(),
                 field_path,
                 &update_criteria,
-                unindexed,
+                &scan_fragments,
+                scan_rows,
             )
             .await?;
+            let per_segment_filters = |filters: Vec<Option<OldIndexDataFilter>>| {
+                filters
+                    .into_iter()
+                    .map(|filter| block_stale_rows(dataset.as_ref(), filter, &stale_rows))
+                    .collect::<Vec<_>>()
+            };
 
             match index_type {
                 IndexType::BTree => {
                     let (_, old_data_filters) =
                         build_per_segment_filters(dataset.as_ref(), &selected_old_indices, None)
                             .await?;
+                    let old_data_filters = per_segment_filters(old_data_filters);
                     crate::index::scalar::btree::open_and_merge_segments(
                         dataset.as_ref(),
                         field_path,
@@ -711,6 +815,7 @@ async fn merge_scalar_indices<'a>(
                     let (_, old_data_filters) =
                         build_per_segment_filters(dataset.as_ref(), &selected_old_indices, None)
                             .await?;
+                    let old_data_filters = per_segment_filters(old_data_filters);
                     crate::index::scalar::bitmap::open_and_merge_segments(
                         dataset.as_ref(),
                         field_path,
@@ -726,6 +831,7 @@ async fn merge_scalar_indices<'a>(
                     let (_, old_data_filters) =
                         build_per_segment_filters(dataset.as_ref(), &selected_old_indices, None)
                             .await?;
+                    let old_data_filters = per_segment_filters(old_data_filters);
                     crate::index::scalar::ngram::open_and_merge_segments(
                         dataset.as_ref(),
                         &selected_old_indices,
@@ -743,18 +849,24 @@ async fn merge_scalar_indices<'a>(
                         &deleted_old_frags,
                     )
                     .await?;
+                    let old_data_filter =
+                        block_stale_rows(dataset.as_ref(), old_data_filter, &stale_rows);
                     reference_index
                         .update(new_data_stream, &new_store, old_data_filter)
                         .await?
                 }
             }
         };
-        let source_dataset_version = selected_old_indices
-            .iter()
-            .map(|index| index.dataset_version)
-            .min()
-            .unwrap_or(dataset.manifest.version);
-        (created_index, source_dataset_version)
+        let new_dataset_version = if reference_index.can_remap() {
+            dataset.manifest.version
+        } else {
+            selected_old_indices
+                .iter()
+                .map(|index| index.dataset_version)
+                .min()
+                .unwrap_or(dataset.manifest.version)
+        };
+        (created_index, new_dataset_version)
     };
 
     Ok(Some((
@@ -5196,43 +5308,68 @@ mod tests {
             .unwrap();
     }
 
-    /// The oldest `dataset_version` across an index's segments, which is what a
-    /// segment merge carries over to the segment it produces. Checked here to
-    /// predate the current manifest, since otherwise it could not tell a merge
-    /// from a rebuild.
-    async fn oldest_segment_version(dataset: &Dataset, index_name: &str) -> u64 {
-        let oldest = dataset
+    /// The data files of every fragment the index's segments cover, which a
+    /// segment merge must not read again. Also resets the IO counters so that
+    /// [`assert_merged_not_rebuilt`] sees only the optimize's reads.
+    async fn indexed_data_files(dataset: &Dataset, index_name: &str) -> Vec<String> {
+        let covered = dataset
             .load_indices_by_name(index_name)
             .await
             .unwrap()
             .iter()
-            .map(|segment| segment.dataset_version)
-            .min()
-            .expect("the index must have at least one segment");
+            .filter_map(|segment| segment.fragment_bitmap.clone())
+            .fold(RoaringBitmap::new(), |covered, bitmap| covered | bitmap);
+        let files = dataset
+            .get_fragments()
+            .iter()
+            .filter(|fragment| covered.contains(fragment.id() as u32))
+            .flat_map(|fragment| {
+                fragment
+                    .metadata()
+                    .files
+                    .iter()
+                    .map(|file| file.path.clone())
+            })
+            .collect::<Vec<_>>();
         assert!(
-            oldest < dataset.manifest.version,
-            "the source segments must predate the manifest, or their version \
-             cannot distinguish a merge from a rebuild"
+            !files.is_empty(),
+            "the index must cover at least one fragment with data"
         );
-        oldest
+        dataset.object_store.as_ref().io_stats_incremental(); // Reset
+        files
     }
 
-    /// Pins that `optimize_indices` took the segment-merge path. A full rebuild
-    /// produces the same rows, so the row counts these tests check cannot tell
-    /// the two apart; the stamped `dataset_version` can, because the merge keeps
-    /// the oldest source segment's version while a rebuild stamps the manifest
-    /// version current at the time of the optimize.
-    async fn assert_merged_not_rebuilt(dataset: &Dataset, index_name: &str, oldest_source: u64) {
+    /// Pins that `optimize_indices` merged rather than rebuilt. Both produce the
+    /// same rows and stamp; only a rebuild reads the already-indexed data files.
+    /// `dataset` must be the handle that ran the optimize: the IO counters
+    /// belong to its object store.
+    async fn assert_merged_not_rebuilt(
+        dataset: &Dataset,
+        index_name: &str,
+        indexed_files: &[String],
+    ) {
+        let rescanned = dataset
+            .object_store
+            .as_ref()
+            .io_stats_incremental()
+            .requests
+            .into_iter()
+            .filter(|request| {
+                indexed_files
+                    .iter()
+                    .any(|file| request.path.as_ref().ends_with(file.as_str()))
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            rescanned.is_empty(),
+            "the optimize rebuilt the index instead of merging the segments: it read \
+             already-indexed data files {rescanned:?}"
+        );
         let segments = dataset.load_indices_by_name(index_name).await.unwrap();
         assert_eq!(
             segments.len(),
             1,
             "the optimize must consolidate every bitmap segment, got {segments:?}"
-        );
-        assert_eq!(
-            segments[0].dataset_version, oldest_source,
-            "the optimize rebuilt the index instead of merging the segments: a \
-             merged segment carries the oldest source segment's dataset version"
         );
     }
 
@@ -5330,14 +5467,14 @@ mod tests {
             .await
             .unwrap();
 
-        let oldest_source = oldest_segment_version(&dataset, "cat_idx").await;
+        let indexed_files = indexed_data_files(&dataset, "cat_idx").await;
         dataset
             .optimize_indices(&OptimizeOptions::merge(200))
             .await
             .unwrap();
+        assert_merged_not_rebuilt(&dataset, "cat_idx", &indexed_files).await;
 
         let dataset = DatasetBuilder::from_uri(test_uri).load().await.unwrap();
-        assert_merged_not_rebuilt(&dataset, "cat_idx", oldest_source).await;
 
         // 48 rows cycling A/B/C/NULL: 12 of each.
         for cat in ["A", "B", "C"] {
@@ -5403,14 +5540,14 @@ mod tests {
             .await
             .unwrap();
 
-        let oldest_source = oldest_segment_version(&dataset, "cat_idx").await;
+        let indexed_files = indexed_data_files(&dataset, "cat_idx").await;
         dataset
             .optimize_indices(&OptimizeOptions::merge(200))
             .await
             .unwrap();
+        assert_merged_not_rebuilt(&dataset, "cat_idx", &indexed_files).await;
 
         let dataset = DatasetBuilder::from_uri(test_uri).load().await.unwrap();
-        assert_merged_not_rebuilt(&dataset, "cat_idx", oldest_source).await;
         let segments = dataset.load_indices_by_name("cat_idx").await.unwrap();
         let expected_coverage = dataset
             .get_fragments()
@@ -5470,14 +5607,14 @@ mod tests {
             num_segments as usize
         );
 
-        let oldest_source = oldest_segment_version(&dataset, "cat_idx").await;
+        let indexed_files = indexed_data_files(&dataset, "cat_idx").await;
         dataset
             .optimize_indices(&OptimizeOptions::merge(num_segments as usize))
             .await
             .unwrap();
+        assert_merged_not_rebuilt(&dataset, "cat_idx", &indexed_files).await;
 
         let dataset = DatasetBuilder::from_uri(test_uri).load().await.unwrap();
-        assert_merged_not_rebuilt(&dataset, "cat_idx", oldest_source).await;
         let segments = dataset.load_indices_by_name("cat_idx").await.unwrap();
         let expected_coverage = dataset
             .get_fragments()
@@ -5576,14 +5713,14 @@ mod tests {
             .await
             .unwrap();
 
-        let oldest_source = oldest_segment_version(&dataset, "cat_idx").await;
+        let indexed_files = indexed_data_files(&dataset, "cat_idx").await;
         dataset
             .optimize_indices(&OptimizeOptions::merge(200))
             .await
             .unwrap();
+        assert_merged_not_rebuilt(&dataset, "cat_idx", &indexed_files).await;
 
         let dataset = DatasetBuilder::from_uri(test_uri).load().await.unwrap();
-        assert_merged_not_rebuilt(&dataset, "cat_idx", oldest_source).await;
         // 240 rows: A/B/C/NULL evenly when nullable, A/B/C otherwise.
         let (expected_per_cat, expected_nulls) = if nullable {
             ([60, 60, 60], 60)
@@ -5657,16 +5794,16 @@ mod tests {
             .unwrap();
         let mut dataset = res.new_dataset.as_ref().clone();
 
-        let oldest_source = oldest_segment_version(&dataset, "cat_idx").await;
+        let indexed_files = indexed_data_files(&dataset, "cat_idx").await;
         dataset
             .optimize_indices(&OptimizeOptions::default())
             .await
             .unwrap();
-
-        let dataset = DatasetBuilder::from_uri(test_uri).load().await.unwrap();
         // Two segments went in, so this exercised the K-way path rather than the
         // single-segment `update` this change does not touch.
-        assert_merged_not_rebuilt(&dataset, "cat_idx", oldest_source).await;
+        assert_merged_not_rebuilt(&dataset, "cat_idx", &indexed_files).await;
+
+        let dataset = DatasetBuilder::from_uri(test_uri).load().await.unwrap();
         // ids 0..25 are now 'Z'; the remaining A/B/C counts come from ids 25..100.
         assert_eq!(count_cat(&dataset, "Z").await, 25, "updated rows missing");
         for (cat, expected) in [("A", 25), ("B", 25), ("C", 25)] {

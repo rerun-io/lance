@@ -30,7 +30,10 @@ use crate::index::DatasetIndexInternalExt;
 use crate::session::index_caches::ProstAny;
 use crate::{
     Dataset,
-    dataset::{index::LanceIndexStoreExt, scanner::ColumnOrdering},
+    dataset::{
+        index::LanceIndexStoreExt,
+        scanner::{ColumnOrdering, RowAddrMask},
+    },
 };
 use arrow_schema::DataType;
 use datafusion::physical_plan::SendableRecordBatchStream;
@@ -142,6 +145,7 @@ pub(crate) async fn scan_training_data(
     column: &str,
     criteria: &TrainingCriteria,
     fragments: Option<Vec<Fragment>>,
+    rows: Option<RowAddrMask>,
 ) -> Result<SendableRecordBatchStream> {
     let num_rows = dataset.count_all_rows().await?;
 
@@ -172,6 +176,10 @@ pub(crate) async fn scan_training_data(
 
     if let Some(fragments) = fragments {
         scan.with_fragments(fragments);
+    }
+    // Restricts the scan to these rows; the sort above still applies to what is read.
+    if let Some(rows) = rows {
+        scan.with_row_addr_prefilter(rows);
     }
 
     let batches = scan
@@ -245,9 +253,9 @@ pub(crate) async fn load_training_data(
                     Ok(frag.metadata().clone())
                 })
                 .collect();
-            scan_training_data(dataset, column, criteria, Some(frags?)).await
+            scan_training_data(dataset, column, criteria, Some(frags?), None).await
         } else {
-            scan_training_data(dataset, column, criteria, fragments).await
+            scan_training_data(dataset, column, criteria, fragments, None).await
         }
     } else {
         TrainingRequest::create_empty_stream(dataset, column, criteria).await
