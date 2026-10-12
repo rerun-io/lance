@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -602,14 +603,17 @@ async fn merge_scalar_indices<'a>(
     // incorporated. A type that remaps through the fragment-reuse index (`can_remap`) merges
     // stamped with this manifest, but the entries it would carry over from a source never
     // incorporate overlays committed after that source was built. Those fragments are left
-    // out of the merge and of the coverage: readers scan them and the next optimize
-    // re-indexes them. Types that do not remap keep the oldest source's stamp and carry
-    // everything over. A freshly scanned fragment already reflects its overlays, so only
-    // carried-over coverage can be stale.
+    // out of the carried-over data and scanned afresh alongside the unindexed ones, so the
+    // merged segment covers them with their current values. Types that do not remap keep
+    // the oldest source's stamp and carry everything over. A freshly scanned fragment
+    // already reflects its overlays, so only carried-over coverage can be stale.
     let mut overlay_stale_frags = RoaringBitmap::new();
     if reference_index.can_remap() {
         let overlaid = overlaid_fragments(&dataset.manifest.fragments);
         if !overlaid.is_empty() {
+            // Checked against the stored bitmap. On a tagged table that is provenance
+            // rather than the derived coverage the scanner masks by, but the tagged
+            // gate refuses overlay commits, so the two cannot disagree there yet.
             for segment in selected_old_indices.iter() {
                 collect_overlay_stale_frags(
                     segment,
@@ -621,6 +625,22 @@ async fn merge_scalar_indices<'a>(
             overlay_stale_frags &= &effective_old_frags;
         }
     }
+    // Everything the merge reads from the dataset: the unindexed fragments plus the
+    // carried-over ones whose entries it leaves behind.
+    let scan_fragments = if overlay_stale_frags.is_empty() {
+        Cow::Borrowed(unindexed)
+    } else {
+        let mut fragments = unindexed.to_vec();
+        fragments.extend(
+            dataset
+                .manifest
+                .fragments
+                .iter()
+                .filter(|fragment| overlay_stale_frags.contains(fragment.id as u32))
+                .cloned(),
+        );
+        Cow::Owned(fragments)
+    };
 
     // The fragments a from-scratch rebuild must scan: everything the merged
     // segment will answer for, all of it live.
@@ -702,8 +722,12 @@ async fn merge_scalar_indices<'a>(
         let details = IndexDetails(index_details.clone());
         let plugin = details.get_plugin()?;
         // Only open data files looking for seeds when the plugin confirms this
-        // index type and configuration can actually produce them.
-        let maybe_created = if plugin.might_use_seeds(&index_details) {
+        // index type and configuration can actually produce them. A seed is written
+        // with the data file, before any overlay, so a fragment that is rescanned for
+        // its overlays cannot be served from one.
+        let maybe_created = if plugin.might_use_seeds(&index_details)
+            && overlay_stale_frags.is_empty()
+        {
             if let Some(seeds) = try_harvest_seeds(dataset.as_ref(), unindexed, column_name).await?
             {
                 plugin
@@ -723,7 +747,7 @@ async fn merge_scalar_indices<'a>(
                 dataset.as_ref(),
                 field_path,
                 &update_criteria,
-                unindexed,
+                &scan_fragments,
             )
             .await?;
 
@@ -798,7 +822,6 @@ async fn merge_scalar_indices<'a>(
             }
         };
         let new_dataset_version = if reference_index.can_remap() {
-            frag_bitmap -= &overlay_stale_frags;
             dataset.manifest.version
         } else {
             selected_old_indices
