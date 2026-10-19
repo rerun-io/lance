@@ -10,8 +10,8 @@ use std::{
     sync::Arc,
 };
 
-use arrow_array::RecordBatchReader;
-use arrow_schema::Schema as ArrowSchema;
+use arrow_array::{ArrayRef, RecordBatchReader, make_array};
+use arrow_schema::{DataType, Schema as ArrowSchema};
 use byteorder::{ByteOrder, LittleEndian, ReadBytesExt};
 use bytes::{Bytes, BytesMut};
 use futures::{Stream, StreamExt, stream::BoxStream};
@@ -24,6 +24,7 @@ use lance_encoding::{
         schedule_and_decode_blocking,
     },
     encoder::EncodedBatch,
+    encodings::logical::primitive::FieldDataCacheKey,
     version::LanceFileVersion,
 };
 use log::debug;
@@ -235,6 +236,14 @@ impl CacheKey for ColumnMetadataCacheKey {
     fn write_key(&self, builder: &mut KeyBuilder) {
         builder.write_u32(self.column_index);
     }
+}
+
+/// One page of a column: its row range and, when the page is a dictionary-encoded
+/// mini-block page, its dictionary (which holds every value present in the page).
+#[derive(Debug, Clone)]
+pub struct PageDictionary {
+    pub rows: Range<u64>,
+    pub dictionary: Option<ArrayRef>,
 }
 
 impl CachedFileMetadata {
@@ -2167,6 +2176,74 @@ impl FileReadCore {
         self.metadata_provider.schema()
     }
 
+    async fn column_info(&self, column_index: u32) -> Result<Arc<ColumnInfo>> {
+        match &self.metadata_provider {
+            FileMetadataProvider::Full(metadata) => metadata
+                .column_infos
+                .get(column_index as usize)
+                .cloned()
+                .ok_or_else(|| {
+                    Error::invalid_input(format!(
+                        "column index {column_index} is out of range for a file with {} columns",
+                        metadata.column_infos.len()
+                    ))
+                }),
+            FileMetadataProvider::Indexed(metadata_index) => {
+                let mut column_infos = FileMetadataProvider::load_indexed_column_infos(
+                    metadata_index,
+                    &self.scheduler,
+                    &self.cache,
+                    &[column_index],
+                )
+                .await?;
+                column_infos.pop().ok_or_else(|| {
+                    Error::internal(format!("no column metadata for column {column_index}"))
+                })
+            }
+        }
+    }
+
+    async fn cached_page_dictionaries(
+        &self,
+        column_index: u32,
+        data_type: &DataType,
+    ) -> Result<Option<Vec<PageDictionary>>> {
+        if self.version() < LanceFileVersion::V2_1 {
+            return Ok(None);
+        }
+        // Filled by the decoder the first time it schedules this column.
+        let cache_key = FieldDataCacheKey {
+            column_index,
+            view_tag: format!("{data_type:?}"),
+        };
+        let Some(field_data) = self.cache.get_with_key(&cache_key).await else {
+            return Ok(None);
+        };
+        let column_info = self.column_info(column_index).await?;
+        column_info
+            .page_infos
+            .iter()
+            .zip(field_data.page_dictionaries())
+            .map(|(page_info, dictionary)| {
+                Ok(PageDictionary {
+                    // In 2.1+ files a page's priority is the top-level row it starts at.
+                    rows: page_info.priority..page_info.priority + page_info.num_rows,
+                    dictionary: dictionary
+                        .map(|block| {
+                            Ok::<_, Error>(make_array(
+                                block
+                                    .as_ref()
+                                    .clone()
+                                    .into_arrow(data_type.clone(), false)?,
+                            ))
+                        })
+                        .transpose()?,
+                })
+            })
+            .collect::<Result<Vec<_>>>()
+            .map(Some)
+    }
+
     async fn read_global_buffer(&self, index: u32) -> Result<Bytes> {
         let file_buffers = self.metadata_provider.file_buffers();
         let buffer_desc = file_buffers.get(index as usize).ok_or_else(|| {
@@ -2419,6 +2496,21 @@ impl FileReadCore {
 }
 
 impl ProjectedFileReader {
+    /// The pages of `column_index` with their dictionaries, as cached by an earlier read of
+    /// the column.
+    ///
+    /// `None` when the column has not been read yet (or was evicted) or the file is older
+    /// than 2.1.
+    pub async fn cached_page_dictionaries(
+        &self,
+        column_index: u32,
+        data_type: &DataType,
+    ) -> Result<Option<Vec<PageDictionary>>> {
+        self.core
+            .cached_page_dictionaries(column_index, data_type)
+            .await
+    }
+
     /// Opens a data reader backed by indexed column metadata.
     ///
     /// `base_projection` must be a supported indexed projection. Reads that do

@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::task::Poll;
@@ -11,7 +11,7 @@ use std::{
 
 use arrow_array::cast::AsArray;
 use arrow_array::types::UInt64Type;
-use arrow_array::{Array, BooleanArray, RecordBatch, UInt32Array};
+use arrow_array::{Array, ArrayRef, BooleanArray, RecordBatch, UInt32Array};
 use arrow_schema::{Schema as ArrowSchema, SchemaRef};
 use datafusion::common::runtime::SpawnedTask;
 use datafusion::common::stats::Precision;
@@ -58,7 +58,7 @@ use tokio::sync::{Mutex as AsyncMutex, OnceCell};
 use tracing::{Instrument, instrument};
 
 use crate::Dataset;
-use crate::dataset::fragment::{FileFragment, FragReadConfig};
+use crate::dataset::fragment::{FileFragment, FragReadConfig, FragmentReader};
 use crate::dataset::rowids::load_row_id_sequence;
 use crate::dataset::scanner::{
     BATCH_SIZE_FALLBACK, DEFAULT_FRAGMENT_READAHEAD, get_default_batch_size,
@@ -125,6 +125,8 @@ struct ScopedFragmentRead {
     // An in-memory filter to apply after reading the fragment (whatever couldn't be
     // pushed down into the index query)
     filter: Option<Expr>,
+    // The values each `=`/`IN` conjunct of `filter` accepts, per column
+    dictionary_pruning: Arc<Vec<(String, HashSet<String>)>>,
     priority: u32,
     scan_scheduler: Arc<ScanScheduler>,
 }
@@ -767,7 +769,9 @@ impl FilteredReadStream {
             }
         }
 
-        // Build filters for each fragment
+        // Build filters for each fragment, sharing one `Arc` per distinct filter
+        let refine_filter = options.refine_filter.clone().map(Arc::new);
+        let full_filter = options.full_filter.clone().map(Arc::new);
         let mut filters = HashMap::new();
         for fragment in fragments.iter() {
             let fragment_id = fragment.fragment.id() as u32;
@@ -784,19 +788,19 @@ impl FilteredReadStream {
                             let can_skip_recheck = r.is_exact()
                                 || (r.is_at_least() && scan_planned_with_limit_pushed_down);
                             if can_skip_recheck {
-                                options.refine_filter.clone()
+                                refine_filter.clone()
                             } else {
-                                options.full_filter.clone()
+                                full_filter.clone()
                             }
                         } else {
-                            options.full_filter.clone()
+                            full_filter.clone()
                         }
                     } else {
-                        options.full_filter.clone()
+                        full_filter.clone()
                     };
 
                     if let Some(f) = filter {
-                        filters.insert(fragment_id, Arc::new(f));
+                        filters.insert(fragment_id, f);
                     }
 
                     log::trace!(
@@ -849,6 +853,7 @@ impl FilteredReadStream {
         });
         let projection = Arc::new(options.projection.clone());
         let mut scoped_fragments = Vec::new();
+        let mut dictionary_pruning_by_filter = HashMap::new();
 
         for (priority, fragment) in fragments.iter().enumerate() {
             let fragment_id = fragment.id as u32;
@@ -861,6 +866,13 @@ impl FilteredReadStream {
 
                 // Get filter for this fragment (convert Arc<Expr> back to Expr)
                 let filter = plan.filters.get(&fragment_id).map(|f| (**f).clone());
+                let dictionary_pruning = match plan.filters.get(&fragment_id) {
+                    Some(f) => dictionary_pruning_by_filter
+                        .entry(Arc::as_ptr(f))
+                        .or_insert_with(|| Arc::new(string_equality_conjuncts(f)))
+                        .clone(),
+                    None => Arc::default(),
+                };
 
                 scoped_fragments.push(ScopedFragmentRead {
                     fragment: Arc::new(FileFragment::new(dataset.clone(), fragment.clone())),
@@ -870,6 +882,7 @@ impl FilteredReadStream {
                     batch_size: default_batch_size,
                     file_reader_options: options.file_reader_options.clone(),
                     filter,
+                    dictionary_pruning,
                     priority: priority as u32,
                     scan_scheduler: scan_scheduler.clone(),
                 });
@@ -1315,6 +1328,19 @@ impl FilteredReadStream {
         // the row ids are not contiguous
         fragment_read_task.ranges.sort_by_key(|r| r.start);
 
+        if !fragment_read_task.dictionary_pruning.is_empty() {
+            fragment_read_task.ranges = prune_ranges_by_page_dictionaries(
+                &fragment_reader,
+                &fragment_read_task.dictionary_pruning,
+                &read_schema,
+                std::mem::take(&mut fragment_read_task.ranges),
+            )
+            .await?;
+            if fragment_read_task.ranges.is_empty() {
+                return Ok(futures::stream::empty().boxed());
+            }
+        }
+
         let physical_filter = fragment_read_task
             .filter
             .map(|filter| {
@@ -1483,6 +1509,97 @@ impl FilteredReadStream {
                 future::ready(Ok(Some(result)))
             })
     }
+}
+
+/// Literal values of the `col = 'v'` and `col IN ('v', ...)` conjuncts of `filter`, per column.
+fn string_equality_conjuncts(filter: &Expr) -> Vec<(String, HashSet<String>)> {
+    use datafusion_expr::{BinaryExpr, Operator, expr::InList};
+
+    fn string_literal(expr: &Expr) -> Option<&str> {
+        match expr {
+            Expr::Literal(datafusion::scalar::ScalarValue::Utf8(Some(value)), _) => {
+                Some(value.as_str())
+            }
+            _ => None,
+        }
+    }
+
+    datafusion_expr::utils::split_conjunction(filter)
+        .into_iter()
+        .filter_map(|conjunct| match conjunct {
+            Expr::BinaryExpr(BinaryExpr {
+                left,
+                op: Operator::Eq,
+                right,
+            }) => match (left.as_ref(), right.as_ref()) {
+                (Expr::Column(column), other) | (other, Expr::Column(column)) => Some((
+                    column.name.clone(),
+                    HashSet::from([string_literal(other)?.to_owned()]),
+                )),
+                _ => None,
+            },
+            Expr::InList(InList {
+                expr,
+                list,
+                negated: false,
+            }) => {
+                let Expr::Column(column) = expr.as_ref() else {
+                    return None;
+                };
+                let values = list
+                    .iter()
+                    .map(|value| string_literal(value).map(str::to_owned))
+                    .collect::<Option<HashSet<_>>>()?;
+                Some((column.name.clone(), values))
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+/// Removes from `ranges` the rows of pages that cannot satisfy the `conjuncts` of a filter.
+///
+/// A dictionary-encoded page only contains values from its dictionary, so a page whose
+/// dictionary has none of the values an equality or `IN` conjunct accepts has no matching
+/// rows. Rows that remain still go through the full filter; this only skips decoding.
+/// Dictionaries come from the decoder's cache, so a fragment is pruned from its second read on.
+async fn prune_ranges_by_page_dictionaries(
+    reader: &FragmentReader,
+    conjuncts: &[(String, HashSet<String>)],
+    schema: &lance_core::datatypes::Schema,
+    mut ranges: Vec<Range<u64>>,
+) -> Result<Vec<Range<u64>>> {
+    for (column, values) in conjuncts {
+        // `Expr::Column` names a top-level field; nested access is a `get_field` expression.
+        let Some(field) = schema.fields.iter().find(|field| &field.name == column) else {
+            continue;
+        };
+        let Some(pages) = reader.cached_page_dictionaries(field.id).await? else {
+            continue;
+        };
+        let may_match = |dictionary: &ArrayRef| match dictionary.as_string_opt::<i32>() {
+            Some(dictionary) => dictionary
+                .iter()
+                .flatten()
+                .any(|value| values.contains(value)),
+            None => true,
+        };
+        let candidate_rows = pages
+            .iter()
+            .filter(|page| page.dictionary.as_ref().is_none_or(may_match))
+            .map(|page| page.rows.clone())
+            .collect::<Vec<_>>();
+        log::debug!(
+            "Page dictionaries of column {column} keep {} of {} pages",
+            candidate_rows.len(),
+            pages.len()
+        );
+        ranges = FilteredReadStream::intersect_ranges(&ranges, &candidate_rows);
+        if ranges.is_empty() {
+            break;
+        }
+    }
+    Ok(ranges)
 }
 
 /// Options for a filtered read.
@@ -5838,5 +5955,109 @@ mod tests {
             let plan = take_plan(&dataset, input, &["text"]).unwrap();
             plan.execute(0, Arc::new(TaskContext::default())).unwrap();
         }
+    }
+
+    #[tokio::test]
+    async fn test_page_dictionary_pruning_keeps_counts() {
+        let tmp = lance_core::utils::tempfile::TempStrDir::default();
+        // 50 values in runs of 1000 rows, 5 values per fragment, so each page is
+        // dictionary-encoded and most pages hold none of the probed values.
+        let schema = Arc::new(arrow_schema::Schema::new(vec![arrow_schema::Field::new(
+            "id",
+            arrow_schema::DataType::Utf8,
+            false,
+        )]));
+        let ids = arrow_array::StringArray::from_iter_values(
+            (0..50_000).map(|i| format!("seg-{:03}", i / 1000)),
+        );
+        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(ids)]).unwrap();
+        let reader = arrow_array::RecordBatchIterator::new(vec![Ok(batch)], schema);
+        let params = crate::dataset::WriteParams {
+            max_rows_per_file: 5_000,
+            ..Default::default()
+        };
+        let mut dataset = Dataset::write(reader, tmp.as_str(), Some(params))
+            .await
+            .unwrap();
+
+        let count = |dataset: &Dataset, filter: &str| {
+            let mut scanner = dataset.scan();
+            scanner.filter(filter).unwrap();
+            async move { scanner.count_rows().await.unwrap() }
+        };
+        let cases = [
+            ("id = 'seg-013'", 1000),
+            ("id IN ('seg-007', 'seg-042')", 2000),
+            ("id IN ('missing')", 0),
+            ("id = 'seg-013' AND id IN ('seg-013', 'seg-014')", 1000),
+        ];
+        // The second round reads cached dictionaries and prunes.
+        for _ in 0..2 {
+            for (filter, expected) in cases {
+                assert_eq!(count(&dataset, filter).await, expected, "{filter}");
+            }
+        }
+
+        // Only the fragment holding 'seg-013' is decoded.
+        let mut scanner = dataset.scan();
+        scanner.filter("id = 'seg-013'").unwrap();
+        let analysis = scanner.analyze_plan().await.unwrap();
+        assert!(analysis.contains("fragments_scanned=1,"), "{analysis}");
+
+        // Deleted rows stay in their page's dictionary but must not be counted.
+        dataset.delete("id = 'seg-007'").await.unwrap();
+        for _ in 0..2 {
+            assert_eq!(count(&dataset, "id = 'seg-007'").await, 0);
+            assert_eq!(count(&dataset, "id IN ('seg-007', 'seg-042')").await, 1000);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_page_dictionary_pruning_within_fragment() {
+        let tmp = lance_core::utils::tempfile::TempStrDir::default();
+        // ~25 MB of 100-byte strings in one fragment: the writer flushes a column page
+        // every ~8 MiB, so the fragment holds several dictionary pages.
+        let num_rows = 250_000;
+        let schema = Arc::new(arrow_schema::Schema::new(vec![arrow_schema::Field::new(
+            "id",
+            arrow_schema::DataType::Utf8,
+            false,
+        )]));
+        // Many small batches let the writer cut pages at its buffer threshold.
+        let batches = (0..num_rows)
+            .step_by(10_000)
+            .map(|start| {
+                let ids = arrow_array::StringArray::from_iter_values(
+                    (start..start + 10_000).map(|i| format!("{:0>100}", i / 5000)),
+                );
+                Ok(RecordBatch::try_new(schema.clone(), vec![Arc::new(ids)]).unwrap())
+            })
+            .collect::<Vec<_>>();
+        let reader = arrow_array::RecordBatchIterator::new(batches, schema);
+        let dataset = Dataset::write(reader, tmp.as_str(), None).await.unwrap();
+        assert_eq!(dataset.get_fragments().len(), 1);
+
+        let value = format!("{:0>100}", 25);
+        let filter = format!("id = '{value}'");
+        let mut scanner = dataset.scan();
+        scanner.filter(&filter).unwrap();
+        // The first read caches the dictionaries, the second prunes with them.
+        assert_eq!(scanner.count_rows().await.unwrap(), 5000);
+        assert_eq!(scanner.count_rows().await.unwrap(), 5000);
+
+        let analysis = scanner.analyze_plan().await.unwrap();
+        let rows_scanned = analysis
+            .split("rows_scanned=")
+            .nth(1)
+            .and_then(|rest| rest.split(',').next())
+            .unwrap();
+        let rows_scanned = match rows_scanned.strip_suffix(" K") {
+            Some(thousands) => thousands.parse::<f64>().unwrap() * 1000.0,
+            None => rows_scanned.parse::<f64>().unwrap(),
+        };
+        assert!(
+            rows_scanned >= 5000.0 && rows_scanned < num_rows as f64,
+            "{analysis}"
+        );
     }
 }

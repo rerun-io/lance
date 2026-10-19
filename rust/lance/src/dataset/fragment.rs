@@ -40,7 +40,8 @@ use lance_core::{
 use lance_datafusion::utils::StreamingWriteSource;
 use lance_encoding::decoder::DecoderPlugins;
 use lance_file::reader::{
-    CachedFileMetadata, FileMetadataIndex, FileReaderOptions, ProjectedFileReader, ReaderProjection,
+    CachedFileMetadata, FileMetadataIndex, FileReaderOptions, PageDictionary, ProjectedFileReader,
+    ReaderProjection,
 };
 use lance_file::version::{ConcreteFileVersion, LanceFileVersion};
 use lance_file::versions::v1::reader::{FileReader as V1FileReader, read_batch as v1_read_batch};
@@ -142,6 +143,17 @@ pub trait GenericFileReader: std::fmt::Debug + Send + Sync {
 
     /// Get storage statistics for this file (ignored by v1 reader)
     fn storage_stats(&self) -> Result<Vec<(u32, u64)>>;
+
+    /// The pages of the column storing `field_id`, with their dictionaries, as cached by an
+    /// earlier read of the column.
+    ///
+    /// `None` when this file does not store the field or nothing is cached for it.
+    fn cached_page_dictionaries(
+        &self,
+        _field_id: i32,
+    ) -> BoxFuture<'_, Result<Option<Vec<PageDictionary>>>> {
+        futures::future::ready(Ok(None)).boxed()
+    }
 
     // Helper functions to fallback to the legacy implementation while we
     // slowly migrate functionality over to the generic reader
@@ -491,6 +503,24 @@ mod v2_adapter {
                         num_rows: v2_task.num_rows,
                     })
                     .boxed())
+            }
+            .boxed()
+        }
+
+        fn cached_page_dictionaries(
+            &self,
+            field_id: i32,
+        ) -> BoxFuture<'_, Result<Option<Vec<PageDictionary>>>> {
+            async move {
+                let (Some(column_index), Some(field)) = (
+                    self.field_id_to_column_idx.get(&(field_id as u32)),
+                    self.projection.field_by_id(field_id),
+                ) else {
+                    return Ok(None);
+                };
+                self.reader
+                    .cached_page_dictionaries(*column_index, &field.data_type())
+                    .await
             }
             .boxed()
         }
@@ -2352,6 +2382,22 @@ fn merge_batches(batches: &[RecordBatch]) -> Result<RecordBatch> {
 }
 
 impl FragmentReader {
+    /// The pages of the column storing `field_id`, with their dictionaries, as cached by an
+    /// earlier read of the column.
+    ///
+    /// `None` when no data file of this fragment has them cached.
+    pub async fn cached_page_dictionaries(
+        &self,
+        field_id: i32,
+    ) -> Result<Option<Vec<PageDictionary>>> {
+        for reader in &self.readers {
+            if reader.projection().field_by_id(field_id).is_some() {
+                return reader.cached_page_dictionaries(field_id).await;
+            }
+        }
+        Ok(None)
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn try_new(
         fragment_id: usize,

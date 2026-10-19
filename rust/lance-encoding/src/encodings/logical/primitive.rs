@@ -4150,6 +4150,23 @@ pub struct CachedFieldData {
     pages: Vec<Arc<dyn CachedPageData>>,
 }
 
+impl CachedFieldData {
+    /// The dictionary of each page, `None` for pages that are not dictionary-encoded
+    /// mini-block pages.
+    pub fn page_dictionaries(&self) -> Vec<Option<Arc<DataBlock>>> {
+        self.pages
+            .iter()
+            .map(|page| {
+                page.clone()
+                    .as_arc_any()
+                    .downcast::<MiniBlockCacheableState>()
+                    .ok()
+                    .and_then(|state| state.dictionary.clone())
+            })
+            .collect()
+    }
+}
+
 impl DeepSizeOf for CachedFieldData {
     fn deep_size_of_children(&self, ctx: &mut Context) -> usize {
         self.pages.deep_size_of_children(ctx)
