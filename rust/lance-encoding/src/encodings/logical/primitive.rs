@@ -3,7 +3,7 @@
 
 use std::{
     any::Any,
-    collections::{HashMap, VecDeque},
+    collections::{HashMap, HashSet, VecDeque},
     env,
     fmt::Debug,
     iter,
@@ -25,7 +25,9 @@ use crate::{
     },
 };
 use arrow_array::{Array, ArrayRef, PrimitiveArray, cast::AsArray, make_array, types::UInt64Type};
-use arrow_buffer::{BooleanBuffer, BooleanBufferBuilder, NullBuffer, ScalarBuffer};
+use arrow_buffer::{
+    ArrowNativeType, BooleanBuffer, BooleanBufferBuilder, NullBuffer, ScalarBuffer,
+};
 use arrow_schema::{DataType, Field as ArrowField};
 use bytes::Bytes;
 use futures::{FutureExt, TryStreamExt, future::BoxFuture, stream::FuturesOrdered};
@@ -135,6 +137,13 @@ trait StructuralPageScheduler: std::fmt::Debug + Send {
         ranges: &[Range<u64>],
         io: &Arc<dyn EncodingsIo>,
     ) -> Result<Vec<PageLoadTask>>;
+    /// Whether the page may contain one of the provided `values`.
+    ///
+    /// Called after `initialize` or `load`. `false` is a guarantee that the value is absent,
+    /// `true` only means that the value may be there (and many pages will always return `true`)
+    fn may_contain_any(&self, _values: &HashSet<&[u8]>) -> bool {
+        true
+    }
 }
 
 /// Metadata describing the decoded size of a mini-block
@@ -1912,6 +1921,39 @@ impl CachedPageData for MiniBlockCacheableState {
     }
 }
 
+impl MiniBlockCacheableState {
+    /// Whether the page's dictionary may contain one of `values`.
+    fn dictionary_may_contain_any(&self, values: &HashSet<&[u8]>) -> bool {
+        // Without a variable-width dictionary nothing can be ruled out
+        let Some(DataBlock::VariableWidth(dictionary)) = self.dictionary.as_deref() else {
+            return true;
+        };
+        match dictionary.bits_per_offset {
+            32 => variable_width_contains_any(
+                &dictionary.data,
+                &dictionary.offsets.borrow_to_typed_slice::<u32>(),
+                values,
+            ),
+            64 => variable_width_contains_any(
+                &dictionary.data,
+                &dictionary.offsets.borrow_to_typed_slice::<u64>(),
+                values,
+            ),
+            _ => true,
+        }
+    }
+}
+
+fn variable_width_contains_any<O: ArrowNativeType>(
+    data: &[u8],
+    offsets: &[O],
+    values: &HashSet<&[u8]>,
+) -> bool {
+    offsets
+        .windows(2)
+        .any(|bounds| values.contains(&data[bounds[0].as_usize()..bounds[1].as_usize()]))
+}
+
 /// A scheduler for a page that has been encoded with the mini-block layout
 ///
 /// Scheduling mini-block encoded data is simple in concept and somewhat complex
@@ -2604,6 +2646,12 @@ impl StructuralPageScheduler for MiniBlockScheduler {
                 .downcast::<MiniBlockCacheableState>()
                 .unwrap(),
         );
+    }
+
+    fn may_contain_any(&self, values: &HashSet<&[u8]>) -> bool {
+        self.page_meta
+            .as_ref()
+            .is_none_or(|page_meta| page_meta.dictionary_may_contain_any(values))
     }
 
     fn schedule_ranges(
@@ -3993,6 +4041,28 @@ impl StructuralPrimitiveFieldScheduler {
             column_index: column_info.index,
             view_tag: format!("{:?}", target_field.data_type()),
         })
+    }
+
+    /// The rows of the pages that may hold any of `values`, as sorted, non-overlapping ranges
+    ///
+    /// Called after [`StructuralFieldScheduler::initialize`].
+    pub(crate) fn rows_that_may_contain_any(&self, values: &HashSet<&[u8]>) -> Vec<Range<u64>> {
+        let mut rows: Vec<Range<u64>> = Vec::new();
+        // Pages cover consecutive rows, as in `StructuralPrimitiveFieldSchedulingJob`.
+        let mut next_page_first_row = 0;
+        for page in &self.page_schedulers {
+            let first_row = next_page_first_row;
+            next_page_first_row += page.num_rows;
+            if !page.scheduler.may_contain_any(values) {
+                continue;
+            }
+            // Extend the previous range when pages are adjacent, so skipped pages are the only gaps.
+            match rows.last_mut() {
+                Some(last) if last.end == first_row => last.end = next_page_first_row,
+                _ => rows.push(first_row..next_page_first_row),
+            }
+        }
+        rows
     }
 
     fn page_layout_to_scheduler(
@@ -9039,6 +9109,200 @@ mod tests {
             pages.push(task.await.unwrap());
         }
         pages.into_iter().next().unwrap()
+    }
+
+    /// Encodes each array as its own page of one column, returning the encoded bytes and the
+    /// column's metadata.
+    async fn encode_pages(
+        field: &lance_core::datatypes::Field,
+        arrays: Vec<ArrayRef>,
+    ) -> (bytes::Bytes, crate::decoder::ColumnInfo) {
+        use crate::decoder::{ColumnInfo, PageInfo};
+        use crate::repdef::RepDefBuilder;
+        use crate::{
+            encoder::{
+                ColumnIndexSequence, EncodingOptions, MIN_PAGE_BUFFER_ALIGNMENT, OutOfLineBuffers,
+            },
+            testing::{create_test_field_encoder, test_encoding_strategy},
+        };
+
+        let encoding_strategy = test_encoding_strategy(TestEncoding::StructuralU16);
+        let mut column_index_seq = ColumnIndexSequence::default();
+        // A one-byte cache flushes every array into its own page.
+        let encoding_options = EncodingOptions {
+            cache_bytes_per_column: 1,
+            max_page_bytes: 32 * 1024 * 1024,
+            keep_original_array: true,
+            buffer_alignment: MIN_PAGE_BUFFER_ALIGNMENT,
+        };
+        let mut encoder = create_test_field_encoder(
+            encoding_strategy.as_ref(),
+            field,
+            &mut column_index_seq,
+            &encoding_options,
+        )
+        .unwrap();
+
+        let mut external_buffers = OutOfLineBuffers::new(0, MIN_PAGE_BUFFER_ALIGNMENT);
+        let mut pages = Vec::new();
+        let mut row_number = 0;
+        for array in arrays {
+            let num_rows = array.len() as u64;
+            for task in encoder
+                .maybe_encode(
+                    array,
+                    &mut external_buffers,
+                    RepDefBuilder::default(),
+                    row_number,
+                    num_rows,
+                )
+                .unwrap()
+            {
+                pages.push(task.await.unwrap());
+            }
+            row_number += num_rows;
+        }
+        for task in encoder.flush(&mut external_buffers).unwrap() {
+            pages.push(task.await.unwrap());
+        }
+        let column = encoder
+            .finish(&mut external_buffers)
+            .await
+            .unwrap()
+            .pop()
+            .unwrap();
+        pages.extend(column.final_pages);
+
+        let mut data = bytes::BytesMut::new();
+        let page_infos = pages
+            .into_iter()
+            .map(|page| {
+                let buffer_offsets_and_sizes = page
+                    .data
+                    .iter()
+                    .map(|buffer| {
+                        let offset = data.len() as u64;
+                        data.extend_from_slice(buffer);
+                        (offset, buffer.len() as u64)
+                    })
+                    .collect::<Vec<_>>();
+                PageInfo {
+                    num_rows: page.num_rows,
+                    priority: page.row_number,
+                    encoding: page.description,
+                    buffer_offsets_and_sizes: buffer_offsets_and_sizes.into(),
+                }
+            })
+            .collect::<Vec<_>>();
+        let column_info = ColumnInfo::new(0, page_infos.into(), Vec::new(), column.encoding);
+        (data.freeze(), column_info)
+    }
+
+    fn page_has_dictionary(page: &crate::decoder::PageInfo) -> bool {
+        matches!(
+            &page.encoding,
+            PageEncoding::Structural(pb21::PageLayout {
+                layout: Some(pb21::page_layout::Layout::MiniBlockLayout(mini_block)),
+            }) if mini_block.dictionary.is_some()
+        )
+    }
+
+    #[rstest::rstest]
+    #[case::one_value(&["seg-c"], vec![1000..2000, 3000..4050])]
+    #[case::value_in_two_pages(&["seg-a"], vec![0..1000, 2000..4050])]
+    #[case::value_with_nulls(&["seg-d"], vec![2000..4050])]
+    #[case::several_values(&["seg-b", "seg-c"], vec![0..2000, 3000..4050])]
+    #[case::missing_value(&["missing"], vec![3000..4050])]
+    #[case::no_values(&[], vec![3000..4050])]
+    #[tokio::test]
+    async fn test_rows_that_may_contain_any(
+        #[case] values: &[&str],
+        #[case] expected: Vec<std::ops::Range<u64>>,
+        #[values(DataType::Utf8, DataType::LargeUtf8)] data_type: DataType,
+    ) {
+        use crate::decoder::CoreFieldDecoderStrategy;
+        use crate::{BufferScheduler, EncodingsIo};
+        use lance_core::cache::LanceCache;
+
+        let strings = |values: Vec<Option<String>>| -> ArrayRef {
+            arrow_cast::cast(&StringArray::from(values), &data_type).unwrap()
+        };
+        let pages = vec![
+            // Dictionary pages: two values, one value, and two values with nulls.
+            strings(
+                (0..1000)
+                    .map(|i| Some(["seg-a", "seg-b"][i % 2].to_string()))
+                    .collect(),
+            ),
+            strings(vec![Some("seg-c".to_string()); 1000]),
+            strings(
+                (0..1000)
+                    .map(|i| (i % 10 != 0).then(|| ["seg-a", "seg-d"][i % 2].to_string()))
+                    .collect(),
+            ),
+            // No dictionary: every value is distinct, and too few rows to dictionary-encode.
+            strings((0..1000).map(|i| Some(format!("unique-{i}"))).collect()),
+            strings(vec![Some("seg-c".to_string()); 50]),
+        ];
+        let field =
+            lance_core::datatypes::Field::try_from(&ArrowField::new("id", data_type.clone(), true))
+                .unwrap();
+        let (data, column_info) = encode_pages(&field, pages).await;
+        assert_eq!(
+            column_info
+                .page_infos
+                .iter()
+                .map(page_has_dictionary)
+                .collect::<Vec<_>>(),
+            vec![true, true, true, false, false]
+        );
+
+        let values = values.iter().map(|v| v.as_bytes()).collect::<Vec<_>>();
+        let cache = Arc::new(LanceCache::with_capacity(1024 * 1024));
+        let rows = CoreFieldDecoderStrategy::default()
+            .rows_that_may_contain_any(
+                &field,
+                &column_info,
+                &values,
+                Arc::new(BufferScheduler::new(data)) as Arc<dyn EncodingsIo>,
+                cache.clone(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(rows, Some(expected));
+
+        // The page metadata is cached under the key a read of the same field looks up.
+        let cache_key = super::FieldDataCacheKey {
+            column_index: column_info.index,
+            view_tag: format!("{:?}", field.data_type()),
+        };
+        assert!(cache.get_with_key(&cache_key).await.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_rows_that_may_contain_any_unsupported_type() {
+        use crate::decoder::CoreFieldDecoderStrategy;
+        use crate::{BufferScheduler, EncodingsIo};
+        use arrow_array::Int64Array;
+        use lance_core::cache::LanceCache;
+
+        let field =
+            lance_core::datatypes::Field::try_from(&ArrowField::new("id", DataType::Int64, false))
+                .unwrap();
+        let array: ArrayRef = Arc::new(Int64Array::from(vec![7; 1000]));
+        let (data, column_info) = encode_pages(&field, vec![array]).await;
+
+        let rows = CoreFieldDecoderStrategy::default()
+            .rows_that_may_contain_any(
+                &field,
+                &column_info,
+                &[b"7".as_slice()],
+                Arc::new(BufferScheduler::new(data)) as Arc<dyn EncodingsIo>,
+                Arc::new(LanceCache::no_cache()),
+            )
+            .await
+            .unwrap();
+        assert_eq!(rows, None);
     }
 
     #[tokio::test]

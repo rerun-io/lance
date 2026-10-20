@@ -212,7 +212,7 @@
 //!  * The "batch overhead" is very small in Lance compared to other formats because it has no
 //!    relation to the way the data is stored.
 
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{LazyLock, Once, OnceLock};
 use std::{ops::Range, sync::Arc};
@@ -617,6 +617,42 @@ impl CoreFieldDecoderStrategy {
             decompressor_strategy: Arc::new(DefaultDecompressionStrategy {}),
             cache_repetition_index: config.cache_repetition_index,
         }
+    }
+
+    /// The rows of the column that may hold any of `values`, as sorted, non-overlapping ranges.
+    ///
+    /// Pages whose dictionary has none of `values` are left out. `None` when the column can't
+    /// be checked: it is not a string or binary column, or not in a 2.1+ file.
+    pub async fn rows_that_may_contain_any(
+        &self,
+        field: &Field,
+        column_info: &ColumnInfo,
+        values: &[&[u8]],
+        io: Arc<dyn EncodingsIo>,
+        cache: Arc<LanceCache>,
+    ) -> Result<Option<Vec<Range<u64>>>> {
+        let is_byte_like = matches!(
+            field.data_type(),
+            DataType::Utf8 | DataType::LargeUtf8 | DataType::Binary | DataType::LargeBinary
+        );
+        if !is_byte_like || !column_info.is_structural() {
+            return Ok(None);
+        }
+        let mut scheduler = StructuralPrimitiveFieldScheduler::try_new(
+            column_info,
+            self.decompressor_strategy.as_ref(),
+            self.cache_repetition_index,
+            field,
+        )?;
+        // Loads page metadata through the cache like a read does, so a read that follows reuses it.
+        scheduler
+            .initialize(
+                &FilterExpression::no_filter(),
+                &SchedulerContext::new(io, cache),
+            )
+            .await?;
+        let values = values.iter().copied().collect::<HashSet<_>>();
+        Ok(Some(scheduler.rows_that_may_contain_any(&values)))
     }
 
     /// This is just a sanity check to ensure there is no "wrapped encodings"
