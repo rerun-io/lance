@@ -80,7 +80,6 @@ fn literal_bytes(literal: &ScalarValue) -> Option<&[u8]> {
         ScalarValue::Binary(Some(value))
         | ScalarValue::LargeBinary(Some(value))
         | ScalarValue::BinaryView(Some(value)) => Some(value),
-        ScalarValue::Dictionary(_, value) => literal_bytes(value),
         _ => None,
     }
 }
