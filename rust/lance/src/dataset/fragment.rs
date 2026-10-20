@@ -143,6 +143,16 @@ pub trait GenericFileReader: std::fmt::Debug + Send + Sync {
     /// Get storage statistics for this file (ignored by v1 reader)
     fn storage_stats(&self) -> Result<Vec<(u32, u64)>>;
 
+    /// The rows of the field with `field_id` that may hold any of `values`, `None` when this
+    /// file can't tell (see [`ProjectedFileReader::rows_that_may_contain_any`]).
+    fn rows_that_may_contain_any<'a>(
+        &'a self,
+        _field_id: i32,
+        _values: &'a [&'a [u8]],
+    ) -> BoxFuture<'a, Result<Option<Vec<Range<u64>>>>> {
+        futures::future::ready(Ok(None)).boxed()
+    }
+
     // Helper functions to fallback to the legacy implementation while we
     // slowly migrate functionality over to the generic reader
 
@@ -516,6 +526,25 @@ mod v2_adapter {
                 stats.push((current_field_id, col_stats.size_bytes));
             }
             Ok(stats)
+        }
+
+        fn rows_that_may_contain_any<'a>(
+            &'a self,
+            field_id: i32,
+            values: &'a [&'a [u8]],
+        ) -> BoxFuture<'a, Result<Option<Vec<Range<u64>>>>> {
+            async move {
+                let (Some(field), Some(column_index)) = (
+                    self.projection.field_by_id(field_id),
+                    self.field_id_to_column_idx.get(&(field_id as u32)),
+                ) else {
+                    return Ok(None);
+                };
+                self.reader
+                    .rows_that_may_contain_any(field, *column_index, values)
+                    .await
+            }
+            .boxed()
         }
 
         fn projection(&self) -> &Arc<Schema> {
@@ -2911,6 +2940,35 @@ impl FragmentReader {
         .await
     }
 
+    /// The physical rows of the field with `field_id` that may hold any of `values`, as sorted,
+    /// non-overlapping ranges.
+    ///
+    /// `None` when the field can't be checked; see
+    /// [`ProjectedFileReader::rows_that_may_contain_any`].
+    pub async fn rows_that_may_contain_any(
+        &self,
+        field_id: i32,
+        values: &[&[u8]],
+    ) -> Result<Option<Vec<Range<u64>>>> {
+        // The base file's dictionaries don't list values that a data overlay substitutes.
+        if self
+            .fragment
+            .overlays
+            .iter()
+            .any(|overlay| overlay.data_file.fields.contains(&field_id))
+        {
+            return Ok(None);
+        }
+        let Some(reader) = self
+            .readers
+            .iter()
+            .find(|reader| reader.projection().field_by_id(field_id).is_some())
+        else {
+            return Ok(None);
+        };
+        reader.rows_that_may_contain_any(field_id, values).await
+    }
+
     // This method is a clone of new_read_impl but returns tasks instead of batches
     //
     // It also only supports v2 files
@@ -3374,6 +3432,72 @@ mod tests {
                 .downcast_ref::<Int32Array>()
                 .unwrap()
                 .clone()
+        }
+
+        #[rstest]
+        #[tokio::test]
+        async fn test_rows_that_may_contain_any(
+            #[values(LanceFileVersion::V2_0, LanceFileVersion::V2_1)] version: LanceFileVersion,
+        ) {
+            use arrow_array::StringArray;
+
+            use crate::dataset::fragment::FragReadConfig;
+
+            // One fragment whose string columns each hold a single value, so each is one
+            // dictionary-encoded page in 2.1.
+            let num_rows = 200;
+            let schema = Arc::new(ArrowSchema::new(vec![
+                ArrowField::new("id", DataType::Utf8, true),
+                ArrowField::new("name", DataType::Utf8, true),
+            ]));
+            let batch = RecordBatch::try_new(
+                schema.clone(),
+                vec![
+                    Arc::new(StringArray::from(vec!["seg-a"; num_rows])),
+                    Arc::new(StringArray::from(vec!["n-a"; num_rows])),
+                ],
+            )
+            .unwrap();
+            let write_params = WriteParams {
+                data_storage_version: Some(version),
+                ..Default::default()
+            };
+            let reader = RecordBatchIterator::new(vec![Ok(batch)], schema);
+            let dataset = Dataset::write(reader, "memory://", Some(write_params))
+                .await
+                .unwrap();
+
+            let rows = async |dataset: &Dataset, field_id: i32, value: &str| {
+                let fragment = dataset.get_fragment(0).unwrap();
+                fragment
+                    .open(dataset.schema(), FragReadConfig::default())
+                    .await
+                    .unwrap()
+                    .rows_that_may_contain_any(field_id, &[value.as_bytes()])
+                    .await
+                    .unwrap()
+            };
+            // Legacy 2.0 files have no structural pages to check.
+            let checked = |rows: Vec<std::ops::Range<u64>>| {
+                (version >= LanceFileVersion::V2_1).then_some(rows)
+            };
+            assert_eq!(rows(&dataset, 0, "seg-a").await, checked(vec![0..200]));
+            assert_eq!(rows(&dataset, 0, "seg-x").await, checked(vec![]));
+
+            // An overlay on `id` can substitute values the base file's dictionaries don't list.
+            let overlay_values: ArrayRef = Arc::new(StringArray::from(vec!["seg-x"]));
+            let dataset = commit_overlay(
+                dataset,
+                "ov",
+                0,
+                &[0],
+                OverlayCoverage::dense(bitmap([1])),
+                vec![overlay_values],
+                version,
+            )
+            .await;
+            assert_eq!(rows(&dataset, 0, "seg-x").await, None);
+            assert_eq!(rows(&dataset, 1, "n-x").await, checked(vec![]));
         }
 
         #[rstest]
