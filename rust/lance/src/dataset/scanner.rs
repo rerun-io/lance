@@ -2131,6 +2131,15 @@ impl Scanner {
         .boxed()
     }
 
+    /// Executes `plan`, built by [`Self::create_plan`] on this scanner, with this scanner's
+    /// execution options. Equivalent to [`Self::try_into_stream`] without planning again.
+    pub fn execute_plan(&self, plan: Arc<dyn ExecutionPlan>) -> Result<DatasetRecordBatchStream> {
+        Ok(DatasetRecordBatchStream::new(execute_plan(
+            plan,
+            self.execution_options(),
+        )?))
+    }
+
     pub(crate) async fn try_into_dfstream(
         &self,
         mut options: LanceExecutionOptions,

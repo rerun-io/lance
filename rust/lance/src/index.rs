@@ -64,7 +64,8 @@ use serde_json::json;
 use tracing::{info, instrument, warn};
 use uuid::Uuid;
 use vector::details::{
-    derive_vector_index_type, infer_missing_vector_details, vector_details_as_json,
+    derive_vector_index_type, infer_missing_vector_details, needs_vector_details_inference,
+    vector_details_as_json,
 };
 pub(crate) use vector::details::{vector_index_details, vector_index_details_default};
 use vector::ivf::v2::{IVFIndex, IvfStateEntryBox};
@@ -92,7 +93,9 @@ use crate::index::mem_wal::open_mem_wal_index;
 pub use crate::index::prefilter::{FilterLoader, PreFilter};
 use crate::index::scalar::{IndexDetails, fetch_index_details, load_training_data};
 pub use crate::index::vector::{LogicalIvfView, LogicalVectorIndex};
-use crate::session::index_caches::{FragReuseIndexKey, IndexMetadataKey, write_index_identity};
+use crate::session::index_caches::{
+    FragReuseIndexKey, IndexMetadataKey, RemappedIndexMetadataKey, write_index_identity,
+};
 use crate::{Error, Result, dataset::Dataset};
 pub use create::CreateIndexBuilder;
 pub use lance_index::IndexDescription;
@@ -1510,6 +1513,9 @@ impl DatasetIndexExt for Dataset {
         // Infer details for legacy vector indices (once per index name, concurrently).
         // This may run on indices that were opportunistically cached during Dataset::open
         // before the full Dataset was available for inference.
+        if indices
+            .iter()
+            .any(|idx| needs_vector_details_inference(idx, self.schema()))
         {
             let mut updated = indices.as_ref().clone();
             infer_missing_vector_details(self, &mut updated).await;
@@ -1527,6 +1533,16 @@ impl DatasetIndexExt for Dataset {
         if let Some(frag_reuse_index_meta) =
             indices.iter().find(|idx| idx.name == FRAG_REUSE_INDEX_NAME)
         {
+            // Remapping every fragment bitmap is per call otherwise, and planning loads the
+            // index list many times per scan.
+            let remapped_key = RemappedIndexMetadataKey {
+                version: self.version().version,
+                store_identity: &self.object_store.store_prefix,
+                frag_reuse_uuid: &frag_reuse_index_meta.uuid,
+            };
+            if let Some(remapped) = self.index_cache.get_with_key(&remapped_key).await {
+                return Ok(remapped);
+            }
             // Isolation between the two forms comes from the cache's own prefix, which the
             // dataset built with its remap mode, so the key itself needs only the uuid.
             let mode = self.frag_reuse_remap_mode;
@@ -1552,7 +1568,11 @@ impl DatasetIndexExt for Dataset {
                     frag_reuse_index.remap_fragment_bitmap(bitmap)?;
                 }
             }
-            Ok(Arc::new(indices))
+            let indices = Arc::new(indices);
+            self.index_cache
+                .insert_with_key(&remapped_key, indices.clone())
+                .await;
+            Ok(indices)
         } else {
             Ok(indices)
         }

@@ -195,6 +195,46 @@ impl CacheKey for IndexMetadataKey<'_> {
     }
 }
 
+/// The manifest's index list as translated through one fragment reuse index.
+#[derive(Clone, Copy, Debug)]
+pub struct RemappedIndexMetadataKey<'a> {
+    pub version: u64,
+    pub store_identity: &'a str,
+    pub frag_reuse_uuid: &'a Uuid,
+}
+
+impl CacheKey for RemappedIndexMetadataKey<'_> {
+    type ValueType = Vec<IndexMetadata>;
+
+    fn key(&self) -> Cow<'_, str> {
+        Cow::Owned(format!(
+            "{}:{}/{}/remapped/{}",
+            self.store_identity.len(),
+            self.store_identity,
+            self.version,
+            self.frag_reuse_uuid
+        ))
+    }
+
+    fn type_name() -> &'static str {
+        "Vec<IndexMetadata>"
+    }
+
+    fn schema() -> CacheKeySchema {
+        CacheKeySchema::new("lance.index.metadata-remapped-key", 1)
+    }
+
+    fn write_key(&self, builder: &mut KeyBuilder) {
+        builder.write_str(self.store_identity);
+        builder.write_u64(self.version);
+        builder.write_fixed_bytes(self.frag_reuse_uuid.as_bytes());
+    }
+
+    fn codec() -> Option<lance_core::cache::CacheCodec> {
+        Some(lance_table::format::index_metadata_codec())
+    }
+}
+
 pub struct ProstAny(pub Arc<prost_types::Any>);
 
 impl DeepSizeOf for ProstAny {
