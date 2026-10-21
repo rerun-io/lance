@@ -141,15 +141,13 @@ trait StructuralPageScheduler: std::fmt::Debug + Send {
     ///
     /// Called after `initialize` or `load`. `false` is a guarantee that the value is absent,
     /// `true` only means that the value may be there (and many pages will always return `true`)
-    fn may_contain_any(&self, _values: &HashSet<&[u8]>) -> bool {
-        true
-    }
+    ///
+    /// `values` never has nulls.
+    fn may_contain_any(&self, _values: &HashSet<&[u8]>) -> bool;
     /// Whether `may_contain_any` can ever return `false` for this page.
     ///
     /// Known from the page layout alone, before `initialize`.
-    fn can_rule_out_values(&self) -> bool {
-        false
-    }
+    fn can_rule_out_values(&self) -> bool;
 }
 
 /// Metadata describing the decoded size of a mini-block
@@ -1634,6 +1632,14 @@ impl StructuralPageScheduler for ComplexAllNullScheduler {
         };
         Ok(vec![page_load_task])
     }
+
+    fn may_contain_any(&self, _values: &std::collections::HashSet<&[u8]>) -> bool {
+        false
+    }
+
+    fn can_rule_out_values(&self) -> bool {
+        true
+    }
 }
 
 #[derive(Debug)]
@@ -1849,6 +1855,14 @@ impl StructuralPageScheduler for SimpleAllNullScheduler {
             num_rows,
         };
         Ok(vec![page_load_task])
+    }
+
+    fn may_contain_any(&self, _values: &std::collections::HashSet<&[u8]>) -> bool {
+        false
+    }
+
+    fn can_rule_out_values(&self) -> bool {
+        true
     }
 }
 
@@ -3276,6 +3290,14 @@ impl StructuralPageScheduler for FullZipScheduler {
         } else {
             self.schedule_ranges_simple(ranges, io)
         }
+    }
+
+    fn may_contain_any(&self, _values: &std::collections::HashSet<&[u8]>) -> bool {
+        true
+    }
+
+    fn can_rule_out_values(&self) -> bool {
+        false
     }
 }
 

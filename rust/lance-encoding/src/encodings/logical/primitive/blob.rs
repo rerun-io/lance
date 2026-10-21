@@ -90,6 +90,14 @@ impl StructuralPageScheduler for BlobDescriptionPageScheduler {
             })
             .collect())
     }
+
+    fn may_contain_any(&self, _values: &std::collections::HashSet<&[u8]>) -> bool {
+        true
+    }
+
+    fn can_rule_out_values(&self) -> bool {
+        false
+    }
 }
 
 #[derive(Debug)]
@@ -409,6 +417,14 @@ impl StructuralPageScheduler for BlobPageScheduler {
         }
 
         Ok(page_load_tasks)
+    }
+
+    fn may_contain_any(&self, _values: &std::collections::HashSet<&[u8]>) -> bool {
+        true
+    }
+
+    fn can_rule_out_values(&self) -> bool {
+        false
     }
 }
 

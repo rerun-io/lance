@@ -312,6 +312,14 @@ impl crate::encodings::logical::primitive::StructuralPageScheduler for ConstantP
             num_rows,
         }])
     }
+
+    fn may_contain_any(&self, _values: &std::collections::HashSet<&[u8]>) -> bool {
+        true
+    }
+
+    fn can_rule_out_values(&self) -> bool {
+        false
+    }
 }
 
 #[derive(Debug)]
