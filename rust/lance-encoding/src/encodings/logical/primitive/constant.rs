@@ -18,7 +18,7 @@ use lance_core::{
 use crate::{
     EncodingsIo,
     buffer::LanceBuffer,
-    decoder::PageEncoding,
+    decoder::{BinaryPruneFilter, PageEncoding},
     encoder::EncodedPage,
     encodings::logical::primitive::{CachedPageData, PageLoadTask},
     format::ProtobufUtils21,
@@ -313,7 +313,7 @@ impl crate::encodings::logical::primitive::StructuralPageScheduler for ConstantP
         }])
     }
 
-    fn may_contain_any(&self, _values: &std::collections::HashSet<&[u8]>) -> bool {
+    fn may_contain_any(&self, _values: &BinaryPruneFilter<'_>) -> bool {
         true
     }
 

@@ -3169,7 +3169,7 @@ impl StructuralPageScheduler for SparseStructuralScheduler {
         }])
     }
 
-    fn may_contain_any(&self, _values: &std::collections::HashSet<&[u8]>) -> bool {
+    fn may_contain_any(&self, _values: &BinaryPruneFilter<'_>) -> bool {
         true
     }
 

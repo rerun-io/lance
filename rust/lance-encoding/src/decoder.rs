@@ -649,6 +649,7 @@ impl CoreFieldDecoderStrategy {
         if !scheduler.can_rule_out_values() {
             return Ok(None);
         }
+
         // Loads page metadata through the cache like a read does, so a read that follows reuses it.
         scheduler
             .initialize(
@@ -656,8 +657,9 @@ impl CoreFieldDecoderStrategy {
                 &SchedulerContext::new(io, cache),
             )
             .await?;
-        let values = values.iter().copied().collect::<HashSet<_>>();
-        Ok(Some(scheduler.rows_that_may_contain_any(&values)))
+
+        let values_filter = BinaryPruneFilter::new(values);
+        Ok(Some(scheduler.rows_that_may_contain_any(&values_filter)))
     }
 
     /// This is just a sanity check to ensure there is no "wrapped encodings"
@@ -1090,6 +1092,31 @@ impl CoreFieldDecoderStrategy {
             }
             // TODO: Still need support for RLE
             _ => todo!(),
+        }
+    }
+}
+
+pub(crate) enum BinaryPruneFilter<'a> {
+    Short(&'a [&'a [u8]]),
+    Long(HashSet<&'a [u8]>),
+}
+
+impl<'a> BinaryPruneFilter<'a> {
+    /// Lists longer than this get collected into a HashSet.
+    const SHORT_SCAN_MAX_VALUES: usize = 8;
+
+    pub fn new(values: &'a [&'a [u8]]) -> Self {
+        if values.len() > Self::SHORT_SCAN_MAX_VALUES {
+            Self::Long(values.iter().copied().collect())
+        } else {
+            Self::Short(values)
+        }
+    }
+
+    pub fn contains(&self, entry: &[u8]) -> bool {
+        match self {
+            Self::Short(values) => values.contains(&entry),
+            Self::Long(values) => values.contains(entry),
         }
     }
 }

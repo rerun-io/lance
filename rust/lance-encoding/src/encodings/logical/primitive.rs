@@ -3,7 +3,7 @@
 
 use std::{
     any::Any,
-    collections::{HashMap, HashSet, VecDeque},
+    collections::{HashMap, VecDeque},
     env,
     fmt::Debug,
     iter,
@@ -18,6 +18,7 @@ use crate::{
         STRUCTURAL_ENCODING_SPARSE,
     },
     data::DictionaryDataBlock,
+    decoder::BinaryPruneFilter,
     encodings::logical::primitive::blob::{BlobDescriptionPageScheduler, BlobPageScheduler},
     format::{
         ProtobufUtils21,
@@ -143,7 +144,7 @@ trait StructuralPageScheduler: std::fmt::Debug + Send {
     /// `true` only means that the value may be there (and many pages will always return `true`)
     ///
     /// `values` never has nulls.
-    fn may_contain_any(&self, _values: &HashSet<&[u8]>) -> bool;
+    fn may_contain_any(&self, _values: &BinaryPruneFilter<'_>) -> bool;
     /// Whether `may_contain_any` can ever return `false` for this page.
     ///
     /// Known from the page layout alone, before `initialize`.
@@ -1633,7 +1634,7 @@ impl StructuralPageScheduler for ComplexAllNullScheduler {
         Ok(vec![page_load_task])
     }
 
-    fn may_contain_any(&self, _values: &std::collections::HashSet<&[u8]>) -> bool {
+    fn may_contain_any(&self, _values: &BinaryPruneFilter<'_>) -> bool {
         false
     }
 
@@ -1857,7 +1858,7 @@ impl StructuralPageScheduler for SimpleAllNullScheduler {
         Ok(vec![page_load_task])
     }
 
-    fn may_contain_any(&self, _values: &std::collections::HashSet<&[u8]>) -> bool {
+    fn may_contain_any(&self, _values: &BinaryPruneFilter<'_>) -> bool {
         false
     }
 
@@ -1943,7 +1944,7 @@ impl CachedPageData for MiniBlockCacheableState {
 
 impl MiniBlockCacheableState {
     /// Whether the page's dictionary may contain one of `values`.
-    fn dictionary_may_contain_any(&self, values: &HashSet<&[u8]>) -> bool {
+    fn dictionary_may_contain_any(&self, values: &BinaryPruneFilter<'_>) -> bool {
         // Without a variable-width dictionary nothing can be ruled out
         let Some(DataBlock::VariableWidth(dictionary)) = self.dictionary.as_deref() else {
             return true;
@@ -1967,7 +1968,7 @@ impl MiniBlockCacheableState {
 fn variable_width_contains_any<O: ArrowNativeType>(
     data: &[u8],
     offsets: &[O],
-    values: &HashSet<&[u8]>,
+    values: &BinaryPruneFilter<'_>,
 ) -> bool {
     offsets.windows(2).any(|bounds| {
         data.get(bounds[0].as_usize()..bounds[1].as_usize())
@@ -2669,7 +2670,7 @@ impl StructuralPageScheduler for MiniBlockScheduler {
         );
     }
 
-    fn may_contain_any(&self, values: &HashSet<&[u8]>) -> bool {
+    fn may_contain_any(&self, values: &BinaryPruneFilter) -> bool {
         self.page_meta
             .as_ref()
             .is_none_or(|page_meta| page_meta.dictionary_may_contain_any(values))
@@ -3292,7 +3293,7 @@ impl StructuralPageScheduler for FullZipScheduler {
         }
     }
 
-    fn may_contain_any(&self, _values: &std::collections::HashSet<&[u8]>) -> bool {
+    fn may_contain_any(&self, _values: &BinaryPruneFilter<'_>) -> bool {
         true
     }
 
@@ -4079,7 +4080,7 @@ impl StructuralPrimitiveFieldScheduler {
     /// The rows of the pages that may hold any of `values`, as sorted, non-overlapping ranges
     ///
     /// Called after [`StructuralFieldScheduler::initialize`].
-    pub(crate) fn rows_that_may_contain_any(&self, values: &HashSet<&[u8]>) -> Vec<Range<u64>> {
+    pub(crate) fn rows_that_may_contain_any(&self, values: &BinaryPruneFilter) -> Vec<Range<u64>> {
         let mut rows: Vec<Range<u64>> = Vec::new();
         // Pages cover consecutive rows, as in `StructuralPrimitiveFieldSchedulingJob`.
         let mut next_page_first_row = 0;
@@ -7063,7 +7064,7 @@ mod tests {
         STRUCTURAL_ENCODING_MINIBLOCK,
     };
     use crate::data::BlockInfo;
-    use crate::decoder::{PageEncoding, StructuralFieldDecoder};
+    use crate::decoder::{BinaryPruneFilter, PageEncoding, StructuralFieldDecoder};
     use crate::encodings::logical::primitive::{
         ChunkDrainInstructions, PrimitiveStructuralEncoder, StructuralPrimitiveFieldDecoder,
     };
@@ -9328,7 +9329,7 @@ mod tests {
         #[case] offsets: &[u32],
         #[case] may_contain: bool,
     ) {
-        let values = std::collections::HashSet::from([b"z".as_slice()]);
+        let values = BinaryPruneFilter::new(&[b"z"]);
         assert_eq!(
             super::variable_width_contains_any(data, offsets, &values),
             may_contain
