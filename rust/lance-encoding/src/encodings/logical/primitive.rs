@@ -1955,9 +1955,10 @@ fn variable_width_contains_any<O: ArrowNativeType>(
     offsets: &[O],
     values: &HashSet<&[u8]>,
 ) -> bool {
-    offsets
-        .windows(2)
-        .any(|bounds| values.contains(&data[bounds[0].as_usize()..bounds[1].as_usize()]))
+    offsets.windows(2).any(|bounds| {
+        data.get(bounds[0].as_usize()..bounds[1].as_usize())
+            .is_none_or(|value| values.contains(value))
+    })
 }
 
 /// A scheduler for a page that has been encoded with the mini-block layout
@@ -9294,6 +9295,22 @@ mod tests {
             view_tag: format!("{:?}", field.data_type()),
         };
         assert!(cache.get_with_key(&cache_key).await.is_some());
+    }
+
+    #[rstest::rstest]
+    #[case::valid(b"ab", &[0, 1, 2], false)]
+    #[case::out_of_bounds(b"a", &[0, 2], true)]
+    #[case::decreasing(b"abc", &[2, 1], true)]
+    fn test_variable_width_contains_any_keeps_invalid_offsets(
+        #[case] data: &[u8],
+        #[case] offsets: &[u32],
+        #[case] may_contain: bool,
+    ) {
+        let values = std::collections::HashSet::from([b"z".as_slice()]);
+        assert_eq!(
+            super::variable_width_contains_any(data, offsets, &values),
+            may_contain
+        );
     }
 
     #[rstest::rstest]
