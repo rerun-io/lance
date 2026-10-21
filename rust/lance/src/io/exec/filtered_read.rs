@@ -1041,40 +1041,37 @@ impl FilteredReadStream {
         read_schema: &lance_core::datatypes::Schema,
         mut ranges: Vec<Range<u64>>,
     ) -> Vec<Range<u64>> {
-        'guarantees: for guarantee in LiteralGuarantee::analyze(filter) {
+        let guarantees = LiteralGuarantee::analyze(filter);
+        let lookups = guarantees.iter().filter_map(|guarantee| {
             if guarantee.guarantee != Guarantee::In {
-                continue;
+                return None;
             }
             // A column of the physical filter is a top-level field; nested access is an expression.
-            let Some(field) = read_schema
+            let field = read_schema
                 .fields
                 .iter()
-                .find(|field| field.name == guarantee.column.name)
-            else {
-                continue;
-            };
+                .find(|field| field.name == guarantee.column.name)?;
+            let values = guarantee
+                .literals
+                .iter()
+                .map(literal_bytes)
+                .collect::<Option<Vec<_>>>()?;
+            Some(async move {
+                let rows = fragment_reader
+                    .rows_that_may_contain_any(field.id, &values)
+                    .await;
+                (field, rows)
+            })
+        });
 
-            let mut values = Vec::with_capacity(guarantee.literals.len());
-            for literal in &guarantee.literals {
-                let Some(value) = literal_bytes(literal) else {
-                    continue 'guarantees;
-                };
-                values.push(value);
-            }
-
-            match fragment_reader
-                .rows_that_may_contain_any(field.id, &values)
-                .await
-            {
+        for (field, rows) in futures::future::join_all(lookups).await {
+            match rows {
                 Ok(Some(rows)) => ranges = Self::intersect_ranges(&ranges, &rows),
                 Ok(None) => {}
                 Err(err) => log::warn!(
                     "Skipping page pruning on column {} of fragment {fragment_id}: {err}",
                     field.name,
                 ),
-            }
-            if ranges.is_empty() {
-                break;
             }
         }
         ranges
