@@ -144,6 +144,12 @@ trait StructuralPageScheduler: std::fmt::Debug + Send {
     fn may_contain_any(&self, _values: &HashSet<&[u8]>) -> bool {
         true
     }
+    /// Whether `may_contain_any` can ever return `false` for this page.
+    ///
+    /// Known from the page layout alone, before `initialize`.
+    fn can_rule_out_values(&self) -> bool {
+        false
+    }
 }
 
 /// Metadata describing the decoded size of a mini-block
@@ -2654,6 +2660,10 @@ impl StructuralPageScheduler for MiniBlockScheduler {
             .is_none_or(|page_meta| page_meta.dictionary_may_contain_any(values))
     }
 
+    fn can_rule_out_values(&self) -> bool {
+        self.dictionary.is_some()
+    }
+
     fn schedule_ranges(
         &self,
         ranges: &[Range<u64>],
@@ -4063,6 +4073,13 @@ impl StructuralPrimitiveFieldScheduler {
             }
         }
         rows
+    }
+
+    /// Whether any page can rule out values in [`Self::rows_that_may_contain_any`].
+    pub(crate) fn can_rule_out_values(&self) -> bool {
+        self.page_schedulers
+            .iter()
+            .any(|page| page.scheduler.can_rule_out_values())
     }
 
     fn page_layout_to_scheduler(
@@ -9279,30 +9296,39 @@ mod tests {
         assert!(cache.get_with_key(&cache_key).await.is_some());
     }
 
+    #[rstest::rstest]
+    #[case::not_string(Arc::new(arrow_array::Int64Array::from(vec![7; 1000])) as ArrayRef)]
+    #[case::no_dictionary_pages(
+        Arc::new(StringArray::from_iter_values((0..1000).map(|i| format!("unique-{i}")))) as ArrayRef
+    )]
     #[tokio::test]
-    async fn test_rows_that_may_contain_any_unsupported_type() {
+    async fn test_rows_that_may_contain_any_unchecked_column(#[case] array: ArrayRef) {
         use crate::decoder::CoreFieldDecoderStrategy;
         use crate::{BufferScheduler, EncodingsIo};
-        use arrow_array::Int64Array;
         use lance_core::cache::LanceCache;
 
-        let field =
-            lance_core::datatypes::Field::try_from(&ArrowField::new("id", DataType::Int64, false))
-                .unwrap();
-        let array: ArrayRef = Arc::new(Int64Array::from(vec![7; 1000]));
+        let field = lance_core::datatypes::Field::try_from(&ArrowField::new(
+            "id",
+            array.data_type().clone(),
+            false,
+        ))
+        .unwrap();
         let (data, column_info) = encode_pages(&field, vec![array]).await;
 
+        let cache = Arc::new(LanceCache::with_capacity(1024 * 1024));
         let rows = CoreFieldDecoderStrategy::default()
             .rows_that_may_contain_any(
                 &field,
                 &column_info,
                 &[b"7".as_slice()],
                 Arc::new(BufferScheduler::new(data)) as Arc<dyn EncodingsIo>,
-                Arc::new(LanceCache::no_cache()),
+                cache.clone(),
             )
             .await
             .unwrap();
         assert_eq!(rows, None);
+        // Nothing was loaded for a column that can't be checked.
+        assert_eq!(cache.stats().await.num_entries, 0);
     }
 
     #[tokio::test]

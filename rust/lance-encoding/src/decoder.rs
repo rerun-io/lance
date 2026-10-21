@@ -622,7 +622,8 @@ impl CoreFieldDecoderStrategy {
     /// The rows of the column that may hold any of `values`, as sorted, non-overlapping ranges.
     ///
     /// Pages whose dictionary has none of `values` are left out. `None` when the column can't
-    /// be checked: it is not a string or binary column, or not in a 2.1+ file.
+    /// be checked: it is not a string or binary column, not in a 2.1+ file, or has no
+    /// dictionary-encoded pages.
     pub async fn rows_that_may_contain_any(
         &self,
         field: &Field,
@@ -644,6 +645,10 @@ impl CoreFieldDecoderStrategy {
             self.cache_repetition_index,
             field,
         )?;
+        // Avoid loading page metadata for a column that can't rule anything out.
+        if !scheduler.can_rule_out_values() {
+            return Ok(None);
+        }
         // Loads page metadata through the cache like a read does, so a read that follows reuses it.
         scheduler
             .initialize(
