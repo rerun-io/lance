@@ -152,7 +152,7 @@ impl<'a> FragmentCreateBuilder<'a> {
             schema,
             FileWriterOptions {
                 format_version: params.data_storage_version,
-                ..Default::default()
+                ..params.file_writer_options.clone().unwrap_or_default()
             },
         )?;
 
