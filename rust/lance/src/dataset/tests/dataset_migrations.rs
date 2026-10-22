@@ -7,15 +7,15 @@ use std::vec;
 use crate::dataset::InsertBuilder;
 use crate::dataset::optimize::{CompactionOptions, compact_files};
 use crate::utils::test::copy_test_data_to_tmp;
-use crate::{Dataset, Result};
+use crate::{Dataset, Error, Result};
 use lance_table::format::IndexMetadata;
 
 use crate::dataset::write::{WriteMode, WriteParams};
 use crate::index::DatasetIndexExt;
 use arrow::compute::concat_batches;
-use arrow_array::RecordBatch;
-use arrow_array::{Float32Array, Int64Array, RecordBatchIterator};
-use arrow_schema::Schema as ArrowSchema;
+use arrow_array::{ArrayRef, Float32Array, Int64Array, RecordBatchIterator};
+use arrow_array::{RecordBatch, cast::AsArray};
+use arrow_schema::{DataType, Schema as ArrowSchema};
 use lance_file::version::LanceFileVersion;
 
 use futures::{StreamExt, TryStreamExt};
@@ -510,4 +510,72 @@ async fn test_list_struct_field_reorder_issue_5702() {
 
     // Verify schema has expected columns
     assert_eq!(batch.schema().fields().len(), 3); // id, data, extra
+}
+
+fn int8_dictionary_strings(array: &ArrayRef) -> Vec<Option<String>> {
+    assert_eq!(
+        array.data_type(),
+        &DataType::Dictionary(Box::new(DataType::Int8), Box::new(DataType::Utf8))
+    );
+    arrow::compute::cast(array, &DataType::Utf8)
+        .unwrap()
+        .as_string::<i32>()
+        .iter()
+        .map(|value| value.map(str::to_owned))
+        .collect()
+}
+
+/// Lance 10.0.0 appended a null slot at index 128 to this full Int8 dictionary
+/// and stored its indices as 32 bits under the declared Int8 key type.
+#[tokio::test]
+async fn test_v10_0_0_dictionary_null_slot_past_key_type() {
+    let test_dir = copy_test_data_to_tmp("v10.0.0/null_slot_v2_0.lance").unwrap();
+    let dataset = Dataset::open(&test_dir.path_str()).await.unwrap();
+
+    let batch = dataset.scan().try_into_batch().await.unwrap();
+
+    let expected = (0..128)
+        .map(|i| Some(format!("v{i:03}")))
+        .chain([None, Some("v005".to_owned()), None])
+        .collect::<Vec<_>>();
+    assert_eq!(int8_dictionary_strings(&batch["d"]), expected);
+}
+
+/// Lance 10.0.0 merged two chunks of 100 distinct Int8 dictionary values into one
+/// page and stored its indices as 32 bits under the declared Int8 key type.
+#[tokio::test]
+async fn test_v10_0_0_dictionary_merged_past_key_type() {
+    let test_dir = copy_test_data_to_tmp("v10.0.0/disjoint_v2_1.lance").unwrap();
+    let dataset = Dataset::open(&test_dir.path_str()).await.unwrap();
+
+    // One batch of the whole page references 192 distinct values, more than Int8
+    // keys can address.
+    let error = dataset.scan().try_into_batch().await.unwrap_err();
+    assert!(matches!(error, Error::NotSupported { .. }), "{error}");
+    assert!(
+        error
+            .to_string()
+            .contains("more than the 128 distinct values that Int8 keys can address"),
+        "unexpected error: {error}"
+    );
+
+    let mut scanner = dataset.scan();
+    scanner.batch_size(128);
+    // Each batch carries its own Int8 dictionary, and together they do not fit one.
+    let batches = scanner
+        .try_into_stream()
+        .await
+        .unwrap()
+        .try_collect::<Vec<_>>()
+        .await
+        .unwrap();
+    let actual = batches
+        .iter()
+        .flat_map(|batch| int8_dictionary_strings(&batch["d"]))
+        .collect::<Vec<_>>();
+
+    let expected = (0..200)
+        .map(|i| (i % 100 % 25 != 3).then(|| format!("v{i:03}")))
+        .collect::<Vec<_>>();
+    assert_eq!(actual, expected);
 }
