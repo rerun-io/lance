@@ -114,6 +114,7 @@ use lance_core::Error;
 use lance_core::datatypes::{BlobHandling, BlobKind};
 use lance_core::utils::tokio::get_num_compute_intensive_cpus;
 use lance_core::utils::tracing::{DATASET_COMPACTING_EVENT, TRACE_DATASET_EVENTS};
+use lance_file::writer::FileWriterOptions;
 use lance_index::frag_reuse::{FRAG_REUSE_INDEX_NAME, FragReuseGroup};
 use lance_index::is_system_index;
 use lance_table::format::{Fragment, RowIdMeta};
@@ -293,6 +294,12 @@ pub struct CompactionOptions {
     /// (e.g., job_id for tracking completed compaction jobs).
     #[serde(skip)]
     pub transaction_properties: Option<Arc<HashMap<String, String>>>,
+
+    /// How many bytes to use for buffering column data.
+    /// The default will use 8MiB per column.
+    ///
+    /// See [`FileWriterOptions::data_cache_bytes`] for more detail.
+    pub data_cache_bytes: Option<u64>,
 }
 
 #[allow(deprecated)]
@@ -317,6 +324,7 @@ impl Default for CompactionOptions {
             max_source_fragments: None,
             max_overlays_per_fragment: Some(10),
             transaction_properties: None,
+            data_cache_bytes: None,
         }
     }
 }
@@ -1740,6 +1748,11 @@ async fn rewrite_files(
         }
     }
 
+    let file_writer_options = FileWriterOptions {
+        data_cache_bytes: options.data_cache_bytes,
+        ..Default::default()
+    };
+
     let mut params = WriteParams {
         max_rows_per_file: options.target_rows_per_fragment,
         max_rows_per_group: options.max_rows_per_group,
@@ -1748,6 +1761,7 @@ async fn rewrite_files(
         // (e.g. absolute file:// URIs with base_id == 0). Without this flag
         // the writer would reject such blobs.
         allow_external_blob_outside_bases: true,
+        file_writer_options: Some(file_writer_options),
         ..Default::default()
     };
     if let Some(max_bytes_per_file) = options.max_bytes_per_file {
