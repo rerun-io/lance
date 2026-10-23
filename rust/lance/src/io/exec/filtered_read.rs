@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, hash_map::Entry};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::task::Poll;
@@ -119,12 +119,14 @@ struct ScopedFragmentRead {
     fragment: Arc<FileFragment>,
     ranges: Vec<Range<u64>>,
     projection: Arc<Projection>,
+    // `projection` plus the columns the filter needs
+    read_projection: Arc<Projection>,
     with_deleted_rows: bool,
     batch_size: u32,
     file_reader_options: Option<FileReaderOptions>,
     // An in-memory filter to apply after reading the fragment (whatever couldn't be
     // pushed down into the index query)
-    filter: Option<Expr>,
+    physical_filter: Option<Arc<dyn PhysicalExpr>>,
     priority: u32,
     scan_scheduler: Arc<ScanScheduler>,
 }
@@ -132,10 +134,10 @@ struct ScopedFragmentRead {
 impl ScopedFragmentRead {
     fn frag_read_config(&self) -> FragReadConfig {
         let mut config = FragReadConfig::default()
-            .with_row_id(self.with_deleted_rows || self.projection.with_row_id)
-            .with_row_address(self.projection.with_row_addr)
-            .with_row_last_updated_at_version(self.projection.with_row_last_updated_at_version)
-            .with_row_created_at_version(self.projection.with_row_created_at_version)
+            .with_row_id(self.with_deleted_rows || self.read_projection.with_row_id)
+            .with_row_address(self.read_projection.with_row_addr)
+            .with_row_last_updated_at_version(self.read_projection.with_row_last_updated_at_version)
+            .with_row_created_at_version(self.read_projection.with_row_created_at_version)
             .with_scan_scheduler(self.scan_scheduler.clone())
             .with_reader_priority(self.priority);
         if let Some(file_reader_options) = &self.file_reader_options {
@@ -477,7 +479,8 @@ impl FilteredReadStream {
     /// Fragment handles are constructed I/O-free from the manifest
     /// descriptors, only for the fragments the plan selects. A `None`
     /// scheduler is created here; the row-stream path injects its per-query
-    /// shared one and a per-batch priority offset.
+    /// shared one and a per-batch priority offset. Fails if a filter in the
+    /// plan cannot be planned.
     #[instrument(name = "init_filtered_read_stream", skip_all)]
     fn try_new(
         dataset: Arc<Dataset>,
@@ -486,7 +489,7 @@ impl FilteredReadStream {
         plan: FilteredReadInternalPlan,
         scan_scheduler: Option<Arc<ScanScheduler>>,
         priority_offset: Option<u32>,
-    ) -> Self {
+    ) -> Result<Self> {
         let scan_scheduler =
             scan_scheduler.unwrap_or_else(|| Self::make_scan_scheduler(&dataset, &options));
         let threading_mode = options.threading_mode;
@@ -521,7 +524,7 @@ impl FilteredReadStream {
             &dataset,
             &options,
             scan_scheduler.clone(),
-        );
+        )?;
         if let Some(priority_offset) = priority_offset.filter(|offset| *offset != 0) {
             for scoped in &mut scoped_fragments {
                 scoped.priority = scoped.priority.saturating_add(priority_offset);
@@ -563,7 +566,7 @@ impl FilteredReadStream {
                         (fragments, rows)
                     }
                 });
-        Self {
+        Ok(Self {
             output_schema,
             task_stream: Arc::new(AsyncMutex::new(task_stream)),
             scan_scheduler,
@@ -573,7 +576,7 @@ impl FilteredReadStream {
             scan_range_after_filter,
             touched_fragments,
             planned_rows,
-        }
+        })
     }
 
     /// Drain the entire read into batches (used by the row-stream path,
@@ -767,7 +770,10 @@ impl FilteredReadStream {
             }
         }
 
-        // Build filters for each fragment
+        // Build filters for each fragment. Fragments share the filter by `Arc`
+        // so it is copied and planned once, not once per fragment.
+        let full_filter = options.full_filter.clone().map(Arc::new);
+        let refine_filter = options.refine_filter.clone().map(Arc::new);
         let mut filters = HashMap::new();
         for fragment in fragments.iter() {
             let fragment_id = fragment.fragment.id() as u32;
@@ -784,19 +790,19 @@ impl FilteredReadStream {
                             let can_skip_recheck = r.is_exact()
                                 || (r.is_at_least() && scan_planned_with_limit_pushed_down);
                             if can_skip_recheck {
-                                options.refine_filter.clone()
+                                refine_filter.clone()
                             } else {
-                                options.full_filter.clone()
+                                full_filter.clone()
                             }
                         } else {
-                            options.full_filter.clone()
+                            full_filter.clone()
                         }
                     } else {
-                        options.full_filter.clone()
+                        full_filter.clone()
                     };
 
                     if let Some(f) = filter {
-                        filters.insert(fragment_id, Arc::new(f));
+                        filters.insert(fragment_id, f);
                     }
 
                     log::trace!(
@@ -831,14 +837,16 @@ impl FilteredReadStream {
 
     /// Handles are constructed here, I/O-free, only for the fragments the
     /// plan selects; priority is the fragment's position in the candidate
-    /// list so a sparse plan keeps the original I/O order.
+    /// list so a sparse plan keeps the original I/O order. Each distinct
+    /// filter is planned once here and shared by the fragments that use it;
+    /// fails if a filter cannot be planned.
     fn plan_to_scoped_fragments(
         plan: &FilteredReadInternalPlan,
         fragments: &[Fragment],
         dataset: &Arc<Dataset>,
         options: &FilteredReadOptions,
         scan_scheduler: Arc<ScanScheduler>,
-    ) -> Vec<ScopedFragmentRead> {
+    ) -> Result<Vec<ScopedFragmentRead>> {
         let default_batch_size = options.batch_size.unwrap_or_else(|| {
             get_default_batch_size().unwrap_or_else(|| {
                 std::cmp::max(
@@ -849,6 +857,10 @@ impl FilteredReadStream {
         });
         let projection = Arc::new(options.projection.clone());
         let mut scoped_fragments = Vec::new();
+        // Read projection and physical filter for each distinct filter, keyed by
+        // `Arc` identity since fragments share their filter's `Arc`
+        let mut planned_filters: HashMap<*const Expr, (Arc<Projection>, Arc<dyn PhysicalExpr>)> =
+            HashMap::new();
 
         for (priority, fragment) in fragments.iter().enumerate() {
             let fragment_id = fragment.id as u32;
@@ -859,24 +871,38 @@ impl FilteredReadStream {
                     continue;
                 }
 
-                // Get filter for this fragment (convert Arc<Expr> back to Expr)
-                let filter = plan.filters.get(&fragment_id).map(|f| (**f).clone());
+                let (read_projection, physical_filter) = match plan.filters.get(&fragment_id) {
+                    None => (projection.clone(), None),
+                    Some(filter) => {
+                        let (read_projection, physical_filter) =
+                            match planned_filters.entry(Arc::as_ptr(filter)) {
+                                Entry::Occupied(planned) => planned.into_mut(),
+                                Entry::Vacant(entry) => {
+                                    let (read_projection, physical_filter) =
+                                        options.plan_filter(filter)?;
+                                    entry.insert((Arc::new(read_projection), physical_filter))
+                                }
+                            };
+                        (read_projection.clone(), Some(physical_filter.clone()))
+                    }
+                };
 
                 scoped_fragments.push(ScopedFragmentRead {
                     fragment: Arc::new(FileFragment::new(dataset.clone(), fragment.clone())),
                     ranges: ranges.clone(),
                     projection: projection.clone(),
+                    read_projection,
                     with_deleted_rows: options.with_deleted_rows,
                     batch_size: default_batch_size,
                     file_reader_options: options.file_reader_options.clone(),
-                    filter,
+                    physical_filter,
                     priority: priority as u32,
                     scan_scheduler: scan_scheduler.clone(),
                 });
             }
         }
 
-        scoped_fragments
+        Ok(scoped_fragments)
     }
 
     /// Apply index to a fragment and apply skip/take to matched ranges if possible
@@ -1276,21 +1302,8 @@ impl FilteredReadStream {
         let output_schema =
             public_blob_v2_binary_projection_schema(fragment_read_task.projection.as_ref());
 
-        if let Some(filter) = &fragment_read_task.filter {
-            let filter_cols = Planner::column_names_in_expr(filter);
-            if !filter_cols.is_empty() {
-                fragment_read_task.projection = Arc::new(
-                    fragment_read_task
-                        .projection
-                        .as_ref()
-                        .clone()
-                        .union_columns(filter_cols, OnMissing::Error)?,
-                );
-            }
-        }
-
-        let output_read_schema = Arc::new(fragment_read_task.projection.to_schema());
-        let bare_read_schema = fragment_read_task.projection.to_bare_schema();
+        let output_read_schema = Arc::new(fragment_read_task.read_projection.to_schema());
+        let bare_read_schema = fragment_read_task.read_projection.to_bare_schema();
         let materialize_blob_v2_binary =
             crate::dataset::blob::schema_has_blob_v2_binary_view(&bare_read_schema);
         let read_schema = if materialize_blob_v2_binary {
@@ -1315,15 +1328,7 @@ impl FilteredReadStream {
         // the row ids are not contiguous
         fragment_read_task.ranges.sort_by_key(|r| r.start);
 
-        let physical_filter = fragment_read_task
-            .filter
-            .map(|filter| {
-                let planner = Planner::new(public_blob_v2_binary_projection_schema(
-                    fragment_read_task.projection.as_ref(),
-                ));
-                planner.create_physical_expr(&filter)
-            })
-            .transpose()?;
+        let physical_filter = fragment_read_task.physical_filter;
 
         // We are going to count the fragment as scanned on the first batch we
         // read. This might miss empty fragments, but we assume that wouldn't be
@@ -1693,6 +1698,19 @@ impl FilteredReadOptions {
         self.refine_filter = filter_plan.refine_expr;
         self.full_filter = filter_plan.full_expr;
         self
+    }
+
+    /// Plan `filter` for a read: returns the projection to read (the scan's
+    /// projection plus the columns the filter needs) and the physical filter.
+    fn plan_filter(&self, filter: &Expr) -> Result<(Projection, Arc<dyn PhysicalExpr>)> {
+        let read_projection = self
+            .projection
+            .clone()
+            .union_columns(Planner::column_names_in_expr(filter), OnMissing::Error)?;
+        let physical_filter =
+            Planner::new(public_blob_v2_binary_projection_schema(&read_projection))
+                .create_physical_expr(filter)?;
+        Ok((read_projection, physical_filter))
     }
 
     /// Specify the projection to use for the scan
@@ -2260,7 +2278,8 @@ impl FilteredReadExec {
                     plan.clone(),
                     None,
                     None,
-                );
+                )
+                .map_err(|e| DataFusionError::External(e.into()))?;
                 let first_stream = new_running_stream.get_stream(&metrics, partition);
                 *running_stream = Some(new_running_stream);
                 first_stream
@@ -2593,7 +2612,7 @@ impl RowStreamRead {
             internal_plan,
             Some(self.scan_scheduler.clone()),
             Some(priority_offset),
-        );
+        )?;
         let decode_parallelism = match self.source.read_options.threading_mode {
             FilteredReadThreadingMode::OnePartitionMultipleThreads(n) => n,
             FilteredReadThreadingMode::MultiplePartitions(n) => n,
@@ -2944,17 +2963,8 @@ impl ExecutionPlan for FilteredReadExec {
         // stats and basic filter shape)
 
         // Need to add in filter columns even though they aren't part of the projection
-        let filter_columns = Planner::column_names_in_expr(filter);
-        let read_projection = self
-            .options
-            .projection
-            .clone()
-            .union_columns(filter_columns, OnMissing::Error)?;
-
+        let (read_projection, physical_filter) = self.options.plan_filter(filter)?;
         let read_schema = public_blob_v2_binary_projection_schema(&read_projection);
-
-        let planner = Arc::new(Planner::new(read_schema.clone()));
-        let physical_filter = planner.create_physical_expr(filter)?;
 
         let mock_input = Arc::new(Self::try_new(
             self.dataset.clone(),
@@ -3720,6 +3730,40 @@ mod tests {
         let filter_plan = fixture.filter_plan("fully_indexed >= 200", false).await;
         let options = base_options.clone().with_filter_plan(filter_plan);
         fixture.test_plan(options, &u32s(vec![250..400])).await;
+    }
+
+    /// Fragments that share a filter share its `Arc` and one planned physical
+    /// filter, so a scan plans the filter once rather than once per fragment
+    #[tokio::test]
+    async fn test_filter_planned_once_per_scan() {
+        let fixture = TestFixture::new().await;
+        let options = FilteredReadOptions::basic_full_read(&fixture.dataset)
+            .with_filter_plan(fixture.filter_plan("not_indexed >= 75", false).await);
+        let read =
+            FilteredReadExec::try_new(fixture.dataset.clone(), options.clone(), None).unwrap();
+        let plan = read
+            .get_or_create_plan(Arc::new(TaskContext::default()))
+            .await
+            .unwrap();
+        let filters = plan.filters.values().collect::<Vec<_>>();
+        assert_eq!(filters.len(), 3);
+        assert!(filters.iter().all(|f| Arc::ptr_eq(f, filters[0])));
+
+        let scoped = FilteredReadStream::plan_to_scoped_fragments(
+            read.plan.get().unwrap(),
+            fixture.dataset.fragments(),
+            &fixture.dataset,
+            &options,
+            FilteredReadStream::make_scan_scheduler(&fixture.dataset, &options),
+        )
+        .unwrap();
+        assert_eq!(scoped.len(), 3);
+        let physical_filter = scoped[0].physical_filter.as_ref().unwrap();
+        assert!(
+            scoped
+                .iter()
+                .all(|s| Arc::ptr_eq(s.physical_filter.as_ref().unwrap(), physical_filter))
+        );
     }
 
     #[test_log::test(tokio::test)]
@@ -5124,7 +5168,8 @@ mod tests {
                 dataset,
                 &options,
                 scheduler,
-            );
+            )
+            .unwrap();
             assert_eq!(scoped.len(), 1);
             assert_eq!(scoped[0].fragment.id(), 2);
             assert_eq!(scoped[0].priority, 2);
