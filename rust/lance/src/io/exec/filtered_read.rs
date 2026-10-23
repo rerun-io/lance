@@ -60,7 +60,7 @@ use tokio::sync::{Mutex as AsyncMutex, OnceCell};
 use tracing::{Instrument, instrument};
 
 use crate::Dataset;
-use crate::dataset::fragment::{FileFragment, FragReadConfig, FragmentReader};
+use crate::dataset::fragment::{FileFragment, FragReadConfig, FragmentOpenCache, FragmentReader};
 use crate::dataset::rowids::load_row_id_sequence;
 use crate::dataset::scanner::{
     BATCH_SIZE_FALLBACK, DEFAULT_FRAGMENT_READAHEAD, get_default_batch_size,
@@ -135,9 +135,9 @@ impl EvaluatedIndex {
 struct ScopedFragmentRead {
     fragment: Arc<FileFragment>,
     ranges: Vec<Range<u64>>,
-    projection: Arc<Projection>,
     // `projection` plus the columns the filter needs
     read_projection: Arc<Projection>,
+    schemas: Arc<FragmentReadSchemas>,
     with_deleted_rows: bool,
     batch_size: u32,
     file_reader_options: Option<FileReaderOptions>,
@@ -156,11 +156,44 @@ impl ScopedFragmentRead {
             .with_row_last_updated_at_version(self.read_projection.with_row_last_updated_at_version)
             .with_row_created_at_version(self.read_projection.with_row_created_at_version)
             .with_scan_scheduler(self.scan_scheduler.clone())
-            .with_reader_priority(self.priority);
+            .with_reader_priority(self.priority)
+            .with_open_cache(self.schemas.open_cache.clone());
         if let Some(file_reader_options) = &self.file_reader_options {
             config = config.with_file_reader_options(file_reader_options.clone());
         }
         config
+    }
+}
+
+/// Schemas derived from a scan's read projection, shared by its fragments
+struct FragmentReadSchemas {
+    // The scan's output schema (the read schema without filter-only columns)
+    output_schema: SchemaRef,
+    output_read_schema: Arc<lance_core::datatypes::Schema>,
+    // What fragments open; also the projection `open_cache` is keyed on
+    read_schema: Arc<lance_core::datatypes::Schema>,
+    materialize_blob_v2_binary: bool,
+    open_cache: Arc<FragmentOpenCache>,
+}
+
+impl FragmentReadSchemas {
+    fn new(dataset: &Arc<Dataset>, read_projection: &Projection, output_schema: SchemaRef) -> Self {
+        let output_read_schema = Arc::new(read_projection.to_schema());
+        let bare_read_schema = read_projection.to_bare_schema();
+        let materialize_blob_v2_binary =
+            crate::dataset::blob::schema_has_blob_v2_binary_view(&bare_read_schema);
+        let read_schema = Arc::new(if materialize_blob_v2_binary {
+            crate::dataset::blob::blob_v2_descriptor_schema(&bare_read_schema)
+        } else {
+            bare_read_schema
+        });
+        Self {
+            output_schema,
+            output_read_schema,
+            open_cache: Arc::new(FragmentOpenCache::new(dataset.clone(), read_schema.clone())),
+            read_schema,
+            materialize_blob_v2_binary,
+        }
     }
 }
 
@@ -878,6 +911,10 @@ impl FilteredReadStream {
         // `Arc` identity since fragments share their filter's `Arc`
         let mut planned_filters: HashMap<*const Expr, (Arc<Projection>, Arc<dyn PhysicalExpr>)> =
             HashMap::new();
+        // Schemas for each distinct read projection; the keys stay valid because
+        // `projection` and `planned_filters` keep every read projection alive
+        let output_schema = public_blob_v2_binary_projection_schema(&options.projection);
+        let mut read_schemas: HashMap<*const Projection, Arc<FragmentReadSchemas>> = HashMap::new();
 
         for (priority, fragment) in fragments.iter().enumerate() {
             let fragment_id = fragment.id as u32;
@@ -904,11 +941,22 @@ impl FilteredReadStream {
                     }
                 };
 
+                let schemas = read_schemas
+                    .entry(Arc::as_ptr(&read_projection))
+                    .or_insert_with(|| {
+                        Arc::new(FragmentReadSchemas::new(
+                            dataset,
+                            &read_projection,
+                            output_schema.clone(),
+                        ))
+                    })
+                    .clone();
+
                 scoped_fragments.push(ScopedFragmentRead {
                     fragment: Arc::new(FileFragment::new(dataset.clone(), fragment.clone())),
                     ranges: ranges.clone(),
-                    projection: projection.clone(),
                     read_projection,
+                    schemas,
                     with_deleted_rows: options.with_deleted_rows,
                     batch_size: default_batch_size,
                     file_reader_options: options.file_reader_options.clone(),
@@ -1361,25 +1409,17 @@ impl FilteredReadStream {
         global_metrics: Arc<FilteredReadGlobalMetrics>,
         fragment_soft_limit: Option<u64>,
     ) -> Result<BoxStream<'static, Result<ReadBatchFut>>> {
-        let output_schema =
-            public_blob_v2_binary_projection_schema(fragment_read_task.projection.as_ref());
-
-        let output_read_schema = Arc::new(fragment_read_task.read_projection.to_schema());
-        let bare_read_schema = fragment_read_task.read_projection.to_bare_schema();
-        let materialize_blob_v2_binary =
-            crate::dataset::blob::schema_has_blob_v2_binary_view(&bare_read_schema);
-        let read_schema = if materialize_blob_v2_binary {
-            crate::dataset::blob::blob_v2_descriptor_schema(&bare_read_schema)
-        } else {
-            bare_read_schema
-        };
+        let schemas = fragment_read_task.schemas.clone();
+        let output_schema = schemas.output_schema.clone();
+        let output_read_schema = schemas.output_read_schema.clone();
+        let materialize_blob_v2_binary = schemas.materialize_blob_v2_binary;
         let mut frag_read_config = fragment_read_task.frag_read_config();
         if materialize_blob_v2_binary {
             frag_read_config = frag_read_config.with_row_address(true);
         }
         let mut fragment_reader = fragment_read_task
             .fragment
-            .open(&read_schema, frag_read_config)
+            .open(schemas.read_schema.as_ref(), frag_read_config)
             .await?;
 
         if fragment_read_task.with_deleted_rows {
@@ -1397,7 +1437,7 @@ impl FilteredReadStream {
                 fragment_read_task.fragment.id(),
                 &fragment_reader,
                 filter,
-                &read_schema,
+                &schemas.read_schema,
                 fragment_read_task.ranges,
             )
             .await;
@@ -3808,6 +3848,55 @@ mod tests {
         fixture.test_plan(options, &u32s(vec![250..400])).await;
     }
 
+    /// Fragments of a scan share one set of read schemas and one reader-open
+    /// cache, which holds one entry per distinct data-file layout
+    #[tokio::test]
+    async fn test_fragments_share_open_cache() {
+        let fixture = TestFixture::new().await;
+        let options = FilteredReadOptions::basic_full_read(&fixture.dataset)
+            .with_filter_plan(fixture.filter_plan("not_indexed >= 75", false).await);
+        let read =
+            FilteredReadExec::try_new(fixture.dataset.clone(), options.clone(), None).unwrap();
+        read.get_or_create_plan(Arc::new(TaskContext::default()))
+            .await
+            .unwrap();
+        let scoped = FilteredReadStream::plan_to_scoped_fragments(
+            read.plan.get().unwrap(),
+            fixture.dataset.fragments(),
+            &fixture.dataset,
+            &options,
+            FilteredReadStream::make_scan_scheduler(&fixture.dataset, &options),
+        )
+        .unwrap();
+        assert_eq!(scoped.len(), 3);
+        let schemas = scoped[0].schemas.clone();
+        assert!(scoped.iter().all(|s| Arc::ptr_eq(&s.schemas, &schemas)));
+
+        let metrics = Arc::new(FilteredReadGlobalMetrics::new(
+            &ExecutionPlanMetricsSet::new(),
+        ));
+        let mut num_rows = 0;
+        for scoped_fragment in scoped {
+            let batches = FilteredReadStream::read_fragment(
+                fixture.dataset.clone(),
+                scoped_fragment,
+                metrics.clone(),
+                None,
+            )
+            .await
+            .unwrap()
+            .try_buffered(1)
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+            num_rows += batches.iter().map(|b| b.num_rows()).sum::<usize>();
+        }
+        // values 75..100, 250..300 and 300..400
+        assert_eq!(num_rows, 175);
+        // Fragment 0 has all five columns; fragments 2 and 3 were appended with three
+        assert_eq!(schemas.open_cache.num_entries(), 2);
+    }
+
     /// Fragments that share a filter share its `Arc` and one planned physical
     /// filter, so a scan plans the filter once rather than once per fragment
     #[tokio::test]
@@ -6050,6 +6139,156 @@ mod tests {
                 .into_df_exec(RowCount::from(50), BatchCount::from(2));
             let plan = take_plan(&dataset, input, &["text"]).unwrap();
             plan.execute(0, Arc::new(TaskContext::default())).unwrap();
+        }
+    }
+
+    /// Fragments opened in parallel still leave one cache entry per data-file layout
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_concurrent_fragment_opens_share_open_cache_entries() {
+        let fixture = TestFixture::new().await;
+        let options = FilteredReadOptions::basic_full_read(&fixture.dataset)
+            .with_filter_plan(fixture.filter_plan("not_indexed >= 75", false).await);
+        let read =
+            FilteredReadExec::try_new(fixture.dataset.clone(), options.clone(), None).unwrap();
+        read.get_or_create_plan(Arc::new(TaskContext::default()))
+            .await
+            .unwrap();
+        let metrics = Arc::new(FilteredReadGlobalMetrics::new(
+            &ExecutionPlanMetricsSet::new(),
+        ));
+
+        for _ in 0..20 {
+            let scoped = FilteredReadStream::plan_to_scoped_fragments(
+                read.plan.get().unwrap(),
+                fixture.dataset.fragments(),
+                &fixture.dataset,
+                &options,
+                FilteredReadStream::make_scan_scheduler(&fixture.dataset, &options),
+            )
+            .unwrap();
+            let schemas = scoped[0].schemas.clone();
+            let tasks = scoped
+                .into_iter()
+                .map(|scoped_fragment| {
+                    let dataset = fixture.dataset.clone();
+                    let metrics = metrics.clone();
+                    tokio::spawn(async move {
+                        FilteredReadStream::read_fragment(dataset, scoped_fragment, metrics, None)
+                            .await
+                            .unwrap()
+                            .try_buffered(1)
+                            .try_collect::<Vec<_>>()
+                            .await
+                            .unwrap()
+                            .iter()
+                            .map(|b| b.num_rows())
+                            .sum::<usize>()
+                    })
+                })
+                .collect::<Vec<_>>();
+            let num_rows: usize = futures::future::join_all(tasks)
+                .await
+                .into_iter()
+                .map(|r| r.unwrap())
+                .sum();
+            assert_eq!(num_rows, 175);
+            assert_eq!(schemas.open_cache.num_entries(), 2);
+        }
+    }
+
+    /// After schema evolution a scan reads fragments of several layouts: two data
+    /// files per fragment (an added column), field ids of a dropped column still in old
+    /// files, and appended single-file fragments. Reads through the open cache must
+    /// return exactly the rows and values that were written.
+    #[tokio::test]
+    async fn test_filtered_read_across_evolved_layouts() {
+        use crate::dataset::{NewColumnTransform, WriteMode, WriteParams};
+        use arrow::datatypes::Int32Type;
+        use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
+
+        let tmp = TempStrDir::default();
+        let write_params = |mode| WriteParams {
+            max_rows_per_file: 100,
+            mode,
+            ..Default::default()
+        };
+        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "i",
+            DataType::Int32,
+            false,
+        )]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int32Array::from_iter_values(0..400))],
+        )
+        .unwrap();
+        let mut dataset = Dataset::write(
+            RecordBatchIterator::new(vec![Ok(batch)], schema),
+            &tmp,
+            Some(write_params(WriteMode::Create)),
+        )
+        .await
+        .unwrap();
+        dataset
+            .add_columns(
+                NewColumnTransform::SqlExpressions(vec![
+                    ("double".into(), "i * 2".into()),
+                    ("dropped".into(), "i + 1".into()),
+                ]),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        dataset.drop_columns(&["dropped"]).await.unwrap();
+
+        let schema = Arc::new(ArrowSchema::from(dataset.schema()));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from_iter_values(400..600)),
+                Arc::new(Int32Array::from_iter_values((400..600).map(|i| i * 2))),
+            ],
+        )
+        .unwrap();
+        let dataset = Dataset::write(
+            RecordBatchIterator::new(vec![Ok(batch)], schema),
+            &tmp,
+            Some(write_params(WriteMode::Append)),
+        )
+        .await
+        .unwrap();
+        assert!(dataset.fragments().iter().any(|f| f.files.len() == 2));
+        assert!(dataset.fragments().iter().any(|f| f.files.len() == 1));
+
+        let expected: Vec<i32> = (0..600).filter(|i| i % 7 == 0).collect();
+        for projection in [vec!["i", "double"], vec!["double"]] {
+            let batch = dataset
+                .scan()
+                .project(&projection)
+                .unwrap()
+                .filter("i % 7 = 0")
+                .unwrap()
+                .try_into_batch()
+                .await
+                .unwrap();
+            let double = batch["double"].as_primitive::<Int32Type>();
+            let mut doubles: Vec<i32> = double.values().to_vec();
+            doubles.sort_unstable();
+            assert_eq!(
+                doubles,
+                expected.iter().map(|i| i * 2).collect::<Vec<_>>(),
+                "projection {projection:?}"
+            );
+            if projection.contains(&"i") {
+                let i = batch["i"].as_primitive::<Int32Type>();
+                assert!(
+                    i.values()
+                        .iter()
+                        .zip(double.values())
+                        .all(|(i, d)| i * 2 == *d)
+                );
+            }
         }
     }
 }
