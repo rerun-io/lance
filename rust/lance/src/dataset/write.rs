@@ -409,6 +409,13 @@ pub struct WriteParams {
     /// When a pack file reaches this size, a new one is started.
     /// If not set, defaults to 1 GiB.
     pub blob_pack_file_size_threshold: Option<usize>,
+
+    /// File writer options to use when writing data files.
+    ///
+    /// Options set here apply to current-format data files. They have no effect
+    /// when writing legacy V1 files. If not set, the file writer uses its
+    /// configured defaults.
+    pub file_writer_options: Option<FileWriterOptions>,
 }
 
 impl Default for WriteParams {
@@ -439,6 +446,7 @@ impl Default for WriteParams {
             allow_external_blob_outside_bases: false,
             external_blob_mode: ExternalBlobMode::Reference,
             blob_pack_file_size_threshold: None,
+            file_writer_options: None,
         }
     }
 }
@@ -647,6 +655,7 @@ pub async fn do_write_fragments(
         source_store_registry,
         source_store_params,
         params.blob_pack_file_size_threshold,
+        params.file_writer_options.clone().unwrap_or_default(),
     );
     let mut writer: Option<Box<dyn GenericWriter>> = None;
     let mut num_rows_in_current_file = 0;
@@ -1634,6 +1643,7 @@ struct WriterOptions {
     source_store_registry: Arc<ObjectStoreRegistry>,
     source_store_params: ObjectStoreParams,
     blob_pack_file_size_threshold: Option<usize>,
+    file_writer_options: FileWriterOptions,
 }
 
 async fn open_writer_with_options(
@@ -1652,6 +1662,7 @@ async fn open_writer_with_options(
         source_store_registry,
         source_store_params,
         blob_pack_file_size_threshold,
+        file_writer_options,
     } = options;
 
     let data_file_key = generate_random_filename();
@@ -1685,7 +1696,7 @@ async fn open_writer_with_options(
             schema.clone(),
             FileWriterOptions {
                 format_version: Some(storage_version),
-                ..Default::default()
+                ..file_writer_options
             },
         )?;
         let preprocessor = if enable_blob_v2 {
@@ -1752,6 +1763,7 @@ struct WriterGenerator {
     source_store_registry: Arc<ObjectStoreRegistry>,
     source_store_params: ObjectStoreParams,
     blob_pack_file_size_threshold: Option<usize>,
+    file_writer_options: FileWriterOptions,
     /// Counter for round-robin selection
     next_base_index: AtomicUsize,
 }
@@ -1770,6 +1782,7 @@ impl WriterGenerator {
         source_store_registry: Arc<ObjectStoreRegistry>,
         source_store_params: ObjectStoreParams,
         blob_pack_file_size_threshold: Option<usize>,
+        file_writer_options: FileWriterOptions,
     ) -> Self {
         Self {
             object_store,
@@ -1783,6 +1796,7 @@ impl WriterGenerator {
             source_store_registry,
             source_store_params,
             blob_pack_file_size_threshold,
+            file_writer_options,
             next_base_index: AtomicUsize::new(0),
         }
     }
@@ -1819,6 +1833,7 @@ impl WriterGenerator {
                     source_store_registry: self.source_store_registry.clone(),
                     source_store_params: self.source_store_params.clone(),
                     blob_pack_file_size_threshold: self.blob_pack_file_size_threshold,
+                    file_writer_options: self.file_writer_options.clone(),
                 },
             )
             .await?
@@ -1837,6 +1852,7 @@ impl WriterGenerator {
                     source_store_registry: self.source_store_registry.clone(),
                     source_store_params: self.source_store_params.clone(),
                     blob_pack_file_size_threshold: self.blob_pack_file_size_threshold,
+                    file_writer_options: self.file_writer_options.clone(),
                 },
             )
             .await?
@@ -2529,6 +2545,7 @@ mod tests {
             Arc::new(ObjectStoreRegistry::default()),
             ObjectStoreParams::default(),
             None,
+            FileWriterOptions::default(),
         );
 
         // Create a writer
@@ -2647,6 +2664,7 @@ mod tests {
             Arc::new(ObjectStoreRegistry::default()),
             ObjectStoreParams::default(),
             None,
+            FileWriterOptions::default(),
         );
 
         // Create test batch
