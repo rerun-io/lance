@@ -679,6 +679,116 @@ pub struct FragReadConfig {
     pub reader_priority: Option<u32>,
     /// File reader options to use when reading data files.
     pub file_reader_options: Option<FileReaderOptions>,
+    /// Reader-open state shared by the fragments of one scan.
+    pub open_cache: Option<Arc<FragmentOpenCache>>,
+}
+
+/// Projection-derived reader-open state for one data-file layout.
+#[derive(Debug)]
+struct FileOpenState {
+    fields: Arc<[i32]>,
+    column_indices: Arc<[i32]>,
+    file_major_version: u32,
+    file_minor_version: u32,
+    data_file_schema: Arc<Schema>,
+    schema_per_file: Arc<Schema>,
+    field_id_to_column_idx: Arc<BTreeMap<u32, u32>>,
+    // `None` for legacy files and for files with no projected fields
+    reader_projection: Option<ReaderProjection>,
+}
+
+impl FileOpenState {
+    fn reader_projection(&self) -> Result<ReaderProjection> {
+        self.reader_projection
+            .clone()
+            .ok_or_else(|| Error::internal("no reader projection for this data file"))
+    }
+
+    fn matches(&self, data_file: &DataFile) -> bool {
+        self.same_layout(
+            &data_file.fields,
+            &data_file.column_indices,
+            data_file.file_major_version,
+            data_file.file_minor_version,
+        )
+    }
+
+    fn same_layout(
+        &self,
+        fields: &Arc<[i32]>,
+        column_indices: &Arc<[i32]>,
+        file_major_version: u32,
+        file_minor_version: u32,
+    ) -> bool {
+        self.file_major_version == file_major_version
+            && self.file_minor_version == file_minor_version
+            && (Arc::ptr_eq(&self.fields, fields) || self.fields == *fields)
+            && (Arc::ptr_eq(&self.column_indices, column_indices)
+                || self.column_indices == *column_indices)
+    }
+}
+
+/// Memoizes the projection-derived part of opening a data file (per-file schema,
+/// field-to-column map, reader projection) across the fragments of one scan.
+///
+/// The state depends only on the dataset schema, the read projection and the data
+/// file's layout, so it is reused only for opens against the same `Arc<Dataset>` and
+/// the same projection `Arc<Schema>`, both of which the cache keeps alive.
+#[derive(Debug)]
+pub struct FragmentOpenCache {
+    dataset: Arc<Dataset>,
+    projection: Arc<Schema>,
+    entries: std::sync::Mutex<Vec<Arc<FileOpenState>>>,
+}
+
+impl FragmentOpenCache {
+    /// Distinct data-file layouts remembered; further layouts are computed uncached.
+    const MAX_ENTRIES: usize = 16;
+
+    pub fn new(dataset: Arc<Dataset>, projection: Arc<Schema>) -> Self {
+        Self {
+            dataset,
+            projection,
+            entries: std::sync::Mutex::new(Vec::new()),
+        }
+    }
+
+    fn applies_to(&self, dataset: &Arc<Dataset>, projection: &Schema) -> bool {
+        Arc::ptr_eq(&self.dataset, dataset) && std::ptr::eq(self.projection.as_ref(), projection)
+    }
+
+    #[cfg(test)]
+    pub fn num_entries(&self) -> usize {
+        self.entries.lock().unwrap().len()
+    }
+
+    fn get(&self, data_file: &DataFile) -> Option<Arc<FileOpenState>> {
+        let entries = self.entries.lock().unwrap();
+        entries
+            .iter()
+            .find(|state| state.matches(data_file))
+            .cloned()
+    }
+
+    /// Returns the entry for `state`'s layout: an existing one if a concurrent open
+    /// inserted it first, so parallel misses on one layout keep a single entry.
+    fn insert(&self, state: Arc<FileOpenState>) -> Arc<FileOpenState> {
+        let mut entries = self.entries.lock().unwrap();
+        if let Some(existing) = entries.iter().find(|existing| {
+            existing.same_layout(
+                &state.fields,
+                &state.column_indices,
+                state.file_major_version,
+                state.file_minor_version,
+            )
+        }) {
+            return existing.clone();
+        }
+        if entries.len() < Self::MAX_ENTRIES {
+            entries.push(state.clone());
+        }
+        state
+    }
 }
 
 impl FragReadConfig {
@@ -721,6 +831,11 @@ impl FragReadConfig {
 
     pub fn with_file_reader_options(mut self, value: FileReaderOptions) -> Self {
         self.file_reader_options = Some(value);
+        self
+    }
+
+    pub fn with_open_cache(mut self, value: Arc<FragmentOpenCache>) -> Self {
+        self.open_cache = Some(value);
         self
     }
 }
@@ -1029,6 +1144,71 @@ impl FileFragment {
             .await
     }
 
+    /// Projection-derived state for opening `data_file`, served from
+    /// `read_config.open_cache` when it applies to this dataset and projection.
+    fn file_open_state(
+        &self,
+        data_file: &DataFile,
+        projection: Option<&Schema>,
+        read_config: &FragReadConfig,
+    ) -> Result<Arc<FileOpenState>> {
+        let cache = match (projection, read_config.open_cache.as_ref()) {
+            (Some(projection), Some(cache)) if cache.applies_to(&self.dataset, projection) => {
+                Some(cache)
+            }
+            _ => None,
+        };
+        if let Some(state) = cache.and_then(|cache| cache.get(data_file)) {
+            return Ok(state);
+        }
+
+        let full_schema = self.dataset.schema();
+        // The data file may contain fields that are not part of the dataset any longer, remove those
+        let data_file_schema = Arc::new(data_file.schema(full_schema));
+        let projection = projection.unwrap_or(full_schema);
+        // Also remove any fields that are not part of the user's provided projection
+        let schema_per_file =
+            Arc::new(projection.intersection_ignore_types(data_file_schema.as_ref())?);
+        let field_id_to_column_idx = Arc::new(BTreeMap::from_iter(
+            data_file
+                .fields
+                .iter()
+                .copied()
+                .zip(data_file.column_indices.iter().copied())
+                .filter_map(|(field_id, column_index)| {
+                    if column_index < 0 {
+                        None
+                    } else {
+                        Some((field_id as u32, column_index as u32))
+                    }
+                }),
+        ));
+        let reader_projection = if data_file.is_legacy_file() || schema_per_file.fields.is_empty() {
+            None
+        } else {
+            let file_version: LanceFileVersion = data_file.file_version()?.into();
+            Some(ReaderProjection::from_field_ids(
+                file_version,
+                schema_per_file.as_ref(),
+                field_id_to_column_idx.as_ref(),
+            )?)
+        };
+        let state = Arc::new(FileOpenState {
+            fields: data_file.fields.clone(),
+            column_indices: data_file.column_indices.clone(),
+            file_major_version: data_file.file_major_version,
+            file_minor_version: data_file.file_minor_version,
+            data_file_schema,
+            schema_per_file,
+            field_id_to_column_idx,
+            reader_projection,
+        });
+        Ok(match cache {
+            Some(cache) => cache.insert(state),
+            None => state,
+        })
+    }
+
     fn open_reader_impl<'a>(
         &'a self,
         data_file: &'a DataFile,
@@ -1037,13 +1217,8 @@ impl FileFragment {
         metadata_mode: MetadataMode,
     ) -> BoxFuture<'a, Result<Option<Box<dyn GenericFileReader>>>> {
         async move {
-            let full_schema = self.dataset.schema();
-            // The data file may contain fields that are not part of the dataset any longer, remove those
-            let data_file_schema = Arc::new(data_file.schema(full_schema));
-            let projection = projection.unwrap_or(full_schema);
-            // Also remove any fields that are not part of the user's provided projection
-            let schema_per_file =
-                Arc::new(projection.intersection_ignore_types(data_file_schema.as_ref())?);
+            let open_state = self.file_open_state(data_file, projection, read_config)?;
+            let schema_per_file = open_state.schema_per_file.clone();
 
             if data_file.is_legacy_file() {
                 let max_field_id = data_file.fields.iter().max().unwrap();
@@ -1114,26 +1289,9 @@ impl FileFragment {
                     .await?;
                 let path = file_scheduler.reader().path().clone();
                 let metadata_cache = self.dataset.metadata_cache.file_metadata_cache(&path);
-                let field_id_to_column_idx = Arc::new(BTreeMap::from_iter(
-                    data_file
-                        .fields
-                        .iter()
-                        .copied()
-                        .zip(data_file.column_indices.iter().copied())
-                        .filter_map(|(field_id, column_index)| {
-                            if column_index < 0 {
-                                None
-                            } else {
-                                Some((field_id as u32, column_index as u32))
-                            }
-                        }),
-                ));
+                let field_id_to_column_idx = open_state.field_id_to_column_idx.clone();
                 let file_version: LanceFileVersion = data_file.file_version()?.into();
-                let reader_projection = ReaderProjection::from_field_ids(
-                    file_version,
-                    schema_per_file.as_ref(),
-                    field_id_to_column_idx.as_ref(),
-                )?;
+                let reader_projection = open_state.reader_projection()?;
                 let file_reader_options = read_config
                     .file_reader_options
                     .clone()
@@ -1148,7 +1306,7 @@ impl FileFragment {
                     let known_schema = self
                         .metadata
                         .physical_rows
-                        .map(|num_rows| (data_file_schema.clone(), num_rows as u64));
+                        .map(|num_rows| (open_state.data_file_schema.clone(), num_rows as u64));
                     let metadata_index = self
                         .get_file_metadata_index(&file_scheduler, known_schema)
                         .await?;
@@ -1180,10 +1338,16 @@ impl FileFragment {
                     .await?
                 } else {
                     let file_metadata = self.get_file_metadata(&file_scheduler).await?;
+                    // Scan opens (the ones carrying an open cache) always read with an explicit
+                    // projection, so they skip building a whole-file one; other opens keep it.
+                    let base_projection = read_config
+                        .open_cache
+                        .is_some()
+                        .then(|| reader_projection.clone());
                     ProjectedFileReader::try_open_with_file_metadata(
                         encodings_io,
                         path.clone(),
-                        None,
+                        base_projection,
                         Arc::<DecoderPlugins>::default(),
                         file_metadata,
                         &metadata_cache,
@@ -6245,5 +6409,131 @@ mod tests {
         // Verify the operation produced valid results
         assert!(!fields_modified.is_empty());
         assert!(!updated_fragment.files.is_empty());
+    }
+
+    /// Uncached state for `data_file`, for comparing against what the cache serves.
+    fn uncached_state(
+        fragment: &FileFragment,
+        data_file: &DataFile,
+        projection: &Schema,
+    ) -> Arc<FileOpenState> {
+        fragment
+            .file_open_state(data_file, Some(projection), &FragReadConfig::default())
+            .unwrap()
+    }
+
+    fn same_state(a: &FileOpenState, b: &FileOpenState) -> bool {
+        a.data_file_schema == b.data_file_schema
+            && a.schema_per_file == b.schema_per_file
+            && a.field_id_to_column_idx == b.field_id_to_column_idx
+            && format!("{:?}", a.reader_projection) == format!("{:?}", b.reader_projection)
+    }
+
+    /// One data file per distinct layout: the fixture's file with its column indices shifted.
+    fn layout_variant(data_file: &DataFile, shift: i32) -> DataFile {
+        let mut variant = data_file.clone();
+        variant.column_indices = data_file
+            .column_indices
+            .iter()
+            .map(|column_index| column_index + shift)
+            .collect();
+        variant
+    }
+
+    #[tokio::test]
+    async fn test_open_cache_serves_uncached_state_and_keeps_one_entry_per_layout() {
+        let test_dir = TempStrDir::default();
+        let dataset = Arc::new(create_dataset(&test_dir, LanceFileVersion::Stable).await);
+        let fragment = FileFragment::new(dataset.clone(), dataset.fragments()[0].clone());
+        let data_file = fragment.metadata().files[0].clone();
+        let projection = Arc::new(dataset.schema().clone());
+        let cache = Arc::new(FragmentOpenCache::new(dataset, projection.clone()));
+        let config = FragReadConfig::default().with_open_cache(cache.clone());
+
+        let first = fragment
+            .file_open_state(&data_file, Some(projection.as_ref()), &config)
+            .unwrap();
+        let second = fragment
+            .file_open_state(&data_file, Some(projection.as_ref()), &config)
+            .unwrap();
+        assert!(Arc::ptr_eq(&first, &second));
+        assert!(same_state(
+            &first,
+            &uncached_state(&fragment, &data_file, &projection)
+        ));
+        assert_eq!(cache.num_entries(), 1);
+
+        // Two opens that both missed insert the same layout; the second gets the first's entry.
+        let a = uncached_state(&fragment, &layout_variant(&data_file, 1), &projection);
+        let b = uncached_state(&fragment, &layout_variant(&data_file, 1), &projection);
+        assert!(Arc::ptr_eq(&cache.insert(a.clone()), &a));
+        assert!(Arc::ptr_eq(&cache.insert(b), &a));
+        assert_eq!(cache.num_entries(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_open_cache_beyond_capacity_computes_uncached() {
+        let test_dir = TempStrDir::default();
+        let dataset = Arc::new(create_dataset(&test_dir, LanceFileVersion::Stable).await);
+        let fragment = FileFragment::new(dataset.clone(), dataset.fragments()[0].clone());
+        let data_file = fragment.metadata().files[0].clone();
+        let projection = Arc::new(dataset.schema().clone());
+        let cache = Arc::new(FragmentOpenCache::new(dataset, projection.clone()));
+        let config = FragReadConfig::default().with_open_cache(cache.clone());
+
+        let num_layouts = FragmentOpenCache::MAX_ENTRIES as i32 + 4;
+        for shift in 0..num_layouts {
+            let variant = layout_variant(&data_file, shift);
+            let cached = fragment
+                .file_open_state(&variant, Some(projection.as_ref()), &config)
+                .unwrap();
+            assert!(same_state(
+                &cached,
+                &uncached_state(&fragment, &variant, &projection)
+            ));
+        }
+        assert_eq!(cache.num_entries(), FragmentOpenCache::MAX_ENTRIES);
+
+        // A layout past capacity is recomputed on every open, never mixed up with a cached one.
+        let overflow = layout_variant(&data_file, num_layouts - 1);
+        let again = fragment
+            .file_open_state(&overflow, Some(projection.as_ref()), &config)
+            .unwrap();
+        assert!(same_state(
+            &again,
+            &uncached_state(&fragment, &overflow, &projection)
+        ));
+        assert_eq!(cache.num_entries(), FragmentOpenCache::MAX_ENTRIES);
+    }
+
+    #[tokio::test]
+    async fn test_open_cache_ignores_other_projections_and_datasets() {
+        let test_dir = TempStrDir::default();
+        let dataset = Arc::new(create_dataset(&test_dir, LanceFileVersion::Stable).await);
+        let fragment = FileFragment::new(dataset.clone(), dataset.fragments()[0].clone());
+        let data_file = fragment.metadata().files[0].clone();
+        let projection = Arc::new(dataset.schema().clone());
+        let cache = Arc::new(FragmentOpenCache::new(dataset.clone(), projection.clone()));
+        let config = FragReadConfig::default().with_open_cache(cache.clone());
+
+        // An equal projection at another address is not the cache's projection.
+        let other_projection = Arc::new(dataset.schema().project(&["i"]).unwrap());
+        let state = fragment
+            .file_open_state(&data_file, Some(other_projection.as_ref()), &config)
+            .unwrap();
+        assert!(same_state(
+            &state,
+            &uncached_state(&fragment, &data_file, &other_projection)
+        ));
+        assert_eq!(cache.num_entries(), 0);
+
+        // The same dataset reopened is another `Arc<Dataset>`, so the cache does not apply.
+        let reopened = Arc::new(Dataset::open(&test_dir).await.unwrap());
+        let reopened_fragment =
+            FileFragment::new(reopened.clone(), reopened.fragments()[0].clone());
+        reopened_fragment
+            .file_open_state(&data_file, Some(projection.as_ref()), &config)
+            .unwrap();
+        assert_eq!(cache.num_entries(), 0);
     }
 }
