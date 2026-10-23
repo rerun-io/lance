@@ -115,6 +115,7 @@ use crate::io::exec::{
     AddRowOffsetExec, LANCE_RELATIONAL_ALGEBRA_VERSION, LanceFilterExec, LanceScanConfig,
     get_physical_optimizer,
 };
+use crate::session::caches::{FilterableSchema, FilterableSchemaKey};
 use crate::{Error, Result};
 use crate::{
     datatypes::Schema,
@@ -2027,6 +2028,32 @@ impl Scanner {
         Ok(Arc::new(self.add_extra_columns(base_schema)?))
     }
 
+    /// [`Self::filterable_schema`], in both forms, shared by every scan of the same manifest
+    /// when its e-tag is known.
+    async fn cached_filterable_schema(&self) -> Result<Arc<FilterableSchema>> {
+        let build = || {
+            let lance = self.filterable_schema()?;
+            let arrow = Arc::new(ArrowSchema::from(lance.as_ref()));
+            Ok(FilterableSchema { lance, arrow })
+        };
+        let location = &self.dataset.manifest_location;
+        let Some(e_tag) = location.e_tag.as_deref() else {
+            return build().map(Arc::new);
+        };
+        let key = FilterableSchemaKey {
+            store_identity: &self.dataset.object_store.store_prefix,
+            version: location.version,
+            e_tag,
+            nearest: self.nearest.is_some(),
+            batch_nearest: self.is_batch_nearest,
+            full_text_search: self.full_text_query.is_some(),
+        };
+        self.dataset
+            .metadata_cache
+            .get_or_insert_with_key(key, || async { build() })
+            .await
+    }
+
     /// This takes the current output, and the user's requested projection, and calculates the
     /// final projection expression.
     ///
@@ -2467,8 +2494,9 @@ impl Scanner {
     }
 
     async fn create_filter_plan(&self, use_scalar_index: bool) -> Result<FilterPlan> {
-        let filter_schema = self.filterable_schema()?;
-        let planner = Planner::new(Arc::new(filter_schema.as_ref().into()));
+        let filterable = self.cached_filterable_schema().await?;
+        let filter_schema = &filterable.lance;
+        let planner = Planner::new(filterable.arrow.clone());
 
         // Check expr filter
         let filter_plan = if let Some(filter) = self.filter.expr_filter.as_ref() {
@@ -13902,5 +13930,56 @@ full_filter=name LIKE Utf8(\"test%2\"), refine_filter=name LIKE Utf8(\"test%2\")
             scanner
         })
         .await;
+    }
+
+    #[tokio::test]
+    async fn test_filterable_schema_follows_dataset_version() {
+        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "a",
+            DataType::Int32,
+            false,
+        )]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int32Array::from_iter_values(0..10))],
+        )
+        .unwrap();
+        let test_dir = TempStrDir::default();
+        let mut dataset = Dataset::write(
+            RecordBatchIterator::new(vec![Ok(batch)], schema),
+            &test_dir,
+            None,
+        )
+        .await
+        .unwrap();
+        let first_version = dataset.version().version;
+
+        let count = |dataset: Dataset, filter: &'static str| async move {
+            dataset
+                .scan()
+                .filter(filter)?
+                .try_into_batch()
+                .await
+                .map(|b| b.num_rows())
+        };
+        assert_eq!(count(dataset.clone(), "a > 4").await.unwrap(), 5);
+
+        dataset
+            .add_columns(
+                crate::dataset::NewColumnTransform::SqlExpressions(vec![(
+                    "b".into(),
+                    "a * 2".into(),
+                )]),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(count(dataset.clone(), "b > 10").await.unwrap(), 4);
+
+        // The earlier version shares the session's cache but must still not know `b`.
+        let earlier = dataset.checkout_version(first_version).await.unwrap();
+        assert!(count(earlier.clone(), "b > 10").await.is_err());
+        assert_eq!(count(earlier, "a > 4").await.unwrap(), 5);
     }
 }

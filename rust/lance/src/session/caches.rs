@@ -10,7 +10,7 @@
 //!     │    │
 //!     └────┴──► FileMetadataCache (prefixed by file path)
 
-use std::{borrow::Cow, ops::Deref};
+use std::{borrow::Cow, ops::Deref, sync::Arc};
 
 use lance_core::deepsize::{Context, DeepSizeOf};
 use lance_core::{
@@ -240,6 +240,67 @@ impl CacheKey for RowIdSequenceKey {
 
     fn write_key(&self, builder: &mut KeyBuilder) {
         builder.write_u64(self.fragment_id);
+    }
+}
+
+/// A manifest's filterable schema, as a Lance schema and as the Arrow schema planners take.
+#[derive(Debug)]
+pub struct FilterableSchema {
+    pub lance: Arc<lance_core::datatypes::Schema>,
+    pub arrow: Arc<arrow_schema::Schema>,
+}
+
+impl DeepSizeOf for FilterableSchema {
+    fn deep_size_of_children(&self, context: &mut Context) -> usize {
+        // Approximate: the Arrow schema mirrors the Lance one field for field.
+        2 * self.lance.deep_size_of_children(context)
+    }
+}
+
+/// The schema a scanner resolves filters against, for one manifest and one combination of the
+/// scanner options that add columns to it.
+///
+/// Only manifests with a known e-tag are cached, so a dataset recreated at the same URI and
+/// version cannot be served the old schema.
+#[derive(Debug)]
+pub struct FilterableSchemaKey<'a> {
+    pub store_identity: &'a str,
+    pub version: u64,
+    pub e_tag: &'a str,
+    pub nearest: bool,
+    pub batch_nearest: bool,
+    pub full_text_search: bool,
+}
+
+impl CacheKey for FilterableSchemaKey<'_> {
+    type ValueType = FilterableSchema;
+    fn key(&self) -> Cow<'_, str> {
+        let options = (self.nearest as u8)
+            | ((self.batch_nearest as u8) << 1)
+            | ((self.full_text_search as u8) << 2);
+        Cow::Owned(format!(
+            "filterable_schema/{}:{}/{}/{}/{options}",
+            self.store_identity.len(),
+            self.store_identity,
+            self.version,
+            self.e_tag
+        ))
+    }
+    fn type_name() -> &'static str {
+        "FilterableSchema"
+    }
+
+    fn schema() -> CacheKeySchema {
+        CacheKeySchema::new("lance.dataset.filterable-schema-key", 1)
+    }
+
+    fn write_key(&self, builder: &mut KeyBuilder) {
+        builder.write_str(self.store_identity);
+        builder.write_u64(self.version);
+        builder.write_str(self.e_tag);
+        builder.write_bool(self.nearest);
+        builder.write_bool(self.batch_nearest);
+        builder.write_bool(self.full_text_search);
     }
 }
 

@@ -1038,12 +1038,11 @@ impl FileFragment {
     ) -> BoxFuture<'a, Result<Option<Box<dyn GenericFileReader>>>> {
         async move {
             let full_schema = self.dataset.schema();
-            // The data file may contain fields that are not part of the dataset any longer, remove those
-            let data_file_schema = Arc::new(data_file.schema(full_schema));
             let projection = projection.unwrap_or(full_schema);
-            // Also remove any fields that are not part of the user's provided projection
+            // The data file may contain fields that are not part of the dataset any longer, and
+            // fields that are not part of the user's provided projection; remove both.
             let schema_per_file =
-                Arc::new(projection.intersection_ignore_types(data_file_schema.as_ref())?);
+                Arc::new(data_file_projection(full_schema, data_file, projection)?);
 
             if data_file.is_legacy_file() {
                 let max_field_id = data_file.fields.iter().max().unwrap();
@@ -1145,12 +1144,13 @@ impl FileFragment {
                         &reader_projection,
                         file_version,
                     ) {
-                    let known_schema = self
-                        .metadata
-                        .physical_rows
-                        .map(|num_rows| (data_file_schema.clone(), num_rows as u64));
+                    let physical_rows = self.metadata.physical_rows;
                     let metadata_index = self
-                        .get_file_metadata_index(&file_scheduler, known_schema)
+                        .get_file_metadata_index_with(&file_scheduler, || {
+                            physical_rows.map(|num_rows| {
+                                (Arc::new(data_file.schema(full_schema)), num_rows as u64)
+                            })
+                        })
                         .await?;
                     if (reader_projection.column_indices.len() as u32).saturating_mul(4)
                         < metadata_index.num_columns()
@@ -1641,12 +1641,22 @@ impl FileFragment {
         file_scheduler: &FileScheduler,
         known_schema: Option<(Arc<Schema>, u64)>,
     ) -> Result<Arc<FileMetadataIndex>> {
+        self.get_file_metadata_index_with(file_scheduler, || known_schema)
+            .await
+    }
+
+    /// Like [`Self::get_file_metadata_index`], but only builds the known schema on a cache miss.
+    async fn get_file_metadata_index_with(
+        &self,
+        file_scheduler: &FileScheduler,
+        known_schema: impl FnOnce() -> Option<(Arc<Schema>, u64)> + Send,
+    ) -> Result<Arc<FileMetadataIndex>> {
         let path = file_scheduler.reader().path();
         let cache = self.dataset.metadata_cache.file_metadata_cache(path);
 
         let metadata_index = cache
             .get_or_insert_with_key(FileMetadataIndexCacheKey, || async {
-                let metadata_index = if let Some((file_schema, num_rows)) = known_schema {
+                let metadata_index = if let Some((file_schema, num_rows)) = known_schema() {
                     lance_file::reader::FileReader::read_metadata_index_with_schema(
                         file_scheduler,
                         file_schema,
@@ -2226,6 +2236,44 @@ impl From<FileFragment> for Fragment {
     fn from(fragment: FileFragment) -> Self {
         fragment.metadata
     }
+}
+
+/// The fields of `projection` that `data_file` stores, i.e.
+/// `projection.intersection_ignore_types(&data_file.schema(full_schema))`.
+///
+/// The intersection keeps a top-level field of the data file's schema only when its name
+/// resolves in `projection`, and projecting by field ids treats top-level fields independently.
+/// So the data file's schema is built from just the top-level fields `projection` can match,
+/// instead of cloning every field the data file stores, which dominates opening a reader on a
+/// wide dataset with a narrow projection.
+fn data_file_projection(
+    full_schema: &Schema,
+    data_file: &DataFile,
+    projection: &Schema,
+) -> Result<Schema> {
+    let projected_names: HashSet<&str> = projection
+        .fields
+        .iter()
+        .map(|field| field.name.as_str())
+        .collect();
+    let matchable = Schema {
+        fields: full_schema
+            .fields
+            .iter()
+            .filter(|field| {
+                // `Schema::field` parses its argument as a field path; a name without quotes or
+                // dots is a single segment, matched exactly against top-level names.
+                if field.name.contains(['.', '`']) {
+                    projection.field(&field.name).is_some()
+                } else {
+                    projected_names.contains(field.name.as_str())
+                }
+            })
+            .cloned()
+            .collect(),
+        metadata: HashMap::new(),
+    };
+    projection.intersection_ignore_types(&matchable.project_by_ids(&data_file.fields, false))
 }
 
 /// [`FragmentReader`] is an abstract reader for a [`FileFragment`].
@@ -6245,5 +6293,92 @@ mod tests {
         // Verify the operation produced valid results
         assert!(!fields_modified.is_empty());
         assert!(!updated_fragment.files.is_empty());
+    }
+
+    #[test]
+    fn test_data_file_projection_matches_full_intersection() {
+        let nested = ArrowField::new(
+            "nested",
+            DataType::Struct(
+                vec![
+                    ArrowField::new("x", DataType::Int32, true),
+                    ArrowField::new("y", DataType::Utf8, true),
+                ]
+                .into(),
+            ),
+            true,
+        );
+        let list = ArrowField::new(
+            "list",
+            DataType::List(Arc::new(ArrowField::new("item", DataType::Int32, true))),
+            true,
+        );
+        let arrow_schema = ArrowSchema::new(vec![
+            ArrowField::new("a", DataType::Int32, true),
+            ArrowField::new("b", DataType::Utf8, true),
+            nested,
+            list,
+            ArrowField::new("c", DataType::Float64, true),
+            ArrowField::new("`a`", DataType::Int64, true),
+        ]);
+        let full = Schema::try_from(&arrow_schema).unwrap();
+        let top = |name: &str| full.fields.iter().find(|f| f.name == name).unwrap();
+        let ids = |name: &str| {
+            let mut ids = vec![top(name).id];
+            ids.extend(top(name).children.iter().map(|child| child.id));
+            ids
+        };
+
+        // Data files store all, part of, or none of the struct; the list; a quoted name; and a
+        // field id the dataset no longer has.
+        let mut partial_struct = vec![top("nested").id, top("nested").children[0].id];
+        partial_struct.extend([top("a").id, top("c").id, 1_000]);
+        let data_files = [
+            partial_struct,
+            [ids("a"), ids("nested"), ids("list")].concat(),
+            [ids("b"), ids("list"), ids("`a`")].concat(),
+            vec![],
+        ]
+        .map(|fields| {
+            let columns = (0..fields.len() as i32).collect();
+            DataFile::new(
+                "f.lance",
+                fields,
+                columns,
+                ConcreteFileVersion::V2_1,
+                None,
+                None,
+            )
+        });
+
+        let projections = [
+            full.project(&["a"]).unwrap(),
+            full.project(&["c", "a"]).unwrap(),
+            full.project(&["b", "list"]).unwrap(),
+            full.project(&["nested"]).unwrap(),
+            full.project(&["nested.y", "c"]).unwrap(),
+            full.project_by_ids(&[top("`a`").id], false),
+            full.clone(),
+            Schema::default(),
+        ];
+        for data_file in &data_files {
+            for projection in &projections {
+                let expected = projection.intersection_ignore_types(&data_file.schema(&full));
+                let actual = data_file_projection(&full, data_file, projection);
+                match (expected, actual) {
+                    (Ok(expected), Ok(actual)) => assert_eq!(
+                        actual, expected,
+                        "projection {projection:?}, data file {:?}",
+                        data_file.fields
+                    ),
+                    (Err(_), Err(_)) => {}
+                    (expected, actual) => panic!(
+                        "projection {projection:?}, data file {:?}: expected {expected:?}, got \
+                         {actual:?}",
+                        data_file.fields
+                    ),
+                }
+            }
+        }
     }
 }

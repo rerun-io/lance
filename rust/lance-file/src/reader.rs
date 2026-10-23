@@ -7,7 +7,7 @@ use std::{
     io::Cursor,
     ops::Range,
     pin::Pin,
-    sync::Arc,
+    sync::{Arc, OnceLock},
 };
 
 use arrow_array::RecordBatchReader;
@@ -484,7 +484,9 @@ enum FileMetadataProvider {
 #[derive(Debug, Clone)]
 struct FileReadCore {
     scheduler: Arc<dyn EncodingsIo>,
-    base_projection: ReaderProjection,
+    /// Built from the whole file schema on first use when not provided; most readers are only
+    /// ever read with explicit projections.
+    base_projection: OnceLock<ReaderProjection>,
     metadata_provider: FileMetadataProvider,
     decoder_plugins: Arc<DecoderPlugins>,
     cache: Arc<LanceCache>,
@@ -1787,7 +1789,7 @@ impl FileReader {
         projection: Option<ReaderProjection>,
         filter: FilterExpression,
     ) -> Result<Box<dyn RecordBatchReader + Send + 'static>> {
-        let projection = projection.unwrap_or_else(|| self.core.base_projection.clone());
+        let projection = projection.unwrap_or_else(|| self.core.base_projection().clone());
         Self::validate_projection(&projection, &self.metadata)?;
         // Apply the same projection-length validation as the async path.  This
         // reader is always backed by full metadata, so we can build the prepared
@@ -1881,7 +1883,7 @@ impl FileReader {
             params,
             batch_size,
             batch_readahead,
-            self.core.base_projection.clone(),
+            self.core.base_projection().clone(),
             filter,
         )
         .await
@@ -2130,13 +2132,9 @@ impl FileReadCore {
         if let Some(base_projection) = base_projection.as_ref() {
             metadata_provider.validate_projection(base_projection)?;
         }
-        let base_projection = base_projection.unwrap_or(ReaderProjection::from_whole_schema(
-            metadata_provider.schema().as_ref(),
-            metadata_provider.version(),
-        ));
         Ok(Self {
             scheduler,
-            base_projection,
+            base_projection: base_projection.map(OnceLock::from).unwrap_or_default(),
             metadata_provider,
             decoder_plugins,
             cache,
@@ -2153,6 +2151,15 @@ impl FileReadCore {
             cache: self.cache.clone(),
             options: self.options.clone(),
         }
+    }
+
+    fn base_projection(&self) -> &ReaderProjection {
+        self.base_projection.get_or_init(|| {
+            ReaderProjection::from_whole_schema(
+                self.metadata_provider.schema().as_ref(),
+                self.metadata_provider.version(),
+            )
+        })
     }
 
     fn version(&self) -> LanceFileVersion {
@@ -2345,7 +2352,7 @@ impl FileReadCore {
         projection: Option<ReaderProjection>,
         filter: FilterExpression,
     ) -> Result<Pin<Box<dyn Stream<Item = ReadBatchTask> + Send>>> {
-        let projection = projection.unwrap_or_else(|| self.base_projection.clone());
+        let projection = projection.unwrap_or_else(|| self.base_projection().clone());
         let prepared = self
             .metadata_provider
             .prepare_projection(&projection, &self.scheduler, &self.cache)
