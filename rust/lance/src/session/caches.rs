@@ -10,7 +10,7 @@
 //!     │    │
 //!     └────┴──► FileMetadataCache (prefixed by file path)
 
-use std::{borrow::Cow, ops::Deref};
+use std::{borrow::Cow, ops::Deref, sync::Arc};
 
 use lance_core::deepsize::{Context, DeepSizeOf};
 use lance_core::{
@@ -240,6 +240,67 @@ impl CacheKey for RowIdSequenceKey {
 
     fn write_key(&self, builder: &mut KeyBuilder) {
         builder.write_u64(self.fragment_id);
+    }
+}
+
+/// A manifest's filterable schema, as a Lance schema and as the Arrow schema planners take.
+#[derive(Debug)]
+pub struct FilterableSchema {
+    pub lance: Arc<lance_core::datatypes::Schema>,
+    pub arrow: Arc<arrow_schema::Schema>,
+    /// Entries only apply to a dataset holding this exact manifest, since a dataset can be
+    /// recreated, or its manifest replaced, at the same location. The `Weak` keeps that address
+    /// from being reused.
+    pub manifest: std::sync::Weak<Manifest>,
+}
+
+impl DeepSizeOf for FilterableSchema {
+    fn deep_size_of_children(&self, context: &mut Context) -> usize {
+        // Approximate: the Arrow schema mirrors the Lance one field for field.
+        2 * self.lance.deep_size_of_children(context)
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct FilterableSchemaKey<'a> {
+    pub version: u64,
+    pub e_tag: Option<&'a str>,
+    pub nearest: bool,
+    pub batch_nearest: bool,
+    pub full_text_search: bool,
+}
+
+impl CacheKey for FilterableSchemaKey<'_> {
+    type ValueType = FilterableSchema;
+    fn key(&self) -> Cow<'_, str> {
+        Cow::Owned(format!(
+            "filterable_schema/{}/{}/{}{}{}",
+            self.version,
+            self.e_tag.unwrap_or_default(),
+            self.nearest as u8,
+            self.batch_nearest as u8,
+            self.full_text_search as u8
+        ))
+    }
+    fn type_name() -> &'static str {
+        "FilterableSchema"
+    }
+
+    fn schema() -> CacheKeySchema {
+        CacheKeySchema::new("lance.dataset.filterable-schema-key", 1)
+    }
+
+    fn write_key(&self, builder: &mut KeyBuilder) {
+        builder.write_u64(self.version);
+        if let Some(e_tag) = self.e_tag {
+            builder.write_some();
+            builder.write_str(e_tag);
+        } else {
+            builder.write_none();
+        }
+        builder.write_bool(self.nearest);
+        builder.write_bool(self.batch_nearest);
+        builder.write_bool(self.full_text_search);
     }
 }
 
