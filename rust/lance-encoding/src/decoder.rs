@@ -699,6 +699,45 @@ impl CoreFieldDecoderStrategy {
         }
     }
 
+    /// The pages overlapping `ranges` that may hold a value `predicate` accepts, as sorted row
+    /// ranges.
+    ///
+    /// Only pages that know their values (dictionary, constant and all-null pages) can be left
+    /// out. `None` when no such page overlaps `ranges`, or the column is nested,
+    /// dictionary-typed or not in a 2.1+ file. Page metadata goes through `cache`, so a read
+    /// that follows reuses it.
+    pub async fn rows_that_may_match(
+        &self,
+        field: &Field,
+        column_info: Arc<ColumnInfo>,
+        ranges: &[Range<u64>],
+        predicate: &dyn ValuePredicate,
+        io: Arc<dyn EncodingsIo>,
+        cache: Arc<LanceCache>,
+    ) -> Result<Option<Vec<Range<u64>>>> {
+        let data_type = field.data_type();
+        if data_type.is_nested()
+            || matches!(data_type, DataType::Dictionary(..))
+            || !column_info.is_structural()
+        {
+            return Ok(None);
+        }
+        let mut scheduler = StructuralPrimitiveFieldScheduler::try_new_lazy(
+            column_info,
+            self.decompressor_strategy.clone(),
+            self.cache_repetition_index,
+            field,
+        )?;
+        scheduler
+            .rows_that_may_match(
+                ranges,
+                &data_type,
+                predicate,
+                &SchedulerContext::new(io, cache),
+            )
+            .await
+    }
+
     /// This is just a sanity check to ensure there is no "wrapped encodings"
     /// that haven't been handled.
     fn ensure_values_encoded(column_info: &ColumnInfo, field_name: &str) -> Result<()> {
@@ -3211,6 +3250,15 @@ impl FilterExpression {
     pub fn is_noop(&self) -> bool {
         self.0.is_empty()
     }
+}
+
+/// A condition on one column, used to skip pages with no value that meets it.
+///
+/// See [`CoreFieldDecoderStrategy::rows_that_may_match`].
+pub trait ValuePredicate: Send + Sync {
+    /// Whether any of `values` may meet the condition. `values` holds every value of a page,
+    /// including a null when the page may hold nulls; `false` skips the page.
+    fn any_may_match(&self, values: &dyn arrow_array::Array) -> Result<bool>;
 }
 
 pub trait StructuralFieldScheduler: Send + std::fmt::Debug {

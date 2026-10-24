@@ -4,6 +4,7 @@
 use std::{any::Any, collections::VecDeque, fmt::Debug, ops::Range, sync::Arc, vec};
 
 use crate::format::metadata::{self, CompressiveEncoding};
+use arrow_array::ArrayRef;
 use arrow_buffer::BooleanBufferBuilder;
 use arrow_schema::DataType;
 use bytes::Bytes;
@@ -217,6 +218,31 @@ trait StructuralPageScheduler: std::fmt::Debug + Send {
         ranges: &[Range<u64>],
         io: &Arc<dyn EncodingsIo>,
     ) -> Result<Vec<PageLoadTask>>;
+
+    /// Whether [`Self::known_values`] can report the page's values, known before initialization.
+    fn may_know_values(&self) -> bool {
+        false
+    }
+
+    /// The values the page holds, as arrays of `data_type`. Called after initialization.
+    fn known_values(&self, _data_type: &DataType) -> Result<PageValues> {
+        Ok(PageValues::Unknown)
+    }
+}
+
+/// What a page knows about its values without decoding its rows.
+#[derive(Debug)]
+pub(crate) enum PageValues {
+    /// The page may hold any value.
+    Unknown,
+    /// Every non-null value of the page is in `values`, which has no nulls but may list values
+    /// no row holds (e.g. dictionary entries of deleted rows).
+    AnyOf {
+        values: ArrayRef,
+        may_have_nulls: bool,
+    },
+    /// Every value on the page is null.
+    AllNull,
 }
 
 /// A chunk that has been loaded by the miniblock scheduler (but not

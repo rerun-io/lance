@@ -8,9 +8,11 @@ use std::ops::Range;
 use std::sync::Arc;
 use std::{iter, vec};
 
+use arrow_array::make_array;
 #[cfg(feature = "bitpacking")]
 use arrow_buffer::ArrowNativeType;
 use arrow_buffer::ScalarBuffer;
+use arrow_schema::DataType;
 #[cfg(feature = "bitpacking")]
 use bytemuck::Pod;
 use bytes::Bytes;
@@ -42,7 +44,7 @@ use super::chunk_index::{
 };
 use super::{
     CachedPageData, LoadedChunk, MAX_LEGACY_RLE_LEVELS, MINIBLOCK_ALIGNMENT, PageInitialization,
-    PageInitializationBuffers, PageLoadTask, StructuralPageScheduler,
+    PageInitializationBuffers, PageLoadTask, PageValues, StructuralPageScheduler,
 };
 
 /// A mini-block chunk that has been decoded and decompressed
@@ -1800,6 +1802,29 @@ impl StructuralPageScheduler for MiniBlockScheduler {
             num_rows,
         };
         Ok(vec![page_load_task])
+    }
+
+    fn may_know_values(&self) -> bool {
+        self.dictionary.is_some()
+    }
+
+    fn known_values(&self, data_type: &DataType) -> Result<PageValues> {
+        let Some(dictionary) = self
+            .page_meta
+            .as_ref()
+            .and_then(|page_meta| page_meta.dictionary.as_ref())
+        else {
+            return Ok(PageValues::Unknown);
+        };
+        Ok(PageValues::AnyOf {
+            values: make_array(
+                dictionary
+                    .as_ref()
+                    .clone()
+                    .into_arrow(data_type.clone(), true)?,
+            ),
+            may_have_nulls: !self.def_meaning.iter().all(|def| def.is_all_valid()),
+        })
     }
 }
 
