@@ -20,7 +20,7 @@ use crate::{
     EncodingsIo,
     buffer::LanceBuffer,
     data::{BlockInfo, DataBlock, VariableWidthBlock},
-    decoder::{DecodePageTask, DecodedPage, StructuralPageDecoder},
+    decoder::{BinaryPruneFilter, DecodePageTask, DecodedPage, StructuralPageDecoder},
     encodings::logical::primitive::{CachedPageData, PageLoadTask, StructuralPageScheduler},
     repdef::{DefinitionInterpretation, RepDefUnraveler},
 };
@@ -89,6 +89,14 @@ impl StructuralPageScheduler for BlobDescriptionPageScheduler {
                 num_rows: task.num_rows,
             })
             .collect())
+    }
+
+    fn may_contain_any(&self, _values: &BinaryPruneFilter<'_>) -> bool {
+        true
+    }
+
+    fn can_rule_out_values(&self) -> bool {
+        false
     }
 }
 
@@ -409,6 +417,14 @@ impl StructuralPageScheduler for BlobPageScheduler {
         }
 
         Ok(page_load_tasks)
+    }
+
+    fn may_contain_any(&self, _values: &BinaryPruneFilter<'_>) -> bool {
+        true
+    }
+
+    fn can_rule_out_values(&self) -> bool {
+        false
     }
 }
 

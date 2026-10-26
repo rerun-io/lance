@@ -19,9 +19,9 @@ use lance_core::deepsize::{Context, DeepSizeOf};
 use lance_encoding::{
     EncodingsIo,
     decoder::{
-        ColumnInfo, DecoderConfig, DecoderPlugins, FilterExpression, PageEncoding, PageInfo,
-        ReadBatchTask, RequestedRows, SchedulerDecoderConfig, schedule_and_decode,
-        schedule_and_decode_blocking,
+        ColumnInfo, CoreFieldDecoderStrategy, DecoderConfig, DecoderPlugins, FilterExpression,
+        PageEncoding, PageInfo, ReadBatchTask, RequestedRows, SchedulerDecoderConfig,
+        schedule_and_decode, schedule_and_decode_blocking,
     },
     encoder::EncodedBatch,
     version::LanceFileVersion,
@@ -2167,6 +2167,55 @@ impl FileReadCore {
         self.metadata_provider.schema()
     }
 
+    async fn column_info(&self, column_index: u32) -> Result<Arc<ColumnInfo>> {
+        match &self.metadata_provider {
+            FileMetadataProvider::Full(metadata) => metadata
+                .column_infos
+                .get(column_index as usize)
+                .cloned()
+                .ok_or_else(|| {
+                    Error::invalid_input(format!(
+                        "column index {} is out of bounds (file has {} columns)",
+                        column_index,
+                        metadata.column_infos.len()
+                    ))
+                }),
+            FileMetadataProvider::Indexed(metadata_index) => {
+                let mut column_infos = FileMetadataProvider::load_indexed_column_infos(
+                    metadata_index,
+                    &self.scheduler,
+                    &self.cache,
+                    &[column_index],
+                )
+                .await?;
+                column_infos.pop().ok_or_else(|| {
+                    Error::internal(format!(
+                        "lazy metadata loader returned nothing for column index {}",
+                        column_index
+                    ))
+                })
+            }
+        }
+    }
+
+    async fn rows_that_may_contain_any(
+        &self,
+        field: &Field,
+        column_index: u32,
+        values: &[&[u8]],
+    ) -> Result<Option<Vec<Range<u64>>>> {
+        let column_info = self.column_info(column_index).await?;
+        CoreFieldDecoderStrategy::from_decoder_config(&self.options.decoder_config)
+            .rows_that_may_contain_any(
+                field,
+                &column_info,
+                values,
+                self.scheduler.clone(),
+                self.cache.clone(),
+            )
+            .await
+    }
+
     async fn read_global_buffer(&self, index: u32) -> Result<Bytes> {
         let file_buffers = self.metadata_provider.file_buffers();
         let buffer_desc = file_buffers.get(index as usize).ok_or_else(|| {
@@ -2533,6 +2582,20 @@ impl ProjectedFileReader {
     /// Returns file statistics when this reader has full file metadata.
     pub fn file_statistics(&self) -> Option<FileStatistics> {
         self.core.metadata_provider.file_statistics()
+    }
+
+    /// The rows of `field`, stored in the column at `column_index`, that may hold any of `values`.
+    ///
+    /// See [`CoreFieldDecoderStrategy::rows_that_may_contain_any`].
+    pub async fn rows_that_may_contain_any(
+        &self,
+        field: &Field,
+        column_index: u32,
+        values: &[&[u8]],
+    ) -> Result<Option<Vec<Range<u64>>>> {
+        self.core
+            .rows_that_may_contain_any(field, column_index, values)
+            .await
     }
 
     #[cfg(test)]
@@ -3588,6 +3651,128 @@ mod tests {
         let actual = collect_read_tasks(tasks, 16).await;
 
         assert_eq!(expected, actual);
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn test_rows_that_may_contain_any(#[values(false, true)] is_indexed: bool) {
+        let fs = FsFixture::default();
+        let schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("id", DataType::Utf8, false),
+            Field::new("n", DataType::Int32, false),
+        ]));
+        // Each batch becomes its own dictionary-encoded page of `id`.
+        let batches = [["seg-a", "seg-b"], ["seg-c", "seg-c"], ["seg-a", "seg-a"]]
+            .into_iter()
+            .map(|values| {
+                let ids =
+                    arrow_array::StringArray::from_iter_values((0..1000).map(|i| values[i % 2]));
+                RecordBatch::try_new(
+                    schema.clone(),
+                    vec![Arc::new(ids), Arc::new(Int32Array::from(vec![7; 1000]))],
+                )
+                .unwrap()
+            })
+            .collect::<Vec<_>>();
+        let written_file = write_lance_file(
+            RecordBatchIterator::new(batches.into_iter().map(Ok), schema),
+            &fs,
+            FileWriterOptions {
+                data_cache_bytes: Some(1),
+                format_version: Some(LanceFileVersion::V2_1),
+                ..Default::default()
+            },
+        )
+        .await;
+
+        let file_scheduler = fs
+            .scheduler
+            .open_file(&fs.tmp_path, &CachedFileSize::unknown())
+            .await
+            .unwrap();
+        let id_projection = ReaderProjection::from_column_names(
+            LanceFileVersion::V2_1,
+            &written_file.schema,
+            &["id"],
+        )
+        .unwrap();
+        let cache = test_cache();
+        let reader = if is_indexed {
+            ProjectedFileReader::try_open(
+                file_scheduler,
+                Some(id_projection.clone()),
+                Arc::<DecoderPlugins>::default(),
+                &cache,
+                FileReaderOptions::default(),
+            )
+            .await
+            .unwrap()
+        } else {
+            let file_metadata = FileReader::read_all_metadata(&file_scheduler)
+                .await
+                .unwrap();
+            ProjectedFileReader::try_open_with_file_metadata(
+                Arc::new(crate::io::LanceEncodingsIo::new(file_scheduler)),
+                fs.tmp_path.clone(),
+                None,
+                Arc::<DecoderPlugins>::default(),
+                Arc::new(file_metadata),
+                &cache,
+                FileReaderOptions::default(),
+            )
+            .await
+            .unwrap()
+        };
+
+        let column_index = |name: &str| {
+            let field_id = written_file.schema.field(name).unwrap().id as u32;
+            written_file
+                .field_id_mapping
+                .iter()
+                .find(|(id, _)| *id == field_id)
+                .unwrap()
+                .1
+        };
+        let id_field = written_file.schema.field("id").unwrap();
+        let rows = |values: &'static [&'static str]| {
+            let values = values.iter().map(|v| v.as_bytes()).collect::<Vec<_>>();
+            let reader = &reader;
+            let column_index = column_index("id");
+            async move {
+                reader
+                    .rows_that_may_contain_any(id_field, column_index, &values)
+                    .await
+                    .unwrap()
+            }
+        };
+        assert_eq!(rows(&["seg-c"]).await, Some(vec![1000..2000]));
+        assert_eq!(rows(&["seg-a"]).await, Some(vec![0..1000, 2000..3000]));
+        assert_eq!(rows(&["missing"]).await, Some(vec![]));
+
+        // A read of the column afterwards takes its page metadata from the cache.
+        let stats_before_read = cache.stats().await;
+        let tasks = reader
+            .read_tasks(
+                lance_io::ReadBatchParams::RangeFull,
+                1024,
+                Some(id_projection),
+                FilterExpression::no_filter(),
+            )
+            .await
+            .unwrap();
+        let batches = collect_read_tasks(tasks, 16).await;
+        assert_eq!(batches.iter().map(|b| b.num_rows()).sum::<usize>(), 3000);
+        let stats_after_read = cache.stats().await;
+        assert!(stats_after_read.hits > stats_before_read.hits);
+        assert_eq!(stats_after_read.misses, stats_before_read.misses);
+
+        // Only string and binary columns can be checked.
+        let n_field = written_file.schema.field("n").unwrap();
+        let n_rows = reader
+            .rows_that_may_contain_any(n_field, column_index("n"), &[b"7".as_slice()])
+            .await
+            .unwrap();
+        assert_eq!(n_rows, None);
     }
 
     #[tokio::test]

@@ -212,7 +212,7 @@
 //!  * The "batch overhead" is very small in Lance compared to other formats because it has no
 //!    relation to the way the data is stored.
 
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{LazyLock, Once, OnceLock};
 use std::{ops::Range, sync::Arc};
@@ -617,6 +617,49 @@ impl CoreFieldDecoderStrategy {
             decompressor_strategy: Arc::new(DefaultDecompressionStrategy {}),
             cache_repetition_index: config.cache_repetition_index,
         }
+    }
+
+    /// The rows of the column that may hold any of `values`, as sorted, non-overlapping ranges.
+    ///
+    /// Pages whose dictionary has none of `values` are left out. `None` when the column can't
+    /// be checked: it is not a string or binary column, not in a 2.1+ file, or has no
+    /// dictionary-encoded pages.
+    pub async fn rows_that_may_contain_any(
+        &self,
+        field: &Field,
+        column_info: &ColumnInfo,
+        values: &[&[u8]],
+        io: Arc<dyn EncodingsIo>,
+        cache: Arc<LanceCache>,
+    ) -> Result<Option<Vec<Range<u64>>>> {
+        let is_byte_like = matches!(
+            field.data_type(),
+            DataType::Utf8 | DataType::LargeUtf8 | DataType::Binary | DataType::LargeBinary
+        );
+        if !is_byte_like || !column_info.is_structural() {
+            return Ok(None);
+        }
+        let mut scheduler = StructuralPrimitiveFieldScheduler::try_new(
+            column_info,
+            self.decompressor_strategy.as_ref(),
+            self.cache_repetition_index,
+            field,
+        )?;
+        // Avoid loading page metadata for a column that can't rule anything out.
+        if !scheduler.can_rule_out_values() {
+            return Ok(None);
+        }
+
+        // Loads page metadata through the cache like a read does, so a read that follows reuses it.
+        scheduler
+            .initialize(
+                &FilterExpression::no_filter(),
+                &SchedulerContext::new(io, cache),
+            )
+            .await?;
+
+        let values_filter = BinaryPruneFilter::new(values);
+        Ok(Some(scheduler.rows_that_may_contain_any(&values_filter)))
     }
 
     /// This is just a sanity check to ensure there is no "wrapped encodings"
@@ -1049,6 +1092,31 @@ impl CoreFieldDecoderStrategy {
             }
             // TODO: Still need support for RLE
             _ => todo!(),
+        }
+    }
+}
+
+pub(crate) enum BinaryPruneFilter<'a> {
+    Short(&'a [&'a [u8]]),
+    Long(HashSet<&'a [u8]>),
+}
+
+impl<'a> BinaryPruneFilter<'a> {
+    /// Lists longer than this get collected into a HashSet.
+    const SHORT_SCAN_MAX_VALUES: usize = 8;
+
+    pub fn new(values: &'a [&'a [u8]]) -> Self {
+        if values.len() > Self::SHORT_SCAN_MAX_VALUES {
+            Self::Long(values.iter().copied().collect())
+        } else {
+            Self::Short(values)
+        }
+    }
+
+    pub fn contains(&self, entry: &[u8]) -> bool {
+        match self {
+            Self::Short(values) => values.contains(&entry),
+            Self::Long(values) => values.contains(entry),
         }
     }
 }
