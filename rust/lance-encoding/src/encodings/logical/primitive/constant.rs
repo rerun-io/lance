@@ -18,7 +18,7 @@ use lance_core::{
 use crate::{
     EncodingsIo,
     buffer::LanceBuffer,
-    decoder::PageEncoding,
+    decoder::{BinaryPruneFilter, PageEncoding},
     encoder::EncodedPage,
     encodings::logical::primitive::{CachedPageData, PageLoadTask},
     format::ProtobufUtils21,
@@ -311,6 +311,14 @@ impl crate::encodings::logical::primitive::StructuralPageScheduler for ConstantP
             decoder_fut: std::future::ready(Ok(decoder)).boxed(),
             num_rows,
         }])
+    }
+
+    fn may_contain_any(&self, _values: &BinaryPruneFilter<'_>) -> bool {
+        true
+    }
+
+    fn can_rule_out_values(&self) -> bool {
+        false
     }
 }
 
