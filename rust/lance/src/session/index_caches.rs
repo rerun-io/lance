@@ -10,7 +10,11 @@
 //!     │    │
 //!     └────┴──► Index-specific cache (prefixed by index UUID and FRI UUID)
 
-use std::{borrow::Cow, ops::Deref, sync::Arc};
+use std::{
+    borrow::Cow,
+    ops::Deref,
+    sync::{Arc, Weak},
+};
 
 use crate::dataset::optimize::IndexRemapMode;
 use lance_core::cache::{CacheKey, CacheKeySchema, KeyBuilder, LanceCache};
@@ -192,6 +196,57 @@ impl CacheKey for IndexMetadataKey<'_> {
 
     fn codec() -> Option<lance_core::cache::CacheCodec> {
         Some(lance_table::format::index_metadata_codec())
+    }
+}
+
+/// An index list with its fragment bitmaps remapped through the fragment reuse index.
+pub struct RemappedIndexMetadata {
+    pub indices: Arc<Vec<IndexMetadata>>,
+    /// The list it was remapped from. An entry only applies while that exact list is the cached
+    /// one, since it can be replaced for the same version; the `Weak` keeps its address from
+    /// being reused.
+    pub source: Weak<Vec<IndexMetadata>>,
+}
+
+impl DeepSizeOf for RemappedIndexMetadata {
+    fn deep_size_of_children(&self, context: &mut Context) -> usize {
+        self.indices.deep_size_of_children(context)
+    }
+}
+
+/// The manifest's index list as translated through one fragment reuse index.
+#[derive(Clone, Copy, Debug)]
+pub struct RemappedIndexMetadataKey<'a> {
+    pub version: u64,
+    pub store_identity: &'a str,
+    pub frag_reuse_uuid: &'a Uuid,
+}
+
+impl CacheKey for RemappedIndexMetadataKey<'_> {
+    type ValueType = RemappedIndexMetadata;
+
+    fn key(&self) -> Cow<'_, str> {
+        Cow::Owned(format!(
+            "{}:{}/{}/remapped/{}",
+            self.store_identity.len(),
+            self.store_identity,
+            self.version,
+            self.frag_reuse_uuid
+        ))
+    }
+
+    fn type_name() -> &'static str {
+        "RemappedIndexMetadata"
+    }
+
+    fn schema() -> CacheKeySchema {
+        CacheKeySchema::new("lance.index.metadata-remapped-key", 1)
+    }
+
+    fn write_key(&self, builder: &mut KeyBuilder) {
+        builder.write_str(self.store_identity);
+        builder.write_u64(self.version);
+        builder.write_fixed_bytes(self.frag_reuse_uuid.as_bytes());
     }
 }
 
