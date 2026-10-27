@@ -82,7 +82,8 @@ pub struct FragmentUpdateColumnsResult {
     pub matched_offsets: RoaringBitmap,
 }
 
-/// A Fragment of a Lance [`Dataset`].
+/// A [`Fragment`] from the manifest, paired with the [`Dataset`] it belongs to
+/// so its data files can be opened.
 ///
 /// The interface is modeled after `pyarrow.dataset.Fragment`.
 #[derive(Debug, Clone)]
@@ -710,6 +711,29 @@ pub struct FragReadConfig {
     pub file_reader_options: Option<FileReaderOptions>,
 }
 
+/// What a read needs to know about one data file before opening it: which of
+/// its fields are projected and which physical columns they map to.
+#[derive(Debug)]
+struct FileOpenState {
+    /// The dataset schema restricted to the fields the file holds.
+    data_file_schema: Arc<Schema>,
+    /// `data_file_schema` further restricted to the read projection.
+    schema_per_file: Arc<Schema>,
+    /// Field id to physical column index in the file, for every field that has a column.
+    field_id_to_column_idx: Arc<BTreeMap<u32, u32>>,
+    /// Physical columns to read for `schema_per_file`; `None` for legacy files
+    /// and for files with no projected fields.
+    reader_projection: Option<ReaderProjection>,
+}
+
+impl FileOpenState {
+    fn reader_projection(&self) -> Result<ReaderProjection> {
+        self.reader_projection
+            .clone()
+            .ok_or_else(|| Error::internal("no reader projection for this data file"))
+    }
+}
+
 impl FragReadConfig {
     pub fn with_row_id(mut self, value: bool) -> Self {
         self.with_row_id = value;
@@ -1058,6 +1082,51 @@ impl FileFragment {
             .await
     }
 
+    /// Projection-derived state for opening `data_file`.
+    fn file_open_state(
+        &self,
+        data_file: &DataFile,
+        projection: Option<&Schema>,
+    ) -> Result<FileOpenState> {
+        let full_schema = self.dataset.schema();
+        // The data file may contain fields that are not part of the dataset any longer, remove those
+        let data_file_schema = Arc::new(data_file.schema(full_schema));
+        let projection = projection.unwrap_or(full_schema);
+        // Also remove any fields that are not part of the user's provided projection
+        let schema_per_file =
+            Arc::new(projection.intersection_ignore_types(data_file_schema.as_ref())?);
+        let field_id_to_column_idx = Arc::new(BTreeMap::from_iter(
+            data_file
+                .fields
+                .iter()
+                .copied()
+                .zip(data_file.column_indices.iter().copied())
+                .filter_map(|(field_id, column_index)| {
+                    if column_index < 0 {
+                        None
+                    } else {
+                        Some((field_id as u32, column_index as u32))
+                    }
+                }),
+        ));
+        let reader_projection = if data_file.is_legacy_file() || schema_per_file.fields.is_empty() {
+            None
+        } else {
+            let file_version: LanceFileVersion = data_file.file_version()?.into();
+            Some(ReaderProjection::from_field_ids(
+                file_version,
+                schema_per_file.as_ref(),
+                field_id_to_column_idx.as_ref(),
+            )?)
+        };
+        Ok(FileOpenState {
+            data_file_schema,
+            schema_per_file,
+            field_id_to_column_idx,
+            reader_projection,
+        })
+    }
+
     fn open_reader_impl<'a>(
         &'a self,
         data_file: &'a DataFile,
@@ -1066,13 +1135,8 @@ impl FileFragment {
         metadata_mode: MetadataMode,
     ) -> BoxFuture<'a, Result<Option<Box<dyn GenericFileReader>>>> {
         async move {
-            let full_schema = self.dataset.schema();
-            // The data file may contain fields that are not part of the dataset any longer, remove those
-            let data_file_schema = Arc::new(data_file.schema(full_schema));
-            let projection = projection.unwrap_or(full_schema);
-            // Also remove any fields that are not part of the user's provided projection
-            let schema_per_file =
-                Arc::new(projection.intersection_ignore_types(data_file_schema.as_ref())?);
+            let open_state = self.file_open_state(data_file, projection)?;
+            let schema_per_file = open_state.schema_per_file.clone();
 
             if data_file.is_legacy_file() {
                 let max_field_id = data_file.fields.iter().max().unwrap();
@@ -1143,26 +1207,9 @@ impl FileFragment {
                     .await?;
                 let path = file_scheduler.reader().path().clone();
                 let metadata_cache = self.dataset.metadata_cache.file_metadata_cache(&path);
-                let field_id_to_column_idx = Arc::new(BTreeMap::from_iter(
-                    data_file
-                        .fields
-                        .iter()
-                        .copied()
-                        .zip(data_file.column_indices.iter().copied())
-                        .filter_map(|(field_id, column_index)| {
-                            if column_index < 0 {
-                                None
-                            } else {
-                                Some((field_id as u32, column_index as u32))
-                            }
-                        }),
-                ));
+                let field_id_to_column_idx = open_state.field_id_to_column_idx.clone();
                 let file_version: LanceFileVersion = data_file.file_version()?.into();
-                let reader_projection = ReaderProjection::from_field_ids(
-                    file_version,
-                    schema_per_file.as_ref(),
-                    field_id_to_column_idx.as_ref(),
-                )?;
+                let reader_projection = open_state.reader_projection()?;
                 let file_reader_options = read_config
                     .file_reader_options
                     .clone()
@@ -1177,7 +1224,7 @@ impl FileFragment {
                     let known_schema = self
                         .metadata
                         .physical_rows
-                        .map(|num_rows| (data_file_schema.clone(), num_rows as u64));
+                        .map(|num_rows| (open_state.data_file_schema.clone(), num_rows as u64));
                     let metadata_index = self
                         .get_file_metadata_index(&file_scheduler, known_schema)
                         .await?;
