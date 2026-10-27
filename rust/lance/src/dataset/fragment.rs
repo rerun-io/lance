@@ -2432,12 +2432,17 @@ impl From<FileFragment> for Fragment {
 }
 
 /// Equals `projection.intersection_ignore_types(&data_file.schema(full_schema))`, but only clones
-/// the top-level fields `projection` can match: the intersection drops every other top-level field.
+/// the top-level fields that are in the data file and that `projection` can match: projecting by
+/// ids drops the former, the intersection the latter.
 fn data_file_projection(
     full_schema: &Schema,
     data_file: &DataFile,
     projection: &Schema,
 ) -> Result<Schema> {
+    fn in_file(field: &lance_core::datatypes::Field, file_ids: &HashSet<i32>) -> bool {
+        file_ids.contains(&field.id) || field.children.iter().any(|c| in_file(c, file_ids))
+    }
+    let file_ids: HashSet<i32> = data_file.fields.iter().copied().collect();
     let projected_names: HashSet<&str> = projection
         .fields
         .iter()
@@ -2447,6 +2452,7 @@ fn data_file_projection(
         fields: full_schema
             .fields
             .iter()
+            .filter(|field| in_file(field, &file_ids))
             .filter(|field| {
                 // `Schema::field` parses its argument as a field path; a name without quotes or
                 // dots is a single segment, matched exactly against top-level names.
