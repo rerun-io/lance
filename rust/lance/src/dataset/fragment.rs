@@ -6602,12 +6602,39 @@ mod tests {
         ));
         assert_eq!(cache.num_entries(), 1);
 
+        // Equal layout arrays at other addresses hit the same entry.
+        let equal_by_value = layout_variant(&data_file, 0);
+        assert!(!Arc::ptr_eq(
+            &equal_by_value.column_indices,
+            &data_file.column_indices
+        ));
+        let third = fragment
+            .file_open_state(&equal_by_value, Some(projection.as_ref()), &config)
+            .unwrap();
+        assert!(Arc::ptr_eq(&first, &third));
+        assert_eq!(cache.num_entries(), 1);
+
+        // The file version alone makes another layout, even when it decodes to the
+        // same `LanceFileVersion`: (0, 3) is V2.0 like (2, 0).
+        let mut other_version = data_file.clone();
+        other_version.file_major_version = 0;
+        other_version.file_minor_version = 3;
+        let fourth = fragment
+            .file_open_state(&other_version, Some(projection.as_ref()), &config)
+            .unwrap();
+        assert!(!Arc::ptr_eq(&first, &fourth));
+        assert!(same_state(
+            &fourth,
+            &uncached_state(&fragment, &other_version, &projection)
+        ));
+        assert_eq!(cache.num_entries(), 2);
+
         // Two opens that both missed insert the same layout; the second gets the first's entry.
         let a = uncached_state(&fragment, &layout_variant(&data_file, 1), &projection);
         let b = uncached_state(&fragment, &layout_variant(&data_file, 1), &projection);
         assert!(Arc::ptr_eq(&cache.insert(a.clone()), &a));
         assert!(Arc::ptr_eq(&cache.insert(b), &a));
-        assert_eq!(cache.num_entries(), 2);
+        assert_eq!(cache.num_entries(), 3);
     }
 
     #[tokio::test]
