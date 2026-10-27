@@ -2130,10 +2130,12 @@ impl FileReadCore {
         if let Some(base_projection) = base_projection.as_ref() {
             metadata_provider.validate_projection(base_projection)?;
         }
-        let base_projection = base_projection.unwrap_or(ReaderProjection::from_whole_schema(
-            metadata_provider.schema().as_ref(),
-            metadata_provider.version(),
-        ));
+        let base_projection = base_projection.unwrap_or_else(|| {
+            ReaderProjection::from_whole_schema(
+                metadata_provider.schema().as_ref(),
+                metadata_provider.version(),
+            )
+        });
         Ok(Self {
             scheduler,
             base_projection,
