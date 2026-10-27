@@ -3849,7 +3849,9 @@ mod tests {
     }
 
     /// Fragments of a scan share one set of read schemas and one reader-open
-    /// cache, which holds one entry per distinct data-file layout
+    /// cache, which holds one entry per distinct data-file layout. A scan whose
+    /// indexed and unindexed fragments need different filter columns plans two read
+    /// projections and so carries two of each.
     #[tokio::test]
     async fn test_fragments_share_open_cache() {
         let fixture = TestFixture::new().await;
@@ -3895,6 +3897,41 @@ mod tests {
         assert_eq!(num_rows, 175);
         // Fragment 0 has all five columns; fragments 2 and 3 were appended with three
         assert_eq!(schemas.open_cache.num_entries(), 2);
+
+        // `partly_indexed` is indexed on fragment 0 only (fragment 1 was deleted), so
+        // fragment 0 rereads just the refine filter's column while fragments 2 and 3
+        // read both filter columns.
+        let filter_plan = fixture
+            .filter_plan("partly_indexed < 50 AND not_indexed % 3 = 0", true)
+            .await;
+        let options =
+            FilteredReadOptions::basic_full_read(&fixture.dataset).with_filter_plan(filter_plan);
+        let index_input = fixture.index_input(&options).await;
+        let read = FilteredReadExec::try_new(fixture.dataset.clone(), options.clone(), index_input)
+            .unwrap();
+        read.get_or_create_plan(Arc::new(TaskContext::default()))
+            .await
+            .unwrap();
+        let scoped = FilteredReadStream::plan_to_scoped_fragments(
+            read.plan.get().unwrap(),
+            fixture.dataset.fragments(),
+            &fixture.dataset,
+            &options,
+            FilteredReadStream::make_scan_scheduler(&fixture.dataset, &options),
+        )
+        .unwrap();
+        assert_eq!(scoped.len(), 3);
+        let distinct_schemas: HashSet<*const FragmentReadSchemas> =
+            scoped.iter().map(|s| Arc::as_ptr(&s.schemas)).collect();
+        assert_eq!(distinct_schemas.len(), 2);
+        let distinct_caches: HashSet<*const FragmentOpenCache> = scoped
+            .iter()
+            .map(|s| Arc::as_ptr(&s.schemas.open_cache))
+            .collect();
+        assert_eq!(distinct_caches.len(), 2);
+        fixture
+            .test_plan(options, &UInt32Array::from_iter_values((0..50).step_by(3)))
+            .await;
     }
 
     /// Fragments that share a filter share its `Arc` and one planned physical
@@ -6196,15 +6233,63 @@ mod tests {
         }
     }
 
-    /// After schema evolution a scan reads fragments of several layouts: two data
-    /// files per fragment (an added column), field ids of a dropped column still in old
-    /// files, and appended single-file fragments. Reads through the open cache must
-    /// return exactly the rows and values that were written.
+    /// Sorted values of an `Int32` column
+    fn sorted_i32(column: &dyn Array) -> Vec<i32> {
+        let mut values: Vec<i32> = column
+            .as_primitive::<arrow::datatypes::Int32Type>()
+            .values()
+            .to_vec();
+        values.sort_unstable();
+        values
+    }
+
+    /// After schema evolution a scan reads fragments of several layouts: add-on data
+    /// files for added and cast columns, field ids of dropped columns still in old
+    /// files, a column re-added under a dropped name, an all-null column stored in no
+    /// file, appended single-file fragments and deleted rows. Reads through the open
+    /// cache must return exactly the rows and values that were written, for every
+    /// projection.
     #[tokio::test]
     async fn test_filtered_read_across_evolved_layouts() {
-        use crate::dataset::{NewColumnTransform, WriteMode, WriteParams};
-        use arrow::datatypes::Int32Type;
-        use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
+        use crate::dataset::{ColumnAlteration, NewColumnTransform, WriteMode, WriteParams};
+        use arrow::datatypes::{Int32Type, Int64Type};
+        use arrow_array::{Int64Array, StructArray};
+        use arrow_schema::{
+            DataType, Field as ArrowField, Fields as ArrowFields, Schema as ArrowSchema,
+        };
+
+        /// Rows `range` of the evolved table, shaped like `schema` at that point
+        fn evolved_batch(schema: &Arc<ArrowSchema>, range: Range<i32>) -> RecordBatch {
+            let columns = schema
+                .fields()
+                .iter()
+                .map(|field| -> ArrayRef {
+                    match (field.name().as_str(), field.data_type()) {
+                        ("i", _) => Arc::new(Int32Array::from_iter_values(range.clone())),
+                        ("s", DataType::Struct(fields)) => Arc::new(StructArray::new(
+                            fields.clone(),
+                            vec![
+                                Arc::new(Int32Array::from_iter_values(range.clone())),
+                                Arc::new(Int32Array::from_iter_values(range.clone().map(|i| -i))),
+                            ],
+                            None,
+                        )),
+                        ("double", DataType::Int32) => {
+                            Arc::new(Int32Array::from_iter_values(range.clone().map(|i| i * 2)))
+                        }
+                        ("double", DataType::Int64) => Arc::new(Int64Array::from_iter_values(
+                            range.clone().map(|i| i as i64 * 2),
+                        )),
+                        ("n", _) => Arc::new(Int32Array::from_iter_values(range.clone())),
+                        ("dropped", _) => {
+                            Arc::new(Int32Array::from_iter_values(range.clone().map(|i| i + 3)))
+                        }
+                        (name, data_type) => panic!("unexpected field {name}: {data_type}"),
+                    }
+                })
+                .collect();
+            RecordBatch::try_new(schema.clone(), columns).unwrap()
+        }
 
         let tmp = TempStrDir::default();
         let write_params = |mode| WriteParams {
@@ -6212,23 +6297,27 @@ mod tests {
             mode,
             ..Default::default()
         };
-        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
-            "i",
-            DataType::Int32,
-            false,
-        )]));
-        let batch = RecordBatch::try_new(
-            schema.clone(),
-            vec![Arc::new(Int32Array::from_iter_values(0..400))],
-        )
-        .unwrap();
+        let schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("i", DataType::Int32, false),
+            ArrowField::new(
+                "s",
+                DataType::Struct(ArrowFields::from(vec![
+                    ArrowField::new("a", DataType::Int32, false),
+                    ArrowField::new("b", DataType::Int32, false),
+                ])),
+                false,
+            ),
+        ]));
         let mut dataset = Dataset::write(
-            RecordBatchIterator::new(vec![Ok(batch)], schema),
+            RecordBatchIterator::new(vec![Ok(evolved_batch(&schema, 0..400))], schema),
             &tmp,
             Some(write_params(WriteMode::Create)),
         )
         .await
         .unwrap();
+
+        // Computed columns land in a second data file per fragment; an all-null column
+        // lands in no file at all.
         dataset
             .add_columns(
                 NewColumnTransform::SqlExpressions(vec![
@@ -6240,29 +6329,76 @@ mod tests {
             )
             .await
             .unwrap();
+        dataset
+            .add_columns(
+                NewColumnTransform::AllNulls(Arc::new(ArrowSchema::new(vec![ArrowField::new(
+                    "n",
+                    DataType::Int32,
+                    true,
+                )]))),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
         dataset.drop_columns(&["dropped"]).await.unwrap();
 
+        // Appended fragments hold every live column in one file.
         let schema = Arc::new(ArrowSchema::from(dataset.schema()));
-        let batch = RecordBatch::try_new(
-            schema.clone(),
-            vec![
-                Arc::new(Int32Array::from_iter_values(400..600)),
-                Arc::new(Int32Array::from_iter_values((400..600).map(|i| i * 2))),
-            ],
-        )
-        .unwrap();
-        let dataset = Dataset::write(
-            RecordBatchIterator::new(vec![Ok(batch)], schema),
+        let mut dataset = Dataset::write(
+            RecordBatchIterator::new(vec![Ok(evolved_batch(&schema, 400..600))], schema),
             &tmp,
             Some(write_params(WriteMode::Append)),
         )
         .await
         .unwrap();
-        assert!(dataset.fragments().iter().any(|f| f.files.len() == 2));
-        assert!(dataset.fragments().iter().any(|f| f.files.len() == 1));
 
-        let expected: Vec<i32> = (0..600).filter(|i| i % 7 == 0).collect();
-        for projection in [vec!["i", "double"], vec!["double"]] {
+        // A cast rewrites `double` under a new field id into another add-on file, and
+        // the dropped name comes back under a new field id too.
+        dataset
+            .alter_columns(&[ColumnAlteration::new("double".into()).cast_to(DataType::Int64)])
+            .await
+            .unwrap();
+        dataset
+            .add_columns(
+                NewColumnTransform::SqlExpressions(vec![("dropped".into(), "i + 3".into())]),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+
+        let schema = Arc::new(ArrowSchema::from(dataset.schema()));
+        let mut dataset = Dataset::write(
+            RecordBatchIterator::new(vec![Ok(evolved_batch(&schema, 600..700))], schema),
+            &tmp,
+            Some(write_params(WriteMode::Append)),
+        )
+        .await
+        .unwrap();
+        dataset.delete("i % 50 = 0").await.unwrap();
+
+        // The cast leaves the first add-on file with no live field, and it is pruned,
+        // so the first six fragments all have three files of two different sets of
+        // layouts while the last has one.
+        let files_per_fragment: Vec<usize> =
+            dataset.fragments().iter().map(|f| f.files.len()).collect();
+        assert_eq!(files_per_fragment, vec![3, 3, 3, 3, 3, 3, 1]);
+        let main_file_fields: HashSet<&[i32]> = dataset
+            .fragments()
+            .iter()
+            .map(|f| f.files[0].fields.as_ref())
+            .collect();
+        assert_eq!(main_file_fields.len(), 3);
+
+        let expected: Vec<i32> = (0..700).filter(|i| i % 7 == 0 && i % 50 != 0).collect();
+        for projection in [
+            vec!["i", "s", "double", "n", "dropped"],
+            vec!["double"],
+            vec!["dropped"],
+            vec!["s.a"],
+            vec!["n"],
+        ] {
             let batch = dataset
                 .scan()
                 .project(&projection)
@@ -6272,21 +6408,233 @@ mod tests {
                 .try_into_batch()
                 .await
                 .unwrap();
-            let double = batch["double"].as_primitive::<Int32Type>();
-            let mut doubles: Vec<i32> = double.values().to_vec();
-            doubles.sort_unstable();
             assert_eq!(
-                doubles,
-                expected.iter().map(|i| i * 2).collect::<Vec<_>>(),
+                batch.num_rows(),
+                expected.len(),
                 "projection {projection:?}"
             );
-            if projection.contains(&"i") {
-                let i = batch["i"].as_primitive::<Int32Type>();
-                assert!(
-                    i.values()
-                        .iter()
-                        .zip(double.values())
-                        .all(|(i, d)| i * 2 == *d)
+            for (field, column) in batch.schema().fields().iter().zip(batch.columns()) {
+                match field.name().as_str() {
+                    "i" | "s.a" => assert_eq!(sorted_i32(column), expected),
+                    "double" => {
+                        let mut doubles: Vec<i64> =
+                            column.as_primitive::<Int64Type>().values().to_vec();
+                        doubles.sort_unstable();
+                        let expected: Vec<i64> = expected.iter().map(|i| *i as i64 * 2).collect();
+                        assert_eq!(doubles, expected, "projection {projection:?}");
+                    }
+                    "dropped" => assert_eq!(
+                        sorted_i32(column),
+                        expected.iter().map(|i| i + 3).collect::<Vec<_>>(),
+                        "projection {projection:?}"
+                    ),
+                    "n" => {
+                        let n = column.as_primitive::<Int32Type>();
+                        let mut values: Vec<i32> = n.iter().flatten().collect();
+                        values.sort_unstable();
+                        let (nulls, filled): (Vec<i32>, Vec<i32>) =
+                            expected.iter().partition(|i| **i < 400);
+                        assert_eq!(n.null_count(), nulls.len(), "projection {projection:?}");
+                        assert_eq!(values, filled, "projection {projection:?}");
+                    }
+                    "s" => {
+                        let s = column.as_struct();
+                        assert_eq!(sorted_i32(s.column_by_name("a").unwrap()), expected);
+                        if let Some(b) = s.column_by_name("b") {
+                            assert_eq!(
+                                sorted_i32(b),
+                                expected.iter().rev().map(|i| -i).collect::<Vec<_>>()
+                            );
+                        }
+                    }
+                    name => panic!("unexpected column {name}"),
+                }
+            }
+            // Columns from different data files of one fragment must line up row by row.
+            if let (Some(i), Some(double), Some(dropped), Some(n)) = (
+                batch.column_by_name("i"),
+                batch.column_by_name("double"),
+                batch.column_by_name("dropped"),
+                batch.column_by_name("n"),
+            ) {
+                let i = i.as_primitive::<Int32Type>();
+                let double = double.as_primitive::<Int64Type>();
+                let dropped = dropped.as_primitive::<Int32Type>();
+                let n = n.as_primitive::<Int32Type>();
+                for row in 0..batch.num_rows() {
+                    assert_eq!(double.value(row), i.value(row) as i64 * 2);
+                    assert_eq!(dropped.value(row), i.value(row) + 3);
+                    assert_eq!(n.is_null(row), i.value(row) < 400);
+                    if !n.is_null(row) {
+                        assert_eq!(n.value(row), i.value(row));
+                    }
+                }
+            }
+        }
+
+        // A projection of system columns only opens no data file for the output
+        let batch = dataset
+            .scan()
+            .project::<&str>(&[])
+            .unwrap()
+            .with_row_id()
+            .filter("i % 7 = 0")
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        assert_eq!(batch.num_rows(), expected.len());
+    }
+
+    /// Fields that span several physical columns or none (blob, packed struct, list,
+    /// fixed-size list) give data files `column_indices` with `-1` entries and extra
+    /// entries. The reader projection the cache derives from them must open every
+    /// layout of the scan, including add-on files.
+    #[tokio::test]
+    async fn test_filtered_read_multi_column_fields_through_open_cache() {
+        use crate::dataset::{NewColumnTransform, WriteMode, WriteParams};
+        use arrow::datatypes::Int32Type;
+        use arrow_array::{
+            FixedSizeListArray, Float32Array, LargeBinaryArray, ListArray, StructArray,
+        };
+        use arrow_schema::{
+            DataType, Field as ArrowField, Fields as ArrowFields, Schema as ArrowSchema,
+        };
+        use lance_arrow::BLOB_META_KEY;
+
+        let packed = ArrowFields::from(vec![
+            ArrowField::new("x", DataType::Int32, false),
+            ArrowField::new("y", DataType::Int32, false),
+        ]);
+        let item = Arc::new(ArrowField::new("item", DataType::Float32, true));
+        let schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("i", DataType::Int32, false),
+            ArrowField::new("blob", DataType::LargeBinary, true).with_metadata(HashMap::from([(
+                BLOB_META_KEY.to_string(),
+                "true".to_string(),
+            )])),
+            ArrowField::new("ps", DataType::Struct(packed.clone()), false).with_metadata(
+                HashMap::from([("lance-encoding:packed".to_string(), "true".to_string())]),
+            ),
+            ArrowField::new("fsl", DataType::FixedSizeList(item.clone(), 2), false),
+            ArrowField::new(
+                "l",
+                DataType::List(Arc::new(ArrowField::new("item", DataType::Int32, true))),
+                false,
+            ),
+        ]));
+        let make_batch = |range: Range<i32>| {
+            let fsl = FixedSizeListArray::try_new(
+                item.clone(),
+                2,
+                Arc::new(Float32Array::from_iter_values(
+                    range.clone().flat_map(|i| [i as f32, -i as f32]),
+                )),
+                None,
+            )
+            .unwrap();
+            let l = ListArray::from_iter_primitive::<Int32Type, _, _>(
+                range.clone().map(|i| Some(vec![Some(i), Some(i * 10)])),
+            );
+            RecordBatch::try_new(
+                schema.clone(),
+                vec![
+                    Arc::new(Int32Array::from_iter_values(range.clone())),
+                    Arc::new(LargeBinaryArray::from_iter_values(
+                        range.clone().map(|i| i.to_le_bytes()),
+                    )),
+                    Arc::new(StructArray::new(
+                        packed.clone(),
+                        vec![
+                            Arc::new(Int32Array::from_iter_values(range.clone())),
+                            Arc::new(Int32Array::from_iter_values(range.map(|i| i + 1))),
+                        ],
+                        None,
+                    )),
+                    Arc::new(fsl),
+                    Arc::new(l),
+                ],
+            )
+            .unwrap()
+        };
+        let tmp = TempStrDir::default();
+        let write_params = |mode| WriteParams {
+            max_rows_per_file: 100,
+            mode,
+            ..Default::default()
+        };
+        let mut dataset = Dataset::write(
+            RecordBatchIterator::new(vec![Ok(make_batch(0..300))], schema.clone()),
+            &tmp,
+            Some(write_params(WriteMode::Create)),
+        )
+        .await
+        .unwrap();
+        dataset
+            .add_columns(
+                NewColumnTransform::SqlExpressions(vec![("double".into(), "i * 2".into())]),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        let mut batch = make_batch(300..400);
+        batch = batch
+            .try_with_column(
+                ArrowField::new("double", DataType::Int32, true),
+                Arc::new(Int32Array::from_iter_values((300..400).map(|i| i * 2))),
+            )
+            .unwrap();
+        let dataset = Dataset::write(
+            RecordBatchIterator::new(
+                vec![Ok(batch)],
+                Arc::new(ArrowSchema::from(dataset.schema())),
+            ),
+            &tmp,
+            Some(write_params(WriteMode::Append)),
+        )
+        .await
+        .unwrap();
+
+        let expected: Vec<i32> = (0..400).filter(|i| i % 7 == 0).collect();
+        for projection in [
+            vec!["i", "blob", "ps", "fsl", "l", "double"],
+            vec!["blob"],
+            vec!["ps"],
+            vec!["l", "fsl"],
+            vec!["double"],
+        ] {
+            let batch = dataset
+                .scan()
+                .project(&projection)
+                .unwrap()
+                .filter("i % 7 = 0")
+                .unwrap()
+                .try_into_batch()
+                .await
+                .unwrap();
+            assert_eq!(
+                batch.num_rows(),
+                expected.len(),
+                "projection {projection:?}"
+            );
+            if let Some(ps) = batch.column_by_name("ps") {
+                let x = ps.as_struct().column_by_name("x").unwrap();
+                assert_eq!(sorted_i32(x), expected, "projection {projection:?}");
+            }
+            if let Some(l) = batch.column_by_name("l") {
+                let l = l.as_list::<i32>();
+                let mut firsts: Vec<i32> = (0..l.len())
+                    .map(|row| l.value(row).as_primitive::<Int32Type>().value(0))
+                    .collect();
+                firsts.sort_unstable();
+                assert_eq!(firsts, expected, "projection {projection:?}");
+            }
+            if let Some(double) = batch.column_by_name("double") {
+                assert_eq!(
+                    sorted_i32(double),
+                    expected.iter().map(|i| i * 2).collect::<Vec<_>>(),
+                    "projection {projection:?}"
                 );
             }
         }
