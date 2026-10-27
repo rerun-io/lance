@@ -1382,10 +1382,16 @@ impl FileFragment {
                     .await?
                 } else {
                     let file_metadata = self.get_file_metadata(&file_scheduler).await?;
+                    // Scan opens (the ones carrying an open cache) always read with an explicit
+                    // projection, so they skip building a whole-file one; other opens keep it.
+                    let base_projection = read_config
+                        .open_cache
+                        .is_some()
+                        .then(|| reader_projection.clone());
                     ProjectedFileReader::try_open_with_file_metadata(
                         encodings_io,
                         path.clone(),
-                        None,
+                        base_projection,
                         Arc::<DecoderPlugins>::default(),
                         file_metadata,
                         &metadata_cache,
