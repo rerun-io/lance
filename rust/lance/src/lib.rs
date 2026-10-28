@@ -69,6 +69,11 @@
 //! ```
 //!
 
+// Layouts of deeply nested async state machines (e.g. merge_insert's `execute_uncommitted`)
+// sit at the default query depth limit of 128; under rustc's parallel frontend (`-Zthreads`)
+// the depth is nondeterministic and intermittently overflows it.
+#![recursion_limit = "256"]
+
 use arrow_schema::DataType;
 use dataset::builder::DatasetBuilder;
 pub use lance_core::datatypes;
