@@ -88,6 +88,13 @@ ignore = [
     { id = "RUSTSEC-2024-0449", reason = "`serde_yaml` pulled transitively via datafusion-substrait; serde features not utilized by us" },
     { id = "RUSTSEC-2026-0381", reason = "fixed `webpki-roots` 1.0.10 is under 48 hours old, cannot upgrade due to our release age policy; 0.26.11 comes from hf-hub 0.4 in examples and only re-exports 1.x" },
     { id = "RUSTSEC-2026-0382", reason = "fixed `rustls-webpki` 0.103.16 is under 48 hours old, cannot upgrade due to our release age policy" },
+    # zstd 0.13.3 / zstd-safe 7.2.4 come from arrow-ipc 58, parquet 58 (python) and lance-encoding.
+    # The fixes are only in zstd 0.14.3 / zstd-safe 8.2.0, which arrow 58 cannot use (it requires zstd ^0.13).
+    # arrow-ipc and parquet use only `zstd::bulk`; lance-encoding uses `bulk`, `stream::copy_decode` (a `read::Decoder`) and, in tests, `Encoder::new`.
+    # Remove these when arrow 60+ (zstd 0.14) is adopted.
+    { id = "RUSTSEC-2026-0391", reason = "`zstd` 0.13 via arrow; not exercised, nothing calls the stream `with_context` constructors" },
+    { id = "RUSTSEC-2026-0398", reason = "`zstd-safe` 7.2 via zstd 0.13; not exercised, `Seekable` needs the `seekable` feature, which is off" },
+    { id = "RUSTSEC-2026-0403", reason = "`zstd-safe` 7.2 via zstd 0.13; `legacy` is on, but no consumer uses `stream::write::Decoder`; `bulk` and `read::Decoder` are excluded by the advisory" },
 ]
 # If this is true, then cargo deny will use the git executable to fetch advisory database.
 # If this is false, then it uses a built-in git library.
