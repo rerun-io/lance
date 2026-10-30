@@ -1200,7 +1200,6 @@ mod tests {
             Arc::new(EmptyExec::new(schema.clone())),
             Arc::new(dataset),
             job.params.clone(),
-            Arc::new(std::sync::atomic::AtomicU64::new(0)),
         )
         .unwrap();
 

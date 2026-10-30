@@ -5787,10 +5787,7 @@ mod tests {
             true,
         )]));
         let fragment = dataset.get_fragment(fragment_id as usize).unwrap();
-        let mut updater = fragment
-            .updater(Some(&["i"]), None, None)
-            .await
-            .unwrap();
+        let mut updater = fragment.updater(Some(&["i"]), None, None).await.unwrap();
 
         // Every live row is handed back, so the loop only ends when next() gives up.
         let err = loop {

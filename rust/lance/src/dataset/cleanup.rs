@@ -1607,7 +1607,6 @@ mod tests {
     };
 
     use super::*;
-    use rstest::rstest;
     use crate::blob::{BlobArrayBuilder, blob_field};
     use crate::index::DatasetIndexExt;
     use crate::{
@@ -1632,6 +1631,7 @@ mod tests {
     use lance_table::io::commit::RenameCommitHandler;
     use lance_testing::datagen::{BatchGenerator, IncrementingInt32, RandomVector, some_batch};
     use mock_instant::thread_local::MockClock;
+    use rstest::rstest;
     use uuid::Uuid;
 
     #[derive(Debug)]
