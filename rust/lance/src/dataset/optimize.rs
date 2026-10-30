@@ -1575,10 +1575,11 @@ pub struct RewriteResult {
     pub row_addrs: Option<Vec<u8>>,
 }
 
+/// Returns the version the reservation committed at; `dataset` is not moved to it.
 async fn reserve_fragment_ids(
     dataset: &Dataset,
     fragments: impl ExactSizeIterator<Item = &mut Fragment>,
-) -> Result<()> {
+) -> Result<u64> {
     let transaction = Transaction::new(
         dataset.manifest.version,
         Operation::ReserveFragments {
@@ -1607,7 +1608,7 @@ async fn reserve_fragment_ids(
         fragment.id = new_id as u64;
     }
 
-    Ok(())
+    Ok(manifest.version)
 }
 
 /// Rewrite the files in a single task.
@@ -2104,13 +2105,14 @@ pub async fn commit_compaction(
     let mut completed_tasks = completed_tasks;
 
     // Single reserve_fragment_ids for all address-style tasks
+    let mut reserved_version = None;
     if has_address_style {
         let frags: Vec<&mut Fragment> = completed_tasks
             .iter_mut()
             .filter(|t| t.row_addrs.is_some())
             .flat_map(|t| t.new_fragments.iter_mut())
             .collect();
-        reserve_fragment_ids(dataset, frags.into_iter()).await?;
+        reserved_version = Some(reserve_fragment_ids(dataset, frags.into_iter()).await?);
     }
 
     let mut rewrite_groups = Vec::with_capacity(completed_tasks.len());
@@ -2257,7 +2259,18 @@ pub async fn commit_compaction(
 
     // No indexed/chain data touched -> no FRI (all-or-nothing, see above).
     let frag_reuse_index = if options.defer_index_remap && any_group_indexed {
-        Some(build_new_frag_reuse_index(dataset, frag_reuse_groups, new_fragment_bitmap).await?)
+        // The rewrite publishes right after the reservation unless another commit lands in
+        // between; an index built in that window is still treated as post-rewrite.
+        let dataset_version = reserved_version.unwrap_or(dataset.manifest.version);
+        Some(
+            build_new_frag_reuse_index(
+                dataset,
+                frag_reuse_groups,
+                new_fragment_bitmap,
+                dataset_version,
+            )
+            .await?,
+        )
     } else {
         if options.defer_index_remap {
             log::debug!(
@@ -4366,7 +4379,7 @@ mod tests {
             ..Default::default()
         };
 
-        let mut compact_read_versions = Vec::new();
+        let mut prepublish_versions = Vec::new();
         for i in 0..10 {
             dataset
                 .delete(&format!("i < {}", 500 * (i + 1)))
@@ -4377,9 +4390,8 @@ mod tests {
                 .await
                 .unwrap();
 
-            // Record the read version for verification if compaction has happened
             if dataset.manifest.version > read_version {
-                compact_read_versions.push(read_version);
+                prepublish_versions.push(dataset.manifest.version - 1);
             }
 
             // Load and verify the fragment reuse index content
@@ -4410,7 +4422,7 @@ mod tests {
                     .iter()
                     .map(|v| v.dataset_version)
                     .collect::<Vec<_>>(),
-                compact_read_versions
+                prepublish_versions
             );
         }
     }

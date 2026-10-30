@@ -161,13 +161,16 @@ pub(crate) async fn open_frag_reuse_index_with_mode(
     ))
 }
 
+/// `dataset_version` is the last version before the rewrite: indexes built at or before it
+/// still need the new reuse version's mappings.
 pub(crate) async fn build_new_frag_reuse_index(
     dataset: &mut Dataset,
     frag_reuse_groups: Vec<FragReuseGroup>,
     new_fragment_bitmap: RoaringBitmap,
+    dataset_version: u64,
 ) -> lance_core::Result<IndexMetadata> {
     let new_version = FragReuseVersion {
-        dataset_version: dataset.manifest.version,
+        dataset_version,
         groups: frag_reuse_groups,
     };
 
@@ -190,13 +193,15 @@ pub(crate) async fn build_new_frag_reuse_index(
         }
     };
 
-    build_frag_reuse_index_metadata(
+    let mut entry = build_frag_reuse_index_metadata(
         dataset,
         index_meta.as_ref(),
         new_index_details,
         new_fragment_bitmap,
     )
-    .await
+    .await?;
+    entry.dataset_version = dataset_version;
+    Ok(entry)
 }
 
 pub(crate) async fn build_frag_reuse_index_metadata(
