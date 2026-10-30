@@ -5788,7 +5788,7 @@ mod tests {
         )]));
         let fragment = dataset.get_fragment(fragment_id as usize).unwrap();
         let mut updater = fragment
-            .updater(Some(&["i"]), None, None, None)
+            .updater(Some(&["i"]), None, None)
             .await
             .unwrap();
 

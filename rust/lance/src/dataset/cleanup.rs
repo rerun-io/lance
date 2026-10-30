@@ -1578,6 +1578,7 @@ mod tests {
     };
 
     use super::*;
+    use rstest::rstest;
     use crate::blob::{BlobArrayBuilder, blob_field};
     use crate::index::DatasetIndexExt;
     use crate::{
