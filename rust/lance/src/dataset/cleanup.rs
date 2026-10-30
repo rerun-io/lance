@@ -312,6 +312,32 @@ struct CleanupInspection {
     tagged_old_versions: HashSet<u64>,
     /// The earliest timestamp of all retained manifests.
     earliest_retained_manifest_time: Option<DateTime<Utc>>,
+    /// The latest timestamp of all manifests that will be removed.
+    latest_deleted_manifest_time: Option<DateTime<Utc>>,
+}
+
+impl CleanupInspection {
+    /// Cutoff for `read_dir_all(..., unmodified_since)`.
+    ///
+    /// Listing only files with `last_modified <= earliest_retained` is valid
+    /// when the working set is a time suffix: every retained version is newer
+    /// than every deleted one. A tagged old version (or any other sparse
+    /// retain) pulls that cutoff backwards, so files from newer deleted
+    /// versions are never listed. Their manifests are still removed, which
+    /// permanently orphans the data files ([#8705](https://github.com/lance-format/lance/issues/8705)).
+    ///
+    /// When a deleted manifest is newer than the earliest retained one, drop
+    /// the cutoff and scan the whole subtree — the same approach already used
+    /// for `_indices/`.
+    fn listing_unmodified_since(&self) -> Option<DateTime<Utc>> {
+        match (
+            self.earliest_retained_manifest_time,
+            self.latest_deleted_manifest_time,
+        ) {
+            (Some(retained), Some(deleted)) if deleted > retained => None,
+            (retained, _) => retained,
+        }
+    }
 }
 
 /// If a file cannot be verified then it will only be deleted if it is at least
@@ -523,17 +549,35 @@ impl<'a> CleanupTask<'a> {
         // ignore it then we might delete valid data files thinking they are not
         // referenced.
 
-        let manifest =
-            read_manifest(&self.dataset.object_store, &location.path, location.size).await?;
+        let manifest_and_indexes = async {
+            let manifest =
+                read_manifest(&self.dataset.object_store, &location.path, location.size).await?;
+            let indexes =
+                read_manifest_indexes(&self.dataset.object_store, &location, &manifest).await?;
+            Ok::<_, Error>((manifest, indexes))
+        }
+        .await;
+        let (manifest, indexes) = match manifest_and_indexes {
+            Ok(manifest_and_indexes) => manifest_and_indexes,
+            Err(error) if location.version < self.read_version && error.is_not_found() => {
+                // Another cleanup may remove an old manifest after this cleanup lists it.
+                // The current manifest is never safe to skip because it anchors our snapshot.
+                debug!(
+                    manifest_version = location.version,
+                    read_version = self.read_version,
+                    manifest_path = %location.path,
+                    "Skipping old manifest removed by concurrent cleanup"
+                );
+                return Ok(());
+            }
+            Err(error) => return Err(error),
+        };
         // Don't delete the latest version, even if it is old. Don't delete tagged versions,
         // regardless of age. Don't delete manifests if their version is newer than the dataset
         // version.  These are either in-progress or newly added since we started.
         let is_latest = self.read_version <= manifest.version;
         let is_tagged = tagged_versions.contains(&manifest.version);
         let in_working_set = is_latest || !self.policy.should_clean(&manifest) || is_tagged;
-        let indexes =
-            read_manifest_indexes(&self.dataset.object_store, &location, &manifest).await?;
-
         let mut inspection = inspection.lock().unwrap();
 
         // Track tagged old versions in case we want to return a `CleanupError` later.
@@ -543,18 +587,19 @@ impl<'a> CleanupTask<'a> {
         }
 
         self.process_manifest(&manifest, &indexes, in_working_set, &mut inspection)?;
+        let commit_ts = manifest.timestamp();
         if !in_working_set {
             inspection
                 .old_manifests
                 .insert(location.path.clone(), manifest.version);
+            match inspection.latest_deleted_manifest_time {
+                Some(ts) if commit_ts <= ts => {}
+                _ => inspection.latest_deleted_manifest_time = Some(commit_ts),
+            }
         } else {
-            let commit_ts = manifest.timestamp();
-            if let Some(ts) = inspection.earliest_retained_manifest_time {
-                if commit_ts < ts {
-                    inspection.earliest_retained_manifest_time = Some(commit_ts);
-                }
-            } else {
-                inspection.earliest_retained_manifest_time = Some(commit_ts);
+            match inspection.earliest_retained_manifest_time {
+                Some(ts) if commit_ts >= ts => {}
+                _ => inspection.earliest_retained_manifest_time = Some(commit_ts),
             }
         }
         Ok(())
@@ -627,11 +672,11 @@ impl<'a> CleanupTask<'a> {
 
         let is_not_found_err = |e: &Error| matches!(e, Error::NotFound { .. });
         // Build stream for a managed subtree
-        let build_listing_stream = |dir: Path| {
+        let build_listing_stream = |dir: Path, unmodified_since| {
             let inspection_ref = &inspection;
             self.dataset
                 .object_store
-                .read_dir_all(&dir, inspection.earliest_retained_manifest_time)
+                .read_dir_all(&dir, unmodified_since)
                 .map_ok(|obj| stream::once(future::ready(Ok(obj))).boxed())
                 .or_else(|e| {
                     // If the directory doesn't exist then we can just return an empty stream.
@@ -658,12 +703,29 @@ impl<'a> CleanupTask<'a> {
         };
 
         // Restrict scanning to Lance-managed subtrees for safety and performance.
+        // Drop the retained-manifest cutoff when a sparse retain (e.g. a tag)
+        // would hide files that belong to newer deleted versions. See
+        // [`CleanupInspection::listing_unmodified_since`].
+        let unmodified_since = inspection.listing_unmodified_since();
+        // Data files owned by no manifest can be newer than the retained
+        // manifest floor. List through the moving verification threshold so
+        // they become candidates once old enough, or list all data files when
+        // the caller explicitly permits deleting unverified files.
+        let data_unmodified_since = if self.policy.delete_unverified {
+            None
+        } else {
+            unmodified_since.map(|cutoff| cutoff.max(verification_threshold))
+        };
         let streams = vec![
-            build_listing_stream(self.dataset.versions_dir()),
-            build_listing_stream(self.dataset.transactions_dir()),
-            build_listing_stream(self.dataset.data_dir()),
-            build_listing_stream(self.dataset.indices_dir()),
-            build_listing_stream(self.dataset.deletions_dir()),
+            build_listing_stream(self.dataset.versions_dir(), unmodified_since),
+            build_listing_stream(self.dataset.transactions_dir(), unmodified_since),
+            build_listing_stream(self.dataset.data_dir(), data_unmodified_since),
+            // Index UUIDs from manifests being removed are proof that their files are
+            // safe to delete. Scan every index artifact while that proof is available;
+            // a retained-manifest cutoff can otherwise skip newer artifacts and lose
+            // the proof when the old manifests are removed by this cleanup pass.
+            build_listing_stream(self.dataset.indices_dir(), None),
+            build_listing_stream(self.dataset.deletions_dir(), unmodified_since),
         ];
         let unreferenced_files = stream::iter(streams).flatten().boxed();
 
@@ -972,6 +1034,17 @@ impl<'a> CleanupTask<'a> {
                 } else {
                     Ok(None)
                 }
+            }
+            // Local writers stage files in their destination directory before renaming
+            // them. These temporary files are never referenced by a manifest, even
+            // when they are inside a referenced blob sidecar directory.
+            _ if relative_path.as_ref().starts_with("data/")
+                && path
+                    .filename()
+                    .is_some_and(|filename| filename.starts_with(".tmp"))
+                && !maybe_in_progress =>
+            {
+                Ok(cleanup_file(path, CleanupFileKind::Data, true, size_bytes))
             }
             _ => Ok(None),
         }
@@ -1558,6 +1631,7 @@ mod tests {
     use lance_table::io::commit::RenameCommitHandler;
     use lance_testing::datagen::{BatchGenerator, IncrementingInt32, RandomVector, some_batch};
     use mock_instant::thread_local::MockClock;
+    use rstest::rstest;
     use uuid::Uuid;
 
     #[derive(Debug)]
@@ -2033,6 +2107,42 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cleanup_ignores_old_manifest_removed_after_listing() {
+        let fixture = MockDatasetFixture::try_new().unwrap();
+        fixture.create_some_data().await.unwrap();
+        fixture.overwrite_some_data().await.unwrap();
+        let dataset = fixture.open().await.unwrap();
+
+        let old_manifest = dataset
+            .commit_handler
+            .list_manifest_locations(&dataset.base, &dataset.object_store, false)
+            .try_filter(|location| future::ready(location.version == 1))
+            .try_next()
+            .await
+            .unwrap()
+            .unwrap();
+        dataset
+            .object_store
+            .delete(&old_manifest.path)
+            .await
+            .unwrap();
+
+        let cleanup = CleanupTask::new(
+            &dataset,
+            CleanupPolicyBuilder::default().build(),
+            CleanupAction::Execute,
+        );
+        cleanup
+            .process_manifest_file(
+                old_manifest,
+                &Mutex::new(CleanupInspection::default()),
+                &HashSet::new(),
+            )
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
     async fn explain_cleanup_does_not_delete_files() {
         let fixture = MockDatasetFixture::try_new().unwrap();
         fixture.create_some_data().await.unwrap();
@@ -2121,6 +2231,92 @@ mod tests {
             .unwrap();
 
         assert_eq!(fixture.count_blob_files().await.unwrap(), 0);
+    }
+
+    #[rstest]
+    #[case::recent(false, 1, false)]
+    #[case::at_threshold(false, 8, false)]
+    #[case::aged(false, 9, true)]
+    #[case::delete_unverified(true, 1, true)]
+    #[tokio::test]
+    async fn cleanup_temporary_data_files(
+        #[case] delete_unverified: bool,
+        #[case] cleanup_day: i64,
+        #[case] should_remove: bool,
+    ) {
+        MockClock::set_system_time(std::time::Duration::ZERO);
+        let fixture = MockDatasetFixture::try_new().unwrap();
+        fixture.create_some_data().await.unwrap();
+        fixture.append_some_data().await.unwrap();
+        let dataset = fixture.open().await.unwrap();
+        assert_eq!(dataset.manifest.fragments.len(), 2);
+        let expected_rows = dataset.count_rows(None).await.unwrap();
+
+        let data_file = &dataset.manifest.fragments[0].files[0].path;
+        let data_file_key = data_file.strip_suffix(".lance").unwrap();
+        let temporary_paths = [
+            dataset.data_dir().join(".tmpAb3Xz9"),
+            dataset.data_dir().join("uncommitted").join(".tmpAb3Xz9"),
+            dataset.data_dir().join(data_file_key).join(".tmpAb3Xz9"),
+        ];
+        let preserved_paths = [
+            dataset.data_dir().join("unrelated"),
+            dataset.data_dir().join(".tmpDirectory").join("unrelated"),
+            dataset
+                .data_dir()
+                .join(data_file_key)
+                .join("10000000000000000000000000000000.blob"),
+            dataset.base.clone().join("database").join(".tmpAb3Xz9"),
+        ];
+
+        // The debris is newer than every retained manifest, as with an interrupted
+        // append. Its eligibility must depend on its own age, not the manifest age.
+        MockClock::set_system_time(TimeDelta::days(1).to_std().unwrap());
+        for path in temporary_paths.iter().chain(&preserved_paths) {
+            dataset.object_store.put(path, b"debris").await.unwrap();
+        }
+        MockClock::set_system_time(TimeDelta::days(cleanup_day).to_std().unwrap());
+
+        let policy = CleanupPolicyBuilder::default()
+            .before_timestamp(DateTime::<Utc>::UNIX_EPOCH)
+            .delete_unverified(delete_unverified)
+            .build();
+        let before_count = fixture.count_files().await.unwrap();
+        let explanation = dataset.cleanup(policy.clone()).explain().await.unwrap();
+        let expected_files = if should_remove {
+            temporary_paths.len() as u64
+        } else {
+            0
+        };
+        assert_eq!(explanation.stats.data_files_removed, expected_files);
+        assert_eq!(explanation.stats.bytes_removed, expected_files * 6);
+        assert_eq!(explanation.candidate_files.len() as u64, expected_files);
+        for file in &explanation.candidate_files {
+            assert_eq!(file.kind, CleanupFileKind::Data);
+            assert!(file.unverified);
+            assert!(
+                temporary_paths
+                    .iter()
+                    .any(|path| path.as_ref() == file.path)
+            );
+        }
+        assert_eq!(fixture.count_files().await.unwrap(), before_count);
+
+        let removed = dataset.cleanup(policy).execute().await.unwrap();
+        assert_eq!(removed.data_files_removed, expected_files);
+        assert_eq!(removed.bytes_removed, expected_files * 6);
+        assert_eq!(removed.old_versions, 0);
+        for path in &temporary_paths {
+            assert_eq!(
+                dataset.object_store.exists(path).await.unwrap(),
+                !should_remove,
+                "{path}"
+            );
+        }
+        for path in &preserved_paths {
+            assert!(dataset.object_store.exists(path).await.unwrap(), "{path}");
+        }
+        assert_eq!(fixture.count_rows().await.unwrap(), expected_rows);
     }
 
     #[tokio::test]
@@ -2309,6 +2505,49 @@ mod tests {
             .unwrap();
 
         assert_eq!(removed.old_versions, 1);
+    }
+
+    #[tokio::test]
+    async fn cleanup_deletes_data_files_newer_than_tagged_version() {
+        // A tag on an old version must not prevent cleanup from deleting data
+        // files that belong only to newer, untagged versions. The listing
+        // cutoff used to be the earliest retained manifest time; with a tag
+        // that pulled the cutoff backwards and skipped those newer files.
+        // After their manifests were removed they became permanent orphans
+        // (https://github.com/lance-format/lance/issues/8705).
+        MockClock::set_system_time(std::time::Duration::from_secs(0));
+        let fixture = MockDatasetFixture::try_new().unwrap();
+        fixture.create_some_data().await.unwrap();
+        MockClock::set_system_time(TimeDelta::try_days(1).unwrap().to_std().unwrap());
+        fixture.overwrite_some_data().await.unwrap();
+        MockClock::set_system_time(TimeDelta::try_days(2).unwrap().to_std().unwrap());
+        fixture.overwrite_some_data().await.unwrap();
+
+        let dataset = *(fixture.open().await.unwrap());
+        dataset.tags().create("keep-v1", 1).await.unwrap();
+
+        MockClock::set_system_time(TimeDelta::try_days(10).unwrap().to_std().unwrap());
+
+        let before_count = fixture.count_files().await.unwrap();
+        assert_eq!(before_count.num_data_files, 3);
+        assert_eq!(before_count.num_manifest_files, 3);
+
+        let removed = fixture
+            .run_cleanup_with_override(
+                utc_now() - TimeDelta::try_days(8).unwrap(),
+                None,
+                Some(false),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(removed.old_versions, 1);
+        assert_eq!(removed.data_files_removed, 1);
+
+        let after_count = fixture.count_files().await.unwrap();
+        assert_eq!(after_count.num_manifest_files, 2);
+        assert_eq!(after_count.num_data_files, 2);
+        assert_eq!(after_count.num_tx_files, 2);
     }
 
     // Helper function to check that the number of files is correct.
@@ -2764,6 +3003,96 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cleanup_recent_replaced_index_with_short_retention() {
+        let fixture = MockDatasetFixture::try_new().unwrap();
+        fixture.create_some_data().await.unwrap();
+        fixture.append_some_data().await.unwrap();
+
+        let mut dataset = fixture.open().await.unwrap();
+        let field_id = dataset.schema().field("indexable").unwrap().id;
+        let old_uuid = Uuid::new_v4();
+        let current_uuid = Uuid::new_v4();
+
+        let old_index = dummy_index_metadata(&dataset, field_id, old_uuid, [0_u32, 1]);
+        dataset
+            .apply_commit(
+                Transaction::new(
+                    dataset.manifest.version,
+                    Operation::CreateIndex {
+                        new_indices: vec![old_index.clone()],
+                        removed_indices: vec![],
+                    },
+                    None,
+                ),
+                &Default::default(),
+                &Default::default(),
+            )
+            .await
+            .unwrap();
+
+        MockClock::set_system_time(TimeDelta::try_minutes(1).unwrap().to_std().unwrap());
+        let current_index = dummy_index_metadata(&dataset, field_id, current_uuid, [0_u32, 1]);
+        dataset
+            .apply_commit(
+                Transaction::new(
+                    dataset.manifest.version,
+                    Operation::CreateIndex {
+                        new_indices: vec![current_index],
+                        removed_indices: vec![old_index],
+                    },
+                    None,
+                ),
+                &Default::default(),
+                &Default::default(),
+            )
+            .await
+            .unwrap();
+
+        // Model index artifacts whose storage timestamp is newer than the retained
+        // manifest. UUID verification must not be hidden by the manifest cutoff.
+        MockClock::set_system_time(TimeDelta::try_minutes(2).unwrap().to_std().unwrap());
+        write_dummy_index_artifact(&dataset, old_uuid)
+            .await
+            .unwrap();
+        write_dummy_index_artifact(&dataset, current_uuid)
+            .await
+            .unwrap();
+
+        let short_retention = TimeDelta::try_seconds(30).unwrap();
+        let removed = fixture
+            .run_cleanup(utc_now() - short_retention)
+            .await
+            .unwrap();
+        assert_eq!(removed.old_versions, 3);
+        assert_eq!(removed.index_files_removed, 2);
+
+        let old_index_file = dataset
+            .indices_dir()
+            .join(old_uuid.to_string())
+            .join("index.idx");
+        let current_index_file = dataset
+            .indices_dir()
+            .join(current_uuid.to_string())
+            .join("index.idx");
+        assert!(
+            !dataset
+                .object_store
+                .as_ref()
+                .exists(&old_index_file)
+                .await
+                .unwrap()
+        );
+        assert!(
+            dataset
+                .object_store
+                .as_ref()
+                .exists(&current_index_file)
+                .await
+                .unwrap()
+        );
+    }
+
+    #[tokio::test]
     async fn cleanup_old_uncommitted_index_artifacts() {
         let fixture = MockDatasetFixture::try_new().unwrap();
         fixture.create_some_data().await.unwrap();
@@ -2820,29 +3149,40 @@ mod tests {
         );
     }
 
+    #[rstest]
+    #[case::aged(false, 10)]
+    #[case::delete_unverified(true, 1)]
     #[tokio::test]
-    async fn cleanup_failed_commit_data_file() {
+    async fn cleanup_failed_commit_data_file(
+        #[case] delete_unverified: bool,
+        #[case] cleanup_day: i64,
+    ) {
         // We should clean up data files that are written but the commit failed
         // for whatever reason
 
+        MockClock::set_system_time(std::time::Duration::from_secs(0));
         let mut fixture = MockDatasetFixture::try_new().unwrap();
         fixture.create_some_data().await.unwrap();
+
+        // The failed write is newer than every manifest, so a retained-manifest
+        // listing cutoff must not hide it from the age and policy checks.
+        MockClock::set_system_time(TimeDelta::try_days(1).unwrap().to_std().unwrap());
         fixture.block_commits();
         assert!(fixture.append_some_data().await.is_err());
-        MockClock::set_system_time(TimeDelta::try_days(10).unwrap().to_std().unwrap());
+        MockClock::set_system_time(TimeDelta::try_days(cleanup_day).unwrap().to_std().unwrap());
 
         let before_count = fixture.count_files().await.unwrap();
-        // This append will fail since the commit is blocked but it should have
-        // deposited a data file
         assert_eq!(before_count.num_data_files, 2);
         assert_eq!(before_count.num_manifest_files, 1);
         // Only 1 txn file: the failed commit's txn file was already cleaned up.
         assert_eq!(before_count.num_tx_files, 1);
 
-        // All of our manifests are newer than the threshold but temp files
-        // should still be deleted.
         let removed = fixture
-            .run_cleanup(utc_now() - TimeDelta::try_days(7).unwrap())
+            .run_cleanup_with_override(
+                utc_now() - TimeDelta::try_days(7).unwrap(),
+                Some(delete_unverified),
+                None,
+            )
             .await
             .unwrap();
 

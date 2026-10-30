@@ -266,7 +266,8 @@ async fn remap_index(dataset: &mut Dataset, index_id: &Uuid) -> Result<()> {
         Some(mut index_frag_bitmap) => {
             let mut should_remap = false;
             for version in frag_reuse_index.details.versions.iter() {
-                let data_predates_version = baseline_version < version.dataset_version;
+                // Inclusive: an index built at a version's dataset_version predates its rewrite.
+                let data_predates_version = baseline_version <= version.dataset_version;
                 for group in version.groups.iter() {
                     let mut old_frag_in_index = 0;
                     for old_frag in group.old_frags.iter() {

@@ -755,7 +755,8 @@ pub struct Scanner {
     batch_size: Option<usize>,
 
     /// If set, the scanner will produce batches whose total size in bytes
-    /// is approximately this value, overriding the row-based `batch_size`.
+    /// is approximately this value. When both limits are set, the scanner uses
+    /// the smaller row count selected by either limit.
     batch_size_bytes: Option<u64>,
 
     /// Number of batches to prefetch
@@ -1342,9 +1343,9 @@ impl Scanner {
 
     /// Set the maximum number of rows per batch.
     ///
-    /// Note: this can be overridden by [`Self::batch_size_bytes`] or by a dataset-level
-    /// `batch_size_bytes` set via [`ReadParams::file_reader_options`](crate::dataset::ReadParams::file_reader_options).  When a byte-based
-    /// batch size is active, the row-based batch size is used only as an initial estimate.
+    /// When a byte limit is also configured through [`Self::batch_size_bytes`] or
+    /// [`ReadParams::file_reader_options`](crate::dataset::ReadParams::file_reader_options),
+    /// both limits apply and the one reached first determines the batch size.
     pub fn batch_size(&mut self, batch_size: usize) -> &mut Self {
         self.batch_size = Some(batch_size);
         self
@@ -1353,7 +1354,10 @@ impl Scanner {
     /// Set the target batch size in bytes.
     ///
     /// When set, the scanner will produce batches whose total size in bytes
-    /// is approximately this value, overriding the row-based `batch_size`.
+    /// is approximately this value. When a row-based `batch_size` is also set,
+    /// both limits apply and the one reached first determines the batch size.
+    /// This cannot be combined with [`Self::strict_batch_size`] because strict
+    /// row batching can merge batches beyond the byte limit.
     ///
     /// This can also be configured at the dataset level via
     /// [`ReadParams::file_reader_options`](crate::dataset::ReadParams::file_reader_options).  A scanner-level setting takes
@@ -1461,6 +1465,10 @@ impl Scanner {
     /// By default, this is False and output batches are allowed to have fewer than `batch_size` rows
     /// Setting this to True will require us to merge batches, incurring a data copy, for a minor performance
     /// penalty.
+    ///
+    /// This cannot be enabled when a byte limit is configured through
+    /// [`Self::batch_size_bytes`] or
+    /// [`ReadParams::file_reader_options`](crate::dataset::ReadParams::file_reader_options).
     pub fn strict_batch_size(&mut self, strict_batch_size: bool) -> &mut Self {
         self.strict_batch_size = strict_batch_size;
         self
@@ -2436,6 +2444,19 @@ impl Scanner {
             ));
         }
 
+        if self.strict_batch_size
+            && let Some(batch_size_bytes) = self
+                .resolved_file_reader_options()
+                .and_then(|options| options.batch_size_bytes)
+        {
+            return Err(Error::invalid_input_source(
+                format!(
+                    "strict_batch_size=true cannot be combined with batch_size_bytes={batch_size_bytes}; strict row batching can merge batches beyond the byte limit"
+                )
+                .into(),
+            ));
+        }
+
         if self.include_deleted_rows && !self.projection_plan.physical_projection.with_row_id {
             return Err(Error::invalid_input_source(
                 "include_deleted_rows is set but with_row_id is false".into(),
@@ -2766,7 +2787,7 @@ impl Scanner {
         }
 
         // Limit / offset
-        if use_limit_node && (self.limit.unwrap_or(0) > 0 || self.offset.is_some()) {
+        if use_limit_node && (self.limit.is_some() || self.offset.is_some()) {
             plan = self.limit_node(plan);
         }
 
@@ -5859,9 +5880,9 @@ mod test {
 
     use super::*;
     use crate::dataset::WriteMode;
-    use crate::dataset::WriteParams;
     use crate::dataset::optimize::{CompactionOptions, compact_files};
     use crate::dataset::scanner::test_dataset::TestVectorDataset;
+    use crate::dataset::{NewColumnTransform, WriteParams};
     use crate::index::vector::{StageParams, VectorIndexParams};
     use crate::utils::test::{
         DatagenExt, FragmentCount, FragmentRowCount, ThrottledStoreWrapper, assert_plan_node_equals,
@@ -6050,6 +6071,120 @@ mod test {
                 rows_read += next.num_rows();
             }
         }
+    }
+
+    #[tokio::test]
+    async fn test_batch_size_bytes_across_data_files() {
+        let num_rows = 300;
+        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "id",
+            DataType::Int64,
+            false,
+        )]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int64Array::from_iter_values(0..num_rows))],
+        )
+        .unwrap();
+        let test_dir = TempStrDir::default();
+        let mut dataset = Dataset::write(
+            RecordBatchIterator::new([Ok(batch)], schema),
+            &test_dir,
+            Some(WriteParams {
+                data_storage_version: Some(LanceFileVersion::V2_1),
+                max_rows_per_file: num_rows as usize + 1,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        let wide_value = "abcdefghij".repeat(6);
+        let wide_schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "wide",
+            DataType::Utf8,
+            false,
+        )]));
+        let wide_batch = RecordBatch::try_new(
+            wide_schema.clone(),
+            vec![Arc::new(StringArray::from_iter_values(
+                (0..num_rows).map(|_| wide_value.as_str()),
+            ))],
+        )
+        .unwrap();
+        dataset
+            .add_columns(
+                NewColumnTransform::Reader(Box::new(RecordBatchIterator::new(
+                    [Ok(wide_batch)],
+                    wide_schema,
+                ))),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(dataset.get_fragment(0).unwrap().num_data_files(), 2);
+
+        let target_bytes = 8 * 1024;
+        let mut scan = dataset.scan();
+        scan.project(&["id", "wide"])
+            .unwrap()
+            .batch_size_bytes(target_bytes);
+        let batches = scan
+            .try_into_stream()
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        assert_eq!(
+            batches.iter().map(RecordBatch::num_rows).sum::<usize>(),
+            num_rows as usize
+        );
+        for batch in &batches {
+            let wide = batch["wide"].as_string::<i32>();
+            let values_bytes = (*wide.value_offsets().last().unwrap()
+                - *wide.value_offsets().first().unwrap()) as usize;
+            let logical_bytes = batch.num_rows() * std::mem::size_of::<i64>()
+                + std::mem::size_of_val(wide.value_offsets())
+                + values_bytes;
+            assert!(
+                logical_bytes <= target_bytes as usize,
+                "batch has {logical_bytes} logical bytes, target is {target_bytes}"
+            );
+        }
+
+        let mut scan = dataset.scan();
+        scan.project(&["id", "wide"])
+            .unwrap()
+            .batch_size(10)
+            .batch_size_bytes(target_bytes);
+        let batches = scan
+            .try_into_stream()
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        assert!(batches.iter().all(|batch| batch.num_rows() <= 10));
+
+        let mut scan = dataset.scan();
+        scan.project(&["id", "wide"])
+            .unwrap()
+            .batch_size(200)
+            .batch_size_bytes(target_bytes)
+            .strict_batch_size(true);
+        let error = scan
+            .try_into_stream()
+            .await
+            .err()
+            .expect("strict row and byte batch limits should be rejected");
+        assert!(
+            error
+                .to_string()
+                .contains("strict_batch_size=true cannot be combined with batch_size_bytes=8192"),
+            "unexpected error: {error}"
+        );
     }
 
     #[tokio::test]
@@ -6489,8 +6624,9 @@ mod test {
     async fn test_limit(
         #[values(LanceFileVersion::Legacy, LanceFileVersion::Stable)]
         data_storage_version: LanceFileVersion,
+        #[values(false, true)] stable_row_ids: bool,
     ) -> Result<()> {
-        let test_ds = TestVectorDataset::new(data_storage_version, false).await?;
+        let test_ds = TestVectorDataset::new(data_storage_version, stable_row_ids).await?;
         let dataset = &test_ds.dataset;
 
         let full_data = dataset.scan().try_into_batch().await?.slice(19, 2);
@@ -6503,6 +6639,15 @@ mod test {
 
         assert_eq!(actual.num_rows(), 2);
         assert_eq!(actual, full_data);
+
+        for filter in [None, Some("i > 2")] {
+            let mut scan = dataset.scan();
+            if let Some(filter) = filter {
+                scan.filter(filter)?;
+            }
+            let actual = scan.limit(Some(0), None)?.try_into_batch().await?;
+            assert_eq!(actual.num_rows(), 0);
+        }
         Ok(())
     }
 
@@ -10016,6 +10161,79 @@ full_filter=name LIKE Utf8(\"test%2\"), refine_filter=name LIKE Utf8(\"test%2\")
             starts_with_names,
             BTreeSet::from(["epsilon".to_string(), "eta".to_string()])
         );
+    }
+
+    /// A LIKE whose escape consumes an ordinary character (`a\b%` means "starts
+    /// with ab") or that runs escapes together (`\\\%` is the literal `\%`) must
+    /// return the same rows through an index as without one. The BTree answer
+    /// has no recheck, and a multi-fragment zone map prunes before its recheck.
+    #[rstest]
+    #[case::btree(IndexType::BTree, ScalarIndexParams::default())]
+    #[case::zonemap(
+        IndexType::Scalar,
+        ScalarIndexParams::for_builtin(lance_index::scalar::BuiltinIndexType::ZoneMap)
+    )]
+    #[tokio::test]
+    async fn test_like_prefix_escapes_match_unindexed_scan(
+        #[case] index_type: IndexType,
+        #[case] params: ScalarIndexParams,
+    ) {
+        // Two rows per fragment: the first holds only the "ab" rows, so a zone map
+        // pruning on the wrong prefix skips it before its recheck can see them.
+        let names = ["ab1", "ab2", r"a\b1", r"\%", r"\%x", "zz"];
+        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "name",
+            DataType::Utf8,
+            false,
+        )]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(StringArray::from(names.to_vec()))],
+        )
+        .unwrap();
+        let mut dataset = Dataset::write(
+            RecordBatchIterator::new(vec![Ok(batch)], schema),
+            "memory://test_like_prefix_escapes",
+            Some(WriteParams {
+                max_rows_per_file: 2,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(dataset.get_fragments().len(), 3);
+        dataset
+            .create_index(&["name"], index_type, None, &params, true)
+            .await
+            .unwrap();
+
+        let matched = async |filter: &str, use_index: bool| -> BTreeSet<String> {
+            let batch = dataset
+                .scan()
+                .use_scalar_index(use_index)
+                .filter(filter)
+                .unwrap()
+                .try_into_batch()
+                .await
+                .unwrap();
+            batch["name"]
+                .as_string::<i32>()
+                .iter()
+                .map(|name| name.unwrap().to_string())
+                .collect()
+        };
+        for (filter, expected) in [
+            (r"name LIKE 'a\b%'", vec!["ab1", "ab2"]),
+            (r"name LIKE '\\\%'", vec![r"\%"]),
+        ] {
+            let expected: BTreeSet<String> = expected.into_iter().map(String::from).collect();
+            assert_eq!(
+                matched(filter, false).await,
+                expected,
+                "{filter} without index"
+            );
+            assert_eq!(matched(filter, true).await, expected, "{filter} with index");
+        }
     }
 
     #[tokio::test]
