@@ -494,9 +494,9 @@ impl Debug for OperationThrottle {
     }
 }
 
-/// A [`MultipartUpload`] wrapper that throttles and retries `put_part`,
-/// `complete`, and `abort`, feeding outcomes back to the write AIMD
-/// controller.
+/// A [`MultipartUpload`] wrapper that throttles `put_part`, `complete`, and
+/// `abort`, feeding outcomes back to the write AIMD controller. Only `abort`
+/// is retried by this wrapper.
 struct ThrottledMultipartUpload {
     target: Box<dyn MultipartUpload>,
     write: Arc<OperationThrottle>,
@@ -524,23 +524,12 @@ impl MultipartUpload for ThrottledMultipartUpload {
     }
 
     async fn complete(&mut self) -> OSResult<PutResult> {
-        let target = &mut self.target;
-        for attempt in 0..=self.write.max_retries {
-            self.write.acquire_token().await;
-            let result = target.complete().await;
-            self.write.observe_outcome(&result);
-
-            match &result {
-                Err(err) if is_throttle_error(err) && attempt < self.write.max_retries => {
-                    let backoff_ms = rand::rng()
-                        .random_range(self.write.min_backoff_ms..=self.write.max_backoff_ms);
-                    tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)).await;
-                    continue;
-                }
-                _ => return result,
-            }
-        }
-        unreachable!()
+        // Completion can consume the recorded parts even on failure. Leave retries
+        // to the backend's request-level policy, which retains the serialized parts.
+        self.write.acquire_token().await;
+        let result = self.target.complete().await;
+        self.write.observe_outcome(&result);
+        result
     }
 
     async fn abort(&mut self) -> OSResult<()> {
@@ -1680,6 +1669,58 @@ mod tests {
 
         // Should have called get 4 times: initial attempt + 3 retries
         assert_eq!(mock.get_call_count.load(Ordering::Relaxed), 4);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_throttled_multipart_complete_calls_target_once() {
+        #[derive(Debug)]
+        struct FailingComplete {
+            complete_calls: Arc<AtomicUsize>,
+        }
+
+        #[async_trait]
+        impl MultipartUpload for FailingComplete {
+            fn put_part(&mut self, _data: PutPayload) -> UploadPart {
+                Box::pin(async { Ok(()) })
+            }
+
+            async fn complete(&mut self) -> OSResult<PutResult> {
+                let calls = self.complete_calls.fetch_add(1, Ordering::SeqCst);
+                Err(make_generic_error(if calls == 0 {
+                    "SlowDown: Please reduce your request rate"
+                } else {
+                    "Missing part"
+                }))
+            }
+
+            async fn abort(&mut self) -> OSResult<()> {
+                Ok(())
+            }
+        }
+
+        let store =
+            AimdThrottledStore::new(Arc::new(InMemory::new()), AimdThrottleConfig::default())
+                .unwrap();
+        let complete_calls = Arc::new(AtomicUsize::new(0));
+        let mut upload = ThrottledMultipartUpload {
+            target: Box::new(FailingComplete {
+                complete_calls: Arc::clone(&complete_calls),
+            }),
+            write: Arc::clone(&store.write),
+        };
+
+        let err = upload.complete().await.unwrap_err();
+        assert_eq!(complete_calls.load(Ordering::SeqCst), 1);
+        match err {
+            object_store::Error::Generic { store, source } => {
+                assert_eq!(store, "test");
+                assert_eq!(
+                    source.to_string(),
+                    "SlowDown: Please reduce your request rate"
+                );
+            }
+            err => panic!("expected the original throttle error, got: {err}"),
+        }
     }
 
     #[tokio::test]
