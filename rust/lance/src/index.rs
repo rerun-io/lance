@@ -4834,7 +4834,7 @@ mod tests {
         )
         .await
         .unwrap();
-        // Read the list back from the manifest, as a querier would.
+        // Reopen so the list is read back from the manifest.
         let dataset = DatasetBuilder::from_uri(&test_dir).load().await.unwrap();
 
         let key = crate::session::index_caches::IndexMetadataKey {
