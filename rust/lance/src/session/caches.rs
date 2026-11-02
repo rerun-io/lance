@@ -280,8 +280,8 @@ pub struct FilterableSchema {
     pub lance: Arc<lance_core::datatypes::Schema>,
     pub arrow: Arc<arrow_schema::Schema>,
     /// Entries only apply to a dataset holding this exact manifest, since a dataset can be
-    /// recreated, or its manifest replaced, at the same location. The `Weak` keeps that address
-    /// from being reused.
+    /// recreated, or its manifest replaced, at the same version; the key alone cannot tell these
+    /// apart. The `Weak` keeps that address from being reused.
     pub manifest: std::sync::Weak<Manifest>,
 }
 
@@ -293,24 +293,19 @@ impl DeepSizeOf for FilterableSchema {
 }
 
 #[derive(Debug, Clone, Copy)]
-pub struct FilterableSchemaKey<'a> {
+pub struct FilterableSchemaKey {
     pub version: u64,
-    pub e_tag: Option<&'a str>,
     pub nearest: bool,
     pub batch_nearest: bool,
     pub full_text_search: bool,
 }
 
-impl CacheKey for FilterableSchemaKey<'_> {
+impl CacheKey for FilterableSchemaKey {
     type ValueType = FilterableSchema;
     fn key(&self) -> Cow<'_, str> {
         Cow::Owned(format!(
-            "filterable_schema/{}/{}/{}{}{}",
-            self.version,
-            self.e_tag.unwrap_or_default(),
-            self.nearest as u8,
-            self.batch_nearest as u8,
-            self.full_text_search as u8
+            "filterable_schema/{}/{}{}{}",
+            self.version, self.nearest as u8, self.batch_nearest as u8, self.full_text_search as u8
         ))
     }
     fn type_name() -> &'static str {
@@ -323,12 +318,6 @@ impl CacheKey for FilterableSchemaKey<'_> {
 
     fn write_key(&self, builder: &mut KeyBuilder) {
         builder.write_u64(self.version);
-        if let Some(e_tag) = self.e_tag {
-            builder.write_some();
-            builder.write_str(e_tag);
-        } else {
-            builder.write_none();
-        }
         builder.write_bool(self.nearest);
         builder.write_bool(self.batch_nearest);
         builder.write_bool(self.full_text_search);

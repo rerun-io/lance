@@ -2047,10 +2047,8 @@ impl Scanner {
                 manifest: Arc::downgrade(&self.dataset.manifest),
             })
         };
-        let location = &self.dataset.manifest_location;
         let key = FilterableSchemaKey {
-            version: location.version,
-            e_tag: location.e_tag.as_deref(),
+            version: self.dataset.manifest_location.version,
             nearest: self.nearest.is_some(),
             batch_nearest: self.nearest.is_some() && self.is_batch_nearest,
             full_text_search: self.full_text_query.is_some(),
@@ -2065,7 +2063,7 @@ impl Scanner {
         ) {
             return Ok(cached);
         }
-        // Same location, different manifest: rebuild for this one and keep the newer entry.
+        // Same version, different manifest: rebuild for this one and keep the newer entry.
         let rebuilt = Arc::new(build()?);
         cache.insert_with_key(&key, rebuilt.clone()).await;
         Ok(rebuilt)
@@ -14338,8 +14336,7 @@ full_filter=name LIKE Utf8(\"test%2\"), refine_filter=name LIKE Utf8(\"test%2\")
         assert!(count(earlier.clone(), "b > 10").await.is_err());
         assert_eq!(count(earlier.clone(), "a > 4").await.unwrap(), 5);
 
-        // A version reopened by location has an e-tag, so scans share one cached schema.
-        assert!(earlier.manifest_location.e_tag.is_some());
+        // Scans of the same manifest share one cached schema.
         let first = earlier.scan().cached_filterable_schema().await.unwrap();
         let second = earlier.scan().cached_filterable_schema().await.unwrap();
         assert!(Arc::ptr_eq(&first, &second));
