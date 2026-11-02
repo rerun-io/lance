@@ -106,3 +106,6 @@ incremental = false
 
 [lints.clippy]
 disallowed_macros = "deny"
+
+[patch.crates-io]
+object_store = { git = "https://github.com/rerun-io/arrow-rs-object-store", branch = "release-0.14.2" }

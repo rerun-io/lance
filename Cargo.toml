@@ -53,7 +53,7 @@ categories = [
     "development-tools",
     "science",
 ]
-rust-version = "1.91.0"
+rust-version = "1.95.0"
 
 [workspace.dependencies]
 arc-swap = "1.7"
@@ -265,3 +265,6 @@ multiple-crate-versions = "allow"
 single_range_in_vec_init = "allow"
 large_futures = "deny"
 disallowed_macros = "deny"
+
+[patch.crates-io]
+object_store = { git = "https://github.com/rerun-io/arrow-rs-object-store", branch = "release-0.14.2" }
