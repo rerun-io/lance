@@ -6690,7 +6690,7 @@ mod tests {
     fn same_state(a: &FileOpenState, b: &FileOpenState) -> bool {
         a.schema_per_file == b.schema_per_file
             && a.field_id_to_column_idx == b.field_id_to_column_idx
-            && format!("{:?}", a.reader_projection) == format!("{:?}", b.reader_projection)
+            && a.reader_projection == b.reader_projection
     }
 
     /// One data file per distinct layout: the fixture's file with its column indices shifted.
