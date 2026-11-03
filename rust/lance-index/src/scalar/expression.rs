@@ -185,16 +185,111 @@ impl MultiQueryParser {
         self.parsers.push(other);
     }
 
-    /// Pick the first underlying parser whose `is_valid_reference` accepts `expr`.
+    /// Collect every underlying parser whose `is_valid_reference` accepts `expr`.
+    ///
+    /// Reference validation ("does this index handle this column / JSON path?")
+    /// and capability matching ("can this index serve this query shape?") are
+    /// two distinct decisions.  `is_valid_reference` only sees the column
+    /// reference, not the operator, so it cannot answer the second question.
+    /// Committing to the first accepting parser here would, for example, route
+    /// `x > 7` to a bloom filter (which only serves equality) even though a
+    /// btree on the same column could accelerate the range.
+    ///
+    /// We therefore keep *all* parsers that accept the reference and defer the
+    /// capability decision to the `visit_*` calls on the returned
+    /// [`MultiQueryParserView`], which try each candidate in registration order.
+    ///
+    /// All parsers that accept the same reference describe the same underlying
+    /// value, so they agree on its data type; we report the first one.
     pub fn select(
         &self,
         expr: &Expr,
         data_type: &DataType,
-    ) -> Option<(&dyn ScalarQueryParser, DataType)> {
-        self.parsers.iter().find_map(|p| {
-            p.is_valid_reference(expr, data_type)
-                .map(|dt| (p.as_ref(), dt))
-        })
+    ) -> Option<(MultiQueryParserView<'_>, DataType)> {
+        let mut parsers = Vec::new();
+        let mut reference_type = None;
+        for parser in &self.parsers {
+            if let Some(dt) = parser.is_valid_reference(expr, data_type) {
+                reference_type.get_or_insert(dt);
+                parsers.push(parser.as_ref());
+            }
+        }
+        reference_type.map(|dt| (MultiQueryParserView { parsers }, dt))
+    }
+}
+
+/// A borrowed view over the subset of a [`MultiQueryParser`]'s parsers whose
+/// `is_valid_reference` accepted a particular column reference.
+///
+/// It behaves exactly like the parent [`MultiQueryParser`] — every `visit_*`
+/// method fans out to its parsers with the same "first match wins" semantics —
+/// but operates on a borrowed subset rather than owning the parsers.  Selecting
+/// the reference-valid subset up front, then deferring the capability decision
+/// to the `visit_*` calls, lets a column carrying several indexes (e.g. a bloom
+/// filter that only serves equality alongside a btree that serves ranges) pick
+/// the right index per query instead of being locked to whichever parser was
+/// registered first.
+#[derive(Debug)]
+pub struct MultiQueryParserView<'a> {
+    parsers: Vec<&'a dyn ScalarQueryParser>,
+}
+
+impl ScalarQueryParser for MultiQueryParserView<'_> {
+    fn visit_between(
+        &self,
+        column: &str,
+        low: &Bound<ScalarValue>,
+        high: &Bound<ScalarValue>,
+    ) -> Option<IndexedExpression> {
+        self.parsers
+            .iter()
+            .find_map(|parser| parser.visit_between(column, low, high))
+    }
+    fn visit_in_list(&self, column: &str, in_list: &[ScalarValue]) -> Option<IndexedExpression> {
+        self.parsers
+            .iter()
+            .find_map(|parser| parser.visit_in_list(column, in_list))
+    }
+    fn visit_is_bool(&self, column: &str, value: bool) -> Option<IndexedExpression> {
+        self.parsers
+            .iter()
+            .find_map(|parser| parser.visit_is_bool(column, value))
+    }
+    fn visit_is_null(&self, column: &str) -> Option<IndexedExpression> {
+        self.parsers
+            .iter()
+            .find_map(|parser| parser.visit_is_null(column))
+    }
+    fn visit_comparison(
+        &self,
+        column: &str,
+        value: &ScalarValue,
+        op: &Operator,
+    ) -> Option<IndexedExpression> {
+        self.parsers
+            .iter()
+            .find_map(|parser| parser.visit_comparison(column, value, op))
+    }
+    fn visit_scalar_function(
+        &self,
+        column: &str,
+        data_type: &DataType,
+        func: &ScalarUDF,
+        args: &[Expr],
+    ) -> Option<IndexedExpression> {
+        self.parsers
+            .iter()
+            .find_map(|parser| parser.visit_scalar_function(column, data_type, func, args))
+    }
+    fn visit_like(
+        &self,
+        column: &str,
+        like: &Like,
+        pattern: &ScalarValue,
+    ) -> Option<IndexedExpression> {
+        self.parsers
+            .iter()
+            .find_map(|parser| parser.visit_like(column, like, pattern))
     }
 }
 
@@ -509,7 +604,8 @@ impl ScalarQueryParser for SargableQueryParser {
 /// - `prefix` is the leading literal portion before any wildcards
 /// - `needs_refine` is true if the pattern has wildcards beyond a simple trailing `%`
 ///
-/// Returns `None` if the pattern starts with a wildcard (no leading literal).
+/// Returns `None` if the pattern starts with a wildcard (no leading literal), has
+/// no unescaped wildcard, or uses an escape character other than backslash.
 ///
 /// Examples:
 /// - "foo%" -> Some(("foo", false)) - pure prefix, no recheck needed
@@ -518,106 +614,54 @@ impl ScalarQueryParser for SargableQueryParser {
 /// - "foo\%bar%" with escape '\' -> Some(("foo%bar", false)) - escaped %, pure prefix
 /// - "%foo" -> None - starts with wildcard, cannot prune
 /// - "foo" -> None - no wildcard at all, use equality instead
+/// - "a\b%" -> Some(("ab", false)) - an escape consumes any character
 fn extract_like_leading_prefix(pattern: &str, escape_char: Option<char>) -> Option<(String, bool)> {
+    // DataFusion's starts_with simplification escapes special characters with backslash
+    // but doesn't set escape_char, so backslash is the default escape. It is also the
+    // only escape the executor defines: DataFusion's physical planner rejects any other
+    // ESCAPE character, so decline here rather than answer a query the executor
+    // refuses (an index query would replace the predicate and skip that rejection).
+    // Pattern: starts_with(col, 'test_ns$') -> col LIKE 'test\_ns$%' (escape_char: None)
+    let esc = match escape_char {
+        None | Some('\\') => '\\',
+        Some(_) => return None,
+    };
+
     let chars: Vec<char> = pattern.chars().collect();
     let len = chars.len();
 
-    if len == 0 {
-        return None;
-    }
-
-    // DataFusion's starts_with simplification escapes special characters with backslash
-    // but doesn't set escape_char. Use backslash as default escape character.
-    // Pattern: starts_with(col, 'test_ns$') -> col LIKE 'test\_ns$%' (escape_char: None)
-    // See: https://github.com/apache/datafusion/issues/XXXX
-    let effective_escape_char = escape_char.or(Some('\\'));
-
-    // Helper to check if a character at position i is escaped
-    let is_escaped = |i: usize| -> bool {
-        if let Some(esc) = effective_escape_char {
-            if i > 0 && chars[i - 1] == esc {
-                // Check if the escape char itself is escaped
-                if i >= 2 && chars[i - 2] == esc {
-                    false // Escape was escaped, so this char is NOT escaped
-                } else {
-                    true // This char is escaped
-                }
-            } else {
-                false
-            }
-        } else {
-            // No escape character defined - nothing can be escaped
-            false
-        }
-    };
-
-    // Pattern must contain at least one unescaped wildcard
-    let has_wildcard = chars.iter().enumerate().any(|(i, &c)| {
-        if c != '%' && c != '_' {
-            return false;
-        }
-        !is_escaped(i)
-    });
-
-    if !has_wildcard {
-        return None; // No wildcards, should use equality
-    }
-
-    // Check if pattern starts with an unescaped wildcard
-    if chars[0] == '%' || chars[0] == '_' {
-        return None; // Starts with wildcard, cannot prune
-    }
-
-    // Extract the leading literal prefix (everything before first unescaped wildcard)
+    // Single left-to-right pass. An escape consumes whatever follows it, matching
+    // arrow's LIKE kernel ("\x" matches a literal x for any x), so wildcard detection
+    // and prefix extraction must share this tokenization: judging a wildcard by its
+    // neighbours alone misreads runs of escapes such as "\\\%".
     let mut prefix = String::new();
     let mut i = 0;
-    let mut found_wildcard = false;
-
+    let mut first_wildcard = None;
     while i < len {
         let c = chars[i];
-
-        // Check for escape character (using effective escape char which may be inferred)
-        if let Some(esc) = effective_escape_char
-            && c == esc
-            && i + 1 < len
-        {
-            let next = chars[i + 1];
-            if next == '%' || next == '_' || next == esc {
-                // Escaped character - add the literal character
-                prefix.push(next);
-                i += 2;
-                continue;
-            }
+        if c == esc && i + 1 < len {
+            prefix.push(chars[i + 1]);
+            i += 2;
+            continue;
         }
-
-        // Check for unescaped wildcard
         if c == '%' || c == '_' {
-            found_wildcard = true;
+            first_wildcard = Some(i);
             break;
         }
-
         prefix.push(c);
         i += 1;
     }
 
+    // No unescaped wildcard: the pattern is an exact literal, use equality instead.
+    let wildcard_at = first_wildcard?;
+    // Starts with a wildcard: nothing to prune on.
     if prefix.is_empty() {
         return None;
     }
 
-    // Check if pattern is just a simple prefix (ends with single % and nothing after)
-    let needs_refine = if found_wildcard && i < len {
-        // Check if we're at a % wildcard
-        if chars[i] == '%' && i + 1 == len {
-            // Pattern is "prefix%" - pure prefix match, no refine needed
-            false
-        } else {
-            // Pattern has more after first wildcard, or has _ wildcard
-            true
-        }
-    } else {
-        // No wildcard found (shouldn't happen due to earlier check)
-        false
-    };
+    // "prefix%" is a pure prefix match; anything after the first wildcard, or a `_`
+    // wildcard, needs the original predicate re-applied.
+    let needs_refine = !(chars[wildcard_at] == '%' && wildcard_at + 1 == len);
 
     Some((prefix, needs_refine))
 }
@@ -843,6 +887,10 @@ pub struct TextQueryParser {
     index_type: String,
     needs_recheck: bool,
     supports_regex: bool,
+    /// The shortest `contains` pattern (in characters, not bytes) the index can
+    /// say anything useful about.  Shorter patterns bypass the index entirely so
+    /// they are answered by a full scan.  Use 0 for indices with no such limit.
+    min_contains_chars: usize,
 }
 
 impl TextQueryParser {
@@ -851,12 +899,14 @@ impl TextQueryParser {
         index_type: String,
         needs_recheck: bool,
         supports_regex: bool,
+        min_contains_chars: usize,
     ) -> Self {
         Self {
             index_name,
             index_type,
             needs_recheck,
             supports_regex,
+            min_contains_chars,
         }
     }
 }
@@ -913,7 +963,16 @@ impl ScalarQueryParser for TextQueryParser {
         };
 
         let query = match func.name() {
-            "contains" if args.len() == 2 => TextQuery::StringContains(pattern),
+            "contains" if args.len() == 2 => {
+                // A pattern shorter than the index's token width produces no
+                // tokens, so the index can only answer "recheck everything".
+                // Leave it to a full scan instead.  The count is in characters
+                // because tokenizers split on characters, not bytes.
+                if pattern.chars().count() < self.min_contains_chars {
+                    return None;
+                }
+                TextQuery::StringContains(pattern)
+            }
             "regexp_like" | "regexp_match" if self.supports_regex => {
                 let pattern = match args.get(2) {
                     Some(flags_expr) => apply_regex_flags(&pattern, flags_expr)?,
@@ -2047,7 +2106,7 @@ fn extract_nested_column_path(expr: &Expr) -> Option<String> {
 fn maybe_indexed_column<'b>(
     expr: &Expr,
     index_info: &'b dyn IndexInformationProvider,
-) -> Option<(String, DataType, &'b dyn ScalarQueryParser)> {
+) -> Option<(String, DataType, MultiQueryParserView<'b>)> {
     // First try to extract the full nested column path for get_field expressions
     if let Some(nested_path) = extract_nested_column_path(expr)
         && let Some((data_type, multi)) = index_info.get_index(&nested_path)
@@ -3489,10 +3548,32 @@ mod tests {
         // With backslash as default escape (for DataFusion starts_with compatibility):
         // "foo\%" means escaped %, no wildcard -> None (should use equality)
         assert_eq!(extract_like_leading_prefix(r"foo\%", None), None);
-        // "foo\bar%" - \b is not a valid escape sequence, so \ and b are literals, % is wildcard
+        // "foo\bar%" - the escape consumes whatever follows it, so \b is a literal
+        // 'b' (arrow's LIKE kernel matches "\x" against "x" for any x), and the
+        // prefix must be "foobar" or the index would select rows starting with
+        // "foo\bar" and miss the correct ones.
         assert_eq!(
             extract_like_leading_prefix(r"foo\bar%", None),
-            Some(("foo\\bar".to_string(), false))
+            Some(("foobar".to_string(), false))
+        );
+        assert_eq!(
+            extract_like_leading_prefix(r"foo\bar%", Some('\\')),
+            Some(("foobar".to_string(), false))
+        );
+
+        // Only backslash escapes are defined by the executor (DataFusion rejects any
+        // other ESCAPE character at physical planning); declining keeps the index
+        // from answering a query the executor would refuse.
+        assert_eq!(extract_like_leading_prefix(r"a!b%", Some('!')), None);
+
+        // Wildcard detection must use the same escape-pair tokenization as prefix
+        // extraction: three backslashes then % is the exact literal "\%" (no
+        // wildcard), while a trailing % after it is a prefix on "\%".
+        assert_eq!(extract_like_leading_prefix(r"\\\%", Some('\\')), None);
+        assert_eq!(extract_like_leading_prefix(r"\\\%", None), None);
+        assert_eq!(
+            extract_like_leading_prefix(r"\\\%%", None),
+            Some(("\\%".to_string(), false))
         );
 
         // Empty pattern
@@ -3551,6 +3632,44 @@ mod tests {
         } else {
             panic!("Expected Query variant");
         }
+
+        // Escape followed by an ordinary character: LIKE 'a\b%' means "starts with
+        // ab" under arrow's LIKE semantics, so the index prefix must be "ab" (and
+        // needs no refine). A prefix of "a\b" would select disjoint rows with no
+        // recheck to catch it.
+        let expr = state
+            .create_logical_expr("color LIKE 'a\\b%'", &df_schema)
+            .unwrap();
+        let result = apply_scalar_indices(expr, &index_info).unwrap();
+        assert!(
+            result.refine_expr.is_none(),
+            "Escaped literal prefix should not need refine_expr"
+        );
+        if let Some(ScalarIndexExpr::Query(search)) = &result.scalar_query {
+            let query = search.query.as_any().downcast_ref::<SargableQuery>();
+            match query.unwrap() {
+                SargableQuery::LikePrefix(prefix) => {
+                    assert_eq!(prefix, &ScalarValue::Utf8(Some("ab".to_string())));
+                }
+                _ => panic!("Expected LikePrefix query"),
+            }
+        } else {
+            panic!("Expected Query variant");
+        }
+
+        // A non-backslash ESCAPE is accepted by the SQL layer but rejected by
+        // DataFusion's physical planner; the index must decline rather than answer
+        // a query the executor refuses (it would otherwise replace the predicate
+        // entirely and skip the planner's rejection).
+        let expr = state
+            .create_logical_expr("color LIKE 'a!b%' ESCAPE '!'", &df_schema)
+            .unwrap();
+        let result = apply_scalar_indices(expr, &index_info).unwrap();
+        assert!(
+            result.scalar_query.is_none(),
+            "non-backslash escape must not be accelerated, got {:?}",
+            result.scalar_query
+        );
 
         // Complex pattern: LIKE 'foo%bar%' -> LikePrefix("foo"), with refine_expr
         let expr = state
@@ -4129,6 +4248,66 @@ mod tests {
 
         // Query against an unindexed path must not bind to either index.
         check_no_index(&index_info, "json_extract(json, '$.c') = 'foo'");
+    }
+
+    /// Regression test for https://github.com/lance-format/lance/issues/7091.
+    ///
+    /// When a column carries both a bloom filter (equality only) and a btree
+    /// (ranges) index, parser selection must not commit to a single index based
+    /// on the column reference alone.  With the bloom filter registered first,
+    /// a range query like `size > 7` would otherwise be intercepted by the
+    /// bloom parser (which returns `None` for ranges) and fall back to a full
+    /// scan, even though the btree can serve it.
+    #[test]
+    fn test_multi_index_defers_to_operator_capability() {
+        // Register the bloom filter *first* so the pre-fix "first valid
+        // reference wins" behavior would route every query to it.
+        let mut multi = MultiQueryParser::single(Box::new(BloomFilterQueryParser::new(
+            "size_bloom_idx".to_string(),
+            "BloomFilter".to_string(),
+            false,
+        )));
+        multi.add(Box::new(SargableQueryParser::new(
+            "size_btree_idx".to_string(),
+            "BTree".to_string(),
+            false,
+        )));
+
+        let index_info = MockIndexInfoProvider::new(vec![(
+            "size",
+            ColInfo::with_multi(DataType::Float32, Box::new(multi)),
+        )]);
+
+        // `size > 7`: bloom can't serve ranges, so the btree must pick it up.
+        check(
+            &index_info,
+            "size > 7",
+            Some(IndexedExpression::index_query(
+                "size".to_string(),
+                "size_btree_idx".to_string(),
+                "BTree".to_string(),
+                Arc::new(SargableQuery::Range(
+                    Bound::Excluded(ScalarValue::Float32(Some(7.0))),
+                    Bound::Unbounded,
+                )),
+            )),
+            false,
+        );
+
+        // `size = 7`: the bloom filter is registered first and serves equality,
+        // so it still wins for the query shape it supports.
+        check(
+            &index_info,
+            "size = 7",
+            Some(IndexedExpression::index_query_with_recheck(
+                "size".to_string(),
+                "size_bloom_idx".to_string(),
+                "BloomFilter".to_string(),
+                Arc::new(BloomFilterQuery::Equals(ScalarValue::Float32(Some(7.0)))),
+                false,
+            )),
+            false,
+        );
     }
 
     #[test]

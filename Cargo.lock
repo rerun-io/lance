@@ -4653,6 +4653,7 @@ dependencies = [
  "rand 0.9.5",
  "rand_distr",
  "rand_xoshiro",
+ "rstest",
 ]
 
 [[package]]
@@ -5079,6 +5080,7 @@ dependencies = [
  "async-trait",
  "aws-credential-types",
  "aws-sdk-dynamodb",
+ "blake3",
  "byteorder",
  "bytes",
  "chrono",

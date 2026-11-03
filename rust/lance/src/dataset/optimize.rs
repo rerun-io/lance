@@ -520,7 +520,8 @@ impl CompactionOptions {
 /// - All data files share identical Lance file versions
 /// - No fragment has a deletion file
 ///   TODO: Need to support schema evolution case like add column and drop column
-/// - All data files share identical schema mappings (`fields`, `column_indices`)
+/// - All data files use an identical schema mapping (`fields`, `column_indices`) in dataset schema
+///   order
 /// - Input data files must not contain extra global buffers (beyond schema / file descriptor)
 async fn can_use_binary_copy(
     dataset: &Dataset,
@@ -589,6 +590,16 @@ async fn can_use_binary_copy_impl(
     }
     let ref_fields = &fragments[0].files[0].fields;
     let ref_cols = &fragments[0].files[0].column_indices;
+    let (schema_fields, schema_column_indices) =
+        binary_copy::data_file_columns(dataset.schema(), storage_file_version);
+    if ref_fields.as_ref() != schema_fields.as_slice()
+        || ref_cols.as_ref() != schema_column_indices.as_slice()
+    {
+        log::debug!(
+            "Binary copy disabled: data files do not use the dataset schema's physical column order"
+        );
+        return Ok(false);
+    }
     let mut is_same_version = true;
 
     for fragment in fragments {
@@ -1575,10 +1586,11 @@ pub struct RewriteResult {
     pub row_addrs: Option<Vec<u8>>,
 }
 
+/// Returns the version the reservation committed at; `dataset` is not moved to it.
 async fn reserve_fragment_ids(
     dataset: &Dataset,
     fragments: impl ExactSizeIterator<Item = &mut Fragment>,
-) -> Result<()> {
+) -> Result<u64> {
     let transaction = Transaction::new(
         dataset.manifest.version,
         Operation::ReserveFragments {
@@ -1607,7 +1619,7 @@ async fn reserve_fragment_ids(
         fragment.id = new_id as u64;
     }
 
-    Ok(())
+    Ok(manifest.version)
 }
 
 /// Rewrite the files in a single task.
@@ -1942,7 +1954,7 @@ async fn rechunk_stable_row_ids(
     for (fragment, sequence) in new_fragments.iter_mut().zip(new_sequences) {
         // TODO: if large enough, serialize to separate file
         let serialized = lance_table::rowids::write_row_ids(&sequence);
-        fragment.row_id_meta = Some(RowIdMeta::Inline(serialized));
+        fragment.row_id_meta = Some(RowIdMeta::Inline(serialized.into()));
     }
 
     Ok(())
@@ -2104,13 +2116,14 @@ pub async fn commit_compaction(
     let mut completed_tasks = completed_tasks;
 
     // Single reserve_fragment_ids for all address-style tasks
+    let mut reserved_version = None;
     if has_address_style {
         let frags: Vec<&mut Fragment> = completed_tasks
             .iter_mut()
             .filter(|t| t.row_addrs.is_some())
             .flat_map(|t| t.new_fragments.iter_mut())
             .collect();
-        reserve_fragment_ids(dataset, frags.into_iter()).await?;
+        reserved_version = Some(reserve_fragment_ids(dataset, frags.into_iter()).await?);
     }
 
     let mut rewrite_groups = Vec::with_capacity(completed_tasks.len());
@@ -2257,7 +2270,18 @@ pub async fn commit_compaction(
 
     // No indexed/chain data touched -> no FRI (all-or-nothing, see above).
     let frag_reuse_index = if options.defer_index_remap && any_group_indexed {
-        Some(build_new_frag_reuse_index(dataset, frag_reuse_groups, new_fragment_bitmap).await?)
+        // The rewrite publishes right after the reservation unless another commit lands in
+        // between; an index built in that window is still treated as post-rewrite.
+        let dataset_version = reserved_version.unwrap_or(dataset.manifest.version);
+        Some(
+            build_new_frag_reuse_index(
+                dataset,
+                frag_reuse_groups,
+                new_fragment_bitmap,
+                dataset_version,
+            )
+            .await?,
+        )
     } else {
         if options.defer_index_remap {
             log::debug!(
@@ -3380,6 +3404,77 @@ mod tests {
         assert_eq!(before_scalar_result, after_scalar_result);
     }
 
+    /// Regression test for https://github.com/lance-format/lance/issues/8076
+    ///
+    /// A zone map or bloom filter index reports matches as physical row addresses, so
+    /// compaction invalidates it even under stable row ids. Reusing it for the rewritten
+    /// fragments made a filtered scan fail with an internal error (a fragment referenced
+    /// by the index no longer existed) or, once translation tolerated that, silently drop
+    /// every match.
+    #[rstest]
+    #[case::zone_map(BuiltinIndexType::ZoneMap, IndexType::ZoneMap)]
+    #[case::bloom_filter(BuiltinIndexType::BloomFilter, IndexType::BloomFilter)]
+    #[tokio::test]
+    async fn test_addr_domain_index_after_compaction_with_stable_row_ids(
+        #[case] builtin: BuiltinIndexType,
+        #[case] index_type: IndexType,
+    ) {
+        let mut data_gen =
+            BatchGenerator::new().col(Box::new(IncrementingInt32::new().named("i".to_owned())));
+        let mut dataset = Dataset::write(
+            data_gen.batch(200),
+            "memory://test/table",
+            Some(WriteParams {
+                enable_stable_row_ids: true,
+                max_rows_per_file: 100, // 2 fragments, so compaction has something to merge
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        dataset
+            .create_index(
+                &["i"],
+                index_type,
+                None,
+                &ScalarIndexParams::for_builtin(builtin),
+                false,
+            )
+            .await
+            .unwrap();
+
+        compact_files(&mut dataset, CompactionOptions::default(), None)
+            .await
+            .unwrap();
+
+        // The index only knows the pre-compaction fragments, so it must not claim to
+        // cover the fragment they were rewritten into.
+        let live_fragments: RoaringBitmap =
+            dataset.fragments().iter().map(|f| f.id as u32).collect();
+        let index = dataset
+            .load_indices()
+            .await
+            .unwrap()
+            .iter()
+            .find(|index| index.fields == vec![0])
+            .expect("index must survive compaction")
+            .clone();
+        assert!(
+            index
+                .effective_fragment_bitmap(&live_fragments)
+                .is_none_or(|covered| covered.is_empty()),
+            "compaction must not point an address-domain index at the fragments it wrote"
+        );
+
+        // Every fragment therefore falls back to a full scan, and the filter is answered
+        // in full.
+        let mut scanner = dataset.scan();
+        scanner.filter("i > 0").unwrap();
+        let matched = scanner.try_into_batch().await.unwrap();
+        assert_eq!(matched.num_rows(), 199);
+    }
+
     // Regression test for https://github.com/lancedb/lance/issues/6161
     // When FragReuseIndexDetails exceeds 204800 bytes it is written to an external
     // file. Previously the file was silently dropped (temp file deleted) because
@@ -4366,7 +4461,7 @@ mod tests {
             ..Default::default()
         };
 
-        let mut compact_read_versions = Vec::new();
+        let mut prepublish_versions = Vec::new();
         for i in 0..10 {
             dataset
                 .delete(&format!("i < {}", 500 * (i + 1)))
@@ -4377,9 +4472,8 @@ mod tests {
                 .await
                 .unwrap();
 
-            // Record the read version for verification if compaction has happened
             if dataset.manifest.version > read_version {
-                compact_read_versions.push(read_version);
+                prepublish_versions.push(dataset.manifest.version - 1);
             }
 
             // Load and verify the fragment reuse index content
@@ -4410,7 +4504,7 @@ mod tests {
                     .iter()
                     .map(|v| v.dataset_version)
                     .collect::<Vec<_>>(),
-                compact_read_versions
+                prepublish_versions
             );
         }
     }
@@ -5313,6 +5407,164 @@ mod tests {
             plan.contains("ScalarIndexQuery: query=[category = 1]@category_idx(Bitmap)"),
             "Expected index query in plan: {}",
             plan
+        );
+    }
+
+    #[tokio::test]
+    async fn test_read_bloom_filter_index_with_defer_index_remap() {
+        let mut dataset = lance_datagen::gen_batch()
+            .col("id", lance_datagen::array::step::<Int32Type>())
+            .into_ram_dataset(FragmentCount::from(3), FragmentRowCount::from(3))
+            .await
+            .unwrap();
+
+        dataset
+            .create_index(
+                &["id"],
+                IndexType::BloomFilter,
+                Some("id_idx".into()),
+                &ScalarIndexParams::for_builtin(BuiltinIndexType::BloomFilter),
+                false,
+            )
+            .await
+            .unwrap();
+
+        let metrics = compact_files(
+            &mut dataset,
+            CompactionOptions {
+                target_rows_per_fragment: 512,
+                defer_index_remap: true,
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(metrics.fragments_removed > 0);
+        assert!(metrics.fragments_added > 0);
+
+        assert_eq!(
+            dataset.count_rows(Some("id = 2".to_owned())).await.unwrap(),
+            1
+        );
+
+        let mut scanner = dataset.scan();
+        scanner.filter("id = 2").unwrap();
+        let plan = scanner.explain_plan(false).await.unwrap();
+        assert!(
+            plan.contains("ScalarIndexQuery: query=[id = 2]@id_idx(BloomFilter)"),
+            "Expected BloomFilter index query in plan: {plan}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_read_zonemap_index_with_defer_index_remap() {
+        let batch = arrow_array::record_batch!(
+            ("id", Int32, (0..12).collect::<Vec<_>>()),
+            (
+                "value",
+                Int64,
+                [
+                    Some(0),
+                    None,
+                    Some(20),
+                    Some(30),
+                    Some(40),
+                    None,
+                    Some(60),
+                    Some(70),
+                    Some(80),
+                    None,
+                    Some(100),
+                    Some(110)
+                ]
+            )
+        )
+        .unwrap();
+        let reader = RecordBatchIterator::new([Ok(batch.clone())], batch.schema());
+        let mut dataset = Dataset::write(
+            reader,
+            "memory://",
+            Some(WriteParams {
+                max_rows_per_file: 4,
+                max_rows_per_group: 4,
+                enable_stable_row_ids: false,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(dataset.get_fragments().len(), 3);
+
+        dataset
+            .create_index(
+                &["value"],
+                IndexType::ZoneMap,
+                Some("value_idx".into()),
+                &ScalarIndexParams::for_builtin(BuiltinIndexType::ZoneMap),
+                false,
+            )
+            .await
+            .unwrap();
+
+        let metrics = compact_files(
+            &mut dataset,
+            CompactionOptions {
+                target_rows_per_fragment: 512,
+                defer_index_remap: true,
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(metrics.fragments_removed, 3);
+        assert_eq!(metrics.fragments_added, 1);
+
+        async fn scan_ids(dataset: &Dataset, filter: &str, use_scalar_index: bool) -> Vec<i32> {
+            let mut scanner = dataset.scan();
+            scanner.filter(filter).unwrap();
+            scanner.project(&["id"]).unwrap();
+            scanner.use_scalar_index(use_scalar_index);
+            scanner.try_into_batch().await.unwrap()["id"]
+                .as_primitive::<Int32Type>()
+                .values()
+                .to_vec()
+        }
+
+        for (filter, expected) in [
+            ("value IS NULL", vec![1, 5, 9]),
+            ("value = 20", vec![2]),
+            ("value > 90", vec![10, 11]),
+        ] {
+            assert_eq!(scan_ids(&dataset, filter, false).await, expected);
+            assert_eq!(scan_ids(&dataset, filter, true).await, expected);
+        }
+
+        let merged = dataset
+            .merge_existing_index_segments(dataset.load_indices_by_name("value_idx").await.unwrap())
+            .await
+            .unwrap();
+        dataset
+            .commit_existing_index_segments("value_idx", "value", vec![merged])
+            .await
+            .unwrap();
+
+        for (filter, expected) in [
+            ("value IS NULL", vec![1, 5, 9]),
+            ("value = 20", vec![2]),
+            ("value > 90", vec![10, 11]),
+        ] {
+            assert_eq!(scan_ids(&dataset, filter, false).await, expected);
+            assert_eq!(scan_ids(&dataset, filter, true).await, expected);
+        }
+
+        let mut scanner = dataset.scan();
+        scanner.filter("value IS NULL").unwrap();
+        let plan = scanner.explain_plan(false).await.unwrap();
+        assert!(
+            plan.contains("ScalarIndexQuery: query=[value IS NULL]@value_idx(ZoneMap)"),
+            "Expected ZoneMap index query in plan: {plan}"
         );
     }
 

@@ -135,6 +135,7 @@ use snafu::ResultExt;
 use std::collections::HashMap;
 use std::{
     collections::{BTreeMap, HashSet},
+    iter::Peekable,
     sync::{
         Arc, Mutex,
         atomic::{AtomicU32, Ordering},
@@ -147,6 +148,67 @@ use tracing::error;
 mod assign_action;
 mod exec;
 mod logical_plan;
+
+struct UpdatedRowAddrReconciler<I>
+where
+    I: Iterator<Item = (u64, (usize, usize))>,
+{
+    updated_rows: Peekable<I>,
+}
+
+impl<I> UpdatedRowAddrReconciler<I>
+where
+    I: Iterator<Item = (u64, (usize, usize))>,
+{
+    fn new(updated_rows: I) -> Self {
+        Self {
+            updated_rows: updated_rows.peekable(),
+        }
+    }
+
+    fn reconcile_batch(&mut self, original_row_addrs: &[u64]) -> Result<Vec<(usize, usize)>> {
+        let mut indices = Vec::with_capacity(original_row_addrs.len());
+
+        for (original_offset, original_row_addr) in original_row_addrs.iter().enumerate() {
+            match self.updated_rows.peek().copied() {
+                Some((updated_row_addr, updated_row_index))
+                    if updated_row_addr == *original_row_addr =>
+                {
+                    self.updated_rows.next();
+                    indices.push(updated_row_index);
+                }
+                Some((updated_row_addr, _)) if updated_row_addr < *original_row_addr => {
+                    return Err(Self::missing_row_error(
+                        updated_row_addr,
+                        Some(*original_row_addr),
+                    ));
+                }
+                _ => indices.push((0, original_offset)),
+            }
+        }
+
+        Ok(indices)
+    }
+
+    fn finish(mut self) -> Result<()> {
+        if let Some((updated_row_addr, _)) = self.updated_rows.next() {
+            Err(Self::missing_row_error(updated_row_addr, None))
+        } else {
+            Ok(())
+        }
+    }
+
+    fn missing_row_error(updated_row_addr: u64, next_original_row_addr: Option<u64>) -> Error {
+        let updated_row_addr = RowAddress::from(updated_row_addr);
+        let position = next_original_row_addr.map_or_else(
+            || "no target rows remain".to_string(),
+            |row_addr| format!("next target row address is {}", RowAddress::from(row_addr)),
+        );
+        Error::internal(format!(
+            "Merge insert update row address {updated_row_addr} is missing from the target fragment; {position}"
+        ))
+    }
+}
 
 // "update if" expressions typically compare fields from the source table to the target table.
 // These tables have the same schema and so filter expressions need to differentiate.  To do that
@@ -1304,11 +1366,36 @@ impl MergeInsertJob {
                 )?;
 
                 let updated_rows: usize = batches.iter().map(|batch| batch.num_rows()).sum();
-                if Some(updated_rows) == metadata.physical_rows {
-                    // All rows have been updated and there are no deletions. So we
-                    // don't need to merge in existing values.
-                    // Also, because we already sorted by row address, the rows
-                    // will be in the correct order.
+
+                // This function is here to help rustc with lifetimes.
+                fn get_row_addr_iter(
+                    batches: &[RecordBatch],
+                ) -> impl Iterator<Item = (u64, (usize, usize))> + '_ + Send {
+                    batches.iter().enumerate().flat_map(|(batch_idx, batch)| {
+                        // The index in source batches will be one more.
+                        let batch_idx = batch_idx + 1;
+                        let row_addrs = batch
+                            .column_by_name(ROW_ADDR)
+                            .unwrap()
+                            .as_any()
+                            .downcast_ref::<UInt64Array>()
+                            .unwrap();
+                        row_addrs
+                            .values()
+                            .iter()
+                            .enumerate()
+                            .map(move |(offset, row_addr)| (*row_addr, (batch_idx, offset)))
+                    })
+                }
+
+                let has_full_fragment_coverage = metadata.deletion_file.is_none()
+                    && Some(updated_rows) == metadata.physical_rows
+                    && get_row_addr_iter(&batches)
+                        .map(|(row_addr, _)| row_addr)
+                        .eq(RowAddress::address_range(metadata.id as u32).take(updated_rows));
+                if has_full_fragment_coverage {
+                    // Exact, deletion-free coverage can be written directly because the
+                    // batches are sorted by row address.
 
                     let data_storage_version = dataset
                         .manifest()
@@ -1411,28 +1498,8 @@ impl MergeInsertJob {
                         source_batches.push(convert_json_columns(&dropped).map_err(Error::from)?);
                     }
 
-                    // This function is here to help rustc with lifetimes.
-                    fn get_row_addr_iter(
-                        batches: &[RecordBatch],
-                    ) -> impl Iterator<Item = (u64, (usize, usize))> + '_ + Send
-                    {
-                        batches.iter().enumerate().flat_map(|(batch_idx, batch)| {
-                            // The index in source batches will be one more.
-                            let batch_idx = batch_idx + 1;
-                            let row_addrs = batch
-                                .column_by_name(ROW_ADDR)
-                                .unwrap()
-                                .as_any()
-                                .downcast_ref::<UInt64Array>()
-                                .unwrap();
-                            row_addrs
-                                .values()
-                                .iter()
-                                .enumerate()
-                                .map(move |(offset, row_addr)| (*row_addr, (batch_idx, offset)))
-                        })
-                    }
-                    let mut updated_row_addr_iter = get_row_addr_iter(&batches).peekable();
+                    let mut updated_rows =
+                        UpdatedRowAddrReconciler::new(get_row_addr_iter(&batches));
 
                     while let Some(batch) = updater.next().await? {
                         source_batches[0] =
@@ -1444,34 +1511,13 @@ impl MergeInsertJob {
                             .as_any()
                             .downcast_ref::<UInt64Array>()
                             .unwrap();
-                        let indices = original_row_addrs
-                            .values()
-                            .into_iter()
-                            .enumerate()
-                            .map(|(original_offset, row_addr)| {
-                                match updated_row_addr_iter.peek() {
-                                    Some((updated_row_addr, _))
-                                        if *updated_row_addr == *row_addr =>
-                                    {
-                                        updated_row_addr_iter.next().unwrap().1
-                                    }
-                                    // If we have passed the next updated row address, something went wrong.
-                                    Some((updated_row_addr, _)) => {
-                                        debug_assert!(
-                                        *updated_row_addr > *row_addr,
-                                        "Got updated row address that is not in the original batch"
-                                    );
-                                        (0, original_offset)
-                                    }
-                                    _ => (0, original_offset),
-                                }
-                            })
-                            .collect::<Vec<_>>();
+                        let indices = updated_rows.reconcile_batch(original_row_addrs.values())?;
 
                         let updated_batch = interleave_batches(&source_batches, &indices)?;
 
                         updater.update(updated_batch).await?;
                     }
+                    updated_rows.finish()?;
 
                     let mut updated_fragment = updater.finish().await?;
 
@@ -2337,7 +2383,7 @@ impl MergeInsertJob {
 
                     for (fragment, sequence) in new_fragments.iter_mut().zip(sequences) {
                         let serialized = lance_table::rowids::write_row_ids(&sequence);
-                        fragment.row_id_meta = Some(RowIdMeta::Inline(serialized));
+                        fragment.row_id_meta = Some(RowIdMeta::Inline(serialized.into()));
                     }
                 }
 
@@ -2803,7 +2849,6 @@ impl Merger {
         &self,
         combined_batch: &RecordBatch,
         right_offset: usize,
-        num_keys: usize,
     ) -> Result<(BooleanArray, BooleanArray, BooleanArray)> {
         // The outer join distinguishes its three cases by which side's join
         // keys were NULL-padded: a present row always has non-null keys, while
@@ -2813,14 +2858,18 @@ impl Merger {
         // column (e.g. an all-null vector) at position 0, and checking
         // positions [0, num_keys) there misreads an all-null leading payload
         // column as an absent join side, silently dropping every matched row
-        // (https://github.com/lancedb/lancedb/issues/3515). The target half
-        // carries the same columns in the same order, offset by `right_offset`.
+        // (https://github.com/lancedb/lancedb/issues/3515). The target half is
+        // resolved independently because the indexed path keeps dataset-schema
+        // order even when the source fields are reordered. Restrict that lookup
+        // to the target half because a valid source field can have the same
+        // `target_`-prefixed name.
+        let combined_schema = combined_batch.schema();
         let source_key_cols = self
             .params
             .on
             .iter()
             .map(|key| {
-                combined_batch.schema().index_of(key).map_err(|_| {
+                combined_schema.index_of(key).map_err(|_| {
                     Error::internal(format!(
                         "merge insert key column '{}' not found in joined batch",
                         key
@@ -2828,11 +2877,26 @@ impl Merger {
                 })
             })
             .collect::<Result<Vec<_>>>()?;
-        debug_assert_eq!(source_key_cols.len(), num_keys);
-        let target_key_cols = source_key_cols
+        let target_key_cols = self
+            .params
+            .on
             .iter()
-            .map(|c| c + right_offset)
-            .collect::<Vec<_>>();
+            .map(|key| {
+                let target_key = format!("target_{key}");
+                combined_schema
+                    .fields()
+                    .iter()
+                    .enumerate()
+                    .skip(right_offset)
+                    .find_map(|(index, field)| (field.name() == &target_key).then_some(index))
+                    .ok_or_else(|| {
+                        Error::internal(format!(
+                            "merge insert target key column '{}' not found in joined batch",
+                            target_key
+                        ))
+                    })
+            })
+            .collect::<Result<Vec<_>>>()?;
 
         let in_left = Self::not_all_null(combined_batch, &source_key_cols)?;
         let in_right = Self::not_all_null(combined_batch, &target_key_cols)?;
@@ -2868,14 +2932,11 @@ impl Merger {
             (num_fields - 2, Some(num_fields - 1), (num_fields - 2) / 2)
         };
 
-        let num_keys = self.params.on.len();
-
         let left_cols = Vec::from_iter(0..right_offset);
         let right_cols_with_id = Vec::from_iter(right_offset..num_fields);
 
         let mut batches = Vec::with_capacity(2);
-        let (left_only, in_both, right_only) =
-            self.extract_selections(&batch, right_offset, num_keys)?;
+        let (left_only, in_both, right_only) = self.extract_selections(&batch, right_offset)?;
 
         // There is no contention on this mutex.  We're only using it to bypass the rust
         // borrow checker (the stream needs to be `sync` since it crosses an await point)
@@ -3184,6 +3245,74 @@ mod tests {
         }
 
         assert_eq!(fill_depth(8), fill_depth(512));
+    }
+
+    #[test]
+    fn test_updated_row_addr_missing_between_target_rows() {
+        let row_addr = |offset| u64::from(RowAddress::new_from_parts(3, offset));
+        let mut updated_rows = UpdatedRowAddrReconciler::new([(row_addr(1), (1, 0))].into_iter());
+
+        let error = updated_rows
+            .reconcile_batch(&[row_addr(0), row_addr(2)])
+            .unwrap_err();
+
+        assert!(matches!(error, Error::Internal { .. }));
+        let message = error.to_string();
+        assert!(message.contains("update row address (3, 1) is missing"));
+        assert!(message.contains("next target row address is (3, 2)"));
+    }
+
+    #[test]
+    fn test_updated_row_addr_missing_after_target_rows() {
+        let row_addr = |offset| u64::from(RowAddress::new_from_parts(7, offset));
+        let mut updated_rows = UpdatedRowAddrReconciler::new([(row_addr(2), (1, 0))].into_iter());
+
+        assert_eq!(
+            updated_rows
+                .reconcile_batch(&[row_addr(0), row_addr(1)])
+                .unwrap(),
+            vec![(0, 0), (0, 1)]
+        );
+        let error = updated_rows.finish().unwrap_err();
+
+        assert!(matches!(error, Error::Internal { .. }));
+        let message = error.to_string();
+        assert!(message.contains("update row address (7, 2) is missing"));
+        assert!(message.contains("no target rows remain"));
+    }
+
+    #[tokio::test]
+    async fn test_updated_row_addr_missing_in_full_fragment_update() {
+        let initial = record_batch!(("value", Int32, [10, 20])).unwrap();
+        let dataset = Arc::new(
+            InsertBuilder::new("memory://")
+                .execute(vec![initial])
+                .await
+                .unwrap(),
+        );
+        let fragment_id = dataset.get_fragments()[0].id() as u32;
+        let row_addr = |offset| u64::from(RowAddress::new_from_parts(fragment_id, offset));
+        let updates = record_batch!(
+            (ROW_ADDR, UInt64, [row_addr(0), row_addr(2)]),
+            ("value", Int32, [100, 200])
+        )
+        .unwrap();
+        let update_stream =
+            RecordBatchStreamAdapter::new(updates.schema(), futures::stream::iter([Ok(updates)]));
+
+        let error = MergeInsertJob::update_fragments(
+            dataset.clone(),
+            Box::pin(update_stream),
+            dataset.manifest().version + 1,
+            None,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(matches!(error, Error::Internal { .. }));
+        let message = error.to_string();
+        assert!(message.contains("update row address (0, 2) is missing"));
+        assert!(message.contains("no target rows remain"));
     }
 
     // An update-style merge_insert leaves the source and new fragments with
@@ -4422,6 +4551,75 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(n_indexed, UPD, "expected {UPD} rows flipped to 'indexed'");
+    }
+
+    #[rstest::rstest]
+    #[case::reordered_null_payload(false, Some(42))]
+    #[case::target_name_collision(true, None)]
+    #[tokio::test]
+    async fn test_indexed_partial_merge_with_reordered_source(
+        #[case] has_target_name_collision: bool,
+        #[case] expected_payload: Option<i32>,
+    ) {
+        let (target, source, payload_column) = if has_target_name_collision {
+            (
+                record_batch!(
+                    ("id", UInt64, [1]),
+                    ("target_id", Int32, [9]),
+                    ("b", Int32, [7])
+                )
+                .unwrap(),
+                record_batch!(("target_id", Int32, [None]), ("id", UInt64, [1])).unwrap(),
+                "target_id",
+            )
+        } else {
+            (
+                record_batch!(("id", UInt64, [1]), ("a", Int32, [None]), ("b", Int32, [7]))
+                    .unwrap(),
+                record_batch!(("a", Int32, [42]), ("id", UInt64, [1])).unwrap(),
+                "a",
+            )
+        };
+        let mut dataset = InsertBuilder::new("memory://")
+            .execute(vec![target])
+            .await
+            .unwrap();
+        dataset
+            .create_index(
+                &["id"],
+                IndexType::Scalar,
+                None,
+                &ScalarIndexParams::default(),
+                false,
+            )
+            .await
+            .unwrap();
+
+        let source_schema = source.schema();
+        let (dataset, stats) =
+            MergeInsertBuilder::try_new(Arc::new(dataset), vec!["id".to_string()])
+                .unwrap()
+                .when_matched(WhenMatched::UpdateAll)
+                .when_not_matched(WhenNotMatched::DoNothing)
+                .try_build()
+                .unwrap()
+                .execute_reader(RecordBatchIterator::new([Ok(source)], source_schema))
+                .await
+                .unwrap();
+
+        assert_eq!(stats.num_inserted_rows, 0);
+        assert_eq!(stats.num_updated_rows, 1);
+        assert_eq!(stats.num_deleted_rows, 0);
+        let result = dataset
+            .scan()
+            .project(&[payload_column])
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        let payload = result[payload_column].as_primitive::<Int32Type>();
+        let actual_payload = (!payload.is_null(0)).then(|| payload.value(0));
+        assert_eq!(actual_payload, expected_payload);
     }
 
     #[tokio::test]

@@ -17,7 +17,7 @@ use crate::{
         STRUCTURAL_ENCODING_FULLZIP, STRUCTURAL_ENCODING_META_KEY, STRUCTURAL_ENCODING_MINIBLOCK,
         STRUCTURAL_ENCODING_SPARSE,
     },
-    data::DictionaryDataBlock,
+    data::{DictionaryDataBlock, concat_decoded_arrays},
     decoder::BinaryPruneFilter,
     encodings::logical::primitive::blob::{BlobDescriptionPageScheduler, BlobPageScheduler},
     format::{
@@ -25,7 +25,9 @@ use crate::{
         pb21::{self, CompressiveEncoding, PageLayout, compressive_encoding::Compression},
     },
 };
-use arrow_array::{Array, ArrayRef, PrimitiveArray, cast::AsArray, make_array, types::UInt64Type};
+use arrow_array::{
+    Array, ArrayRef, PrimitiveArray, cast::AsArray, make_array, new_null_array, types::UInt64Type,
+};
 use arrow_buffer::{
     ArrowNativeType, BooleanBuffer, BooleanBufferBuilder, NullBuffer, ScalarBuffer,
 };
@@ -65,7 +67,7 @@ use crate::{
     repdef::{
         CompositeRepDefUnraveler, ControlWordIterator, ControlWordParser, DefinitionInterpretation,
         MiniBlockRepDefBudget, NormalizedStructuralPlan, RepDefSlicer, SerializedRepDefs,
-        build_control_word_iterator,
+        build_control_word_iterator, max_visible_level,
     },
     utils::accumulation::AccumulationQueue,
 };
@@ -740,12 +742,7 @@ impl StructuralPageDecoder for MiniBlockDecoder {
         // we were still in the middle of loading rows.  We do need to latch skip_in_chunk though.
         self.offset_in_current_chunk = skip_in_chunk;
 
-        let max_visible_level = self
-            .def_meaning
-            .iter()
-            .take_while(|l| !l.is_list())
-            .map(|l| l.num_def_levels())
-            .sum::<u16>();
+        let max_visible_level = max_visible_level(&self.def_meaning);
 
         Ok(Box::new(DecodeMiniBlockTask {
             instructions: drain_instructions,
@@ -1474,11 +1471,7 @@ impl ComplexAllNullScheduler {
             .iter()
             .map(|meaning| meaning.num_def_levels())
             .sum::<u16>();
-        let max_visible_level = def_meaning
-            .iter()
-            .take_while(|l| !l.is_list())
-            .map(|l| l.num_def_levels())
-            .sum::<u16>();
+        let max_visible_level = max_visible_level(&def_meaning);
         Self {
             buffer_offsets_and_sizes,
             def_meaning,
@@ -2919,11 +2912,7 @@ impl FullZipScheduler {
             .collect::<Vec<_>>();
 
         let max_rep = def_meaning.iter().filter(|d| d.is_list()).count() as u16;
-        let max_visible_def = def_meaning
-            .iter()
-            .filter(|d| !d.is_list())
-            .map(|d| d.num_def_levels())
-            .sum();
+        let max_visible_def = max_visible_level(&def_meaning);
 
         let bits_per_offset = match layout.details {
             Some(pb21::full_zip_layout::Details::BitsPerValue(_)) => 32,
@@ -3320,9 +3309,14 @@ struct FixedFullZipDecoder {
 }
 
 impl FixedFullZipDecoder {
-    fn slice_next_task(&mut self, num_rows: u64) -> FullZipDecodeTaskItem {
+    fn slice_next_task(&mut self, num_rows: u64) -> Result<FullZipDecodeTaskItem> {
         debug_assert!(num_rows > 0);
-        let cur_buf = self.data.front_mut().unwrap();
+        let cur_buf = self.data.front_mut().ok_or_else(|| {
+            Error::corrupt_file_named(
+                "fixed_full_zip",
+                format!("page data ran out with {num_rows} row(s) left to decode"),
+            )
+        })?;
         let start = self.offset_in_current;
         if self.details.ctrl_word_parser.has_rep() {
             // This is a slightly slower path.  In order to figure out where to split we need to
@@ -3331,7 +3325,22 @@ impl FixedFullZipDecoder {
             // We always need at least one value.  Now loop through until we have passed num_rows
             // values
             let mut num_items = 0;
+            let bytes_per_word = self.details.ctrl_word_parser.bytes_per_word();
             while self.offset_in_current < cur_buf.len() {
+                // The item walk is driven by the control words themselves, so a page that
+                // disagrees with its own layout can step past the end of the buffer.  Check
+                // before every read and every advance so that a malformed page is reported
+                // instead of panicking in `slice_with_length`.
+                let bytes_avail = cur_buf.len() - self.offset_in_current;
+                if bytes_avail < bytes_per_word {
+                    return Err(Error::corrupt_file_named(
+                        "fixed_full_zip",
+                        format!(
+                            "truncated control word: {bytes_avail} byte(s) remain in the page \
+                             buffer but a control word requires {bytes_per_word}"
+                        ),
+                    ));
+                }
                 let control = self.details.ctrl_word_parser.parse_desc(
                     &cur_buf[self.offset_in_current..],
                     self.details.max_rep,
@@ -3344,11 +3353,22 @@ impl FixedFullZipDecoder {
                     rows_started += 1;
                 }
                 num_items += 1;
-                if control.is_visible {
-                    self.offset_in_current += self.total_bytes_per_value;
+                let bytes_in_item = if control.is_visible {
+                    self.total_bytes_per_value
                 } else {
-                    self.offset_in_current += self.details.ctrl_word_parser.bytes_per_word();
+                    bytes_per_word
+                };
+                if bytes_in_item > bytes_avail {
+                    return Err(Error::corrupt_file_named(
+                        "fixed_full_zip",
+                        format!(
+                            "truncated item: {bytes_avail} byte(s) remain in the page buffer at \
+                             offset {} but the item requires {bytes_in_item}",
+                            self.offset_in_current
+                        ),
+                    ));
                 }
+                self.offset_in_current += bytes_in_item;
             }
 
             let task_slice = cur_buf.slice_with_length(start, self.offset_in_current - start);
@@ -3357,7 +3377,7 @@ impl FixedFullZipDecoder {
                 self.offset_in_current = 0;
             }
 
-            FullZipDecodeTaskItem {
+            Ok(FullZipDecodeTaskItem {
                 data: PerValueDataBlock::Fixed(FixedWidthDataBlock {
                     data: task_slice,
                     bits_per_value: self.bytes_per_value as u64 * 8,
@@ -3365,7 +3385,7 @@ impl FixedFullZipDecoder {
                     block_info: BlockInfo::new(),
                 }),
                 rows_in_buf: rows_started,
-            }
+            })
         } else {
             // If there's no repetition we can calculate the slicing point by just multiplying
             // the number of rows by the total bytes per value
@@ -3386,7 +3406,7 @@ impl FixedFullZipDecoder {
                 self.offset_in_current += bytes_needed;
                 cur_buf.slice_with_length(offset_in_cur, bytes_needed)
             };
-            FullZipDecodeTaskItem {
+            Ok(FullZipDecodeTaskItem {
                 data: PerValueDataBlock::Fixed(FixedWidthDataBlock {
                     data: task_slice,
                     bits_per_value: self.bytes_per_value as u64 * 8,
@@ -3394,7 +3414,7 @@ impl FixedFullZipDecoder {
                     block_info: BlockInfo::new(),
                 }),
                 rows_in_buf: rows_taken,
-            }
+            })
         }
     }
 }
@@ -3404,7 +3424,7 @@ impl StructuralPageDecoder for FixedFullZipDecoder {
         let mut task_data = Vec::with_capacity(self.data.len());
         let mut remaining = num_rows;
         while remaining > 0 {
-            let task_item = self.slice_next_task(remaining);
+            let task_item = self.slice_next_task(remaining)?;
             remaining -= task_item.rows_in_buf;
             task_data.push(task_item);
         }
@@ -4415,7 +4435,7 @@ impl StructuralDecodeArrayTask for StructuralCompositeDecodeArrayTask {
             arrays.push(array);
         }
         let array_refs = arrays.iter().map(|arr| arr.as_ref()).collect::<Vec<_>>();
-        let array = arrow_select::concat::concat(&array_refs)?;
+        let array = concat_decoded_arrays(&array_refs)?;
         let mut repdef = CompositeRepDefUnraveler::new(unravelers);
 
         let array = Self::restore_validity(array, &mut repdef)?;
@@ -6516,6 +6536,22 @@ impl PrimitiveStructuralEncoder {
         }
 
         if let DataBlock::Dictionary(dict) = data_block {
+            // Merging the buffered chunks can widen dictionary indices beyond
+            // the declared key type (see `concat_dict_arrays`).  The physical
+            // index width must match the schema, so reject the mismatch instead
+            // of persisting a file the reader would later reject as corrupt.
+            if let DataType::Dictionary(key_type, _) = field.data_type() {
+                let declared_key_bits = key_type.byte_width() as u64 * 8;
+                if dict.indices.bits_per_value != declared_key_bits {
+                    return Err(Error::invalid_input(format!(
+                        "Field '{}' is declared as {} but the merged dictionary needs {} bits per index and the declared key type addresses only {} bits; widen the dictionary key type to hold the merged values",
+                        field.name,
+                        field.data_type(),
+                        dict.indices.bits_per_value,
+                        declared_key_bits,
+                    )));
+                }
+            }
             log::debug!(
                 "Encoding column {} with {} items using dictionary encoding (already dictionary encoded)",
                 column_idx,
@@ -6609,6 +6645,97 @@ impl PrimitiveStructuralEncoder {
         }
     }
 
+    /// Rebuilds dictionary chunks whose values array is empty.
+    ///
+    /// Such chunks are entirely null and retain their key validity until rep/def has been
+    /// recorded.  At flush time their keys are zeroed and attached to a neighboring non-empty
+    /// dictionary.  If every chunk is empty, one non-null placeholder value makes key zero valid.
+    /// Rep/def retains the logical nullness, so these replacement keys are never exposed.
+    fn rebuild_empty_dictionary_chunks(arrays: Vec<ArrayRef>) -> Result<Vec<ArrayRef>> {
+        if !arrays.iter().any(|array| {
+            array
+                .as_any_dictionary_opt()
+                .is_some_and(|dictionary| dictionary.values().is_empty())
+        }) {
+            return Ok(arrays);
+        }
+
+        let zeroed = |data_type: &DataType, len: usize| {
+            new_null_array(data_type, len)
+                .to_data()
+                .into_builder()
+                .nulls(None)
+                .build()
+                .map(make_array)
+        };
+        let rebuild =
+            |keys: Vec<ArrayRef>, data_type: &DataType, values: ArrayRef| -> Result<ArrayRef> {
+                let keys = keys.iter().map(|keys| keys.as_ref()).collect::<Vec<_>>();
+                let keys = arrow_select::concat::concat(&keys)?;
+                let data = keys
+                    .to_data()
+                    .into_builder()
+                    .data_type(data_type.clone())
+                    .child_data(vec![values.to_data()])
+                    .build()?;
+                Ok(make_array(data))
+            };
+
+        let mut rebuilt = Vec::with_capacity(arrays.len());
+        let mut pending_keys = Vec::with_capacity(arrays.len());
+        let mut empty_data_type = None;
+        for array in arrays {
+            let Some(dictionary) = array.as_any_dictionary_opt() else {
+                return Err(Error::invalid_input_source(
+                    "Cannot mix dictionary and non-dictionary chunks".into(),
+                ));
+            };
+            if dictionary.values().is_empty() {
+                pending_keys.push(zeroed(dictionary.keys().data_type(), array.len())?);
+                empty_data_type.get_or_insert_with(|| array.data_type().clone());
+            } else if pending_keys.is_empty() {
+                rebuilt.push(array);
+            } else {
+                pending_keys.push(make_array(dictionary.keys().to_data()));
+                rebuilt.push(rebuild(
+                    std::mem::take(&mut pending_keys),
+                    array.data_type(),
+                    dictionary.values().clone(),
+                )?);
+            }
+        }
+
+        if pending_keys.is_empty() {
+            return Ok(rebuilt);
+        }
+        if let Some(array) = rebuilt.pop() {
+            let Some(dictionary) = array.as_any_dictionary_opt() else {
+                return Err(Error::invalid_input_source(
+                    "Cannot mix dictionary and non-dictionary chunks".into(),
+                ));
+            };
+            let mut keys = Vec::with_capacity(pending_keys.len() + 1);
+            keys.push(make_array(dictionary.keys().to_data()));
+            keys.append(&mut pending_keys);
+            rebuilt.push(rebuild(
+                keys,
+                array.data_type(),
+                dictionary.values().clone(),
+            )?);
+        } else {
+            let data_type = empty_data_type.ok_or_else(|| {
+                Error::internal("Missing data type for an empty dictionary chunk")
+            })?;
+            let DataType::Dictionary(_, value_type) = &data_type else {
+                return Err(Error::internal(format!(
+                    "Expected dictionary data type, got {data_type}"
+                )));
+            };
+            rebuilt.push(rebuild(pending_keys, &data_type, zeroed(value_type, 1)?)?);
+        }
+        Ok(rebuilt)
+    }
+
     // Creates encode tasks, consuming all buffered data
     fn do_flush(
         &mut self,
@@ -6617,6 +6744,7 @@ impl PrimitiveStructuralEncoder {
         row_number: u64,
         num_rows: u64,
     ) -> Result<Vec<EncodeTask>> {
+        let arrays = Self::rebuild_empty_dictionary_chunks(arrays)?;
         let num_values = arrays.iter().map(|arr| arr.len() as u64).sum();
         let is_simple_validity = repdefs.iter().all(|rd| rd.is_simple_validity());
         let has_repdef_info = repdefs.iter().any(|rd| !rd.is_empty());
@@ -6679,6 +6807,14 @@ impl PrimitiveStructuralEncoder {
             } else {
                 repdef.add_validity_bitmap(deep_copy_nulls(Some(validity)).unwrap());
             }
+            // Empty dictionaries have no valid key payload.  Keep the validity until rep/def is
+            // grouped with the buffered page; `do_flush` then rebuilds the keys against either a
+            // neighboring values array or an all-empty-page placeholder.
+            if let Some(dictionary) = array.as_any_dictionary_opt()
+                && dictionary.values().is_empty()
+            {
+                return Ok(array);
+            }
             let data_no_nulls = array.to_data().into_builder().nulls(None).build()?;
             Ok(make_array(data_no_nulls))
         } else {
@@ -6699,6 +6835,7 @@ impl PrimitiveStructuralEncoder {
             }
             DataType::Dictionary(_, _) => {
                 array = dict::normalize_dict_nulls(array)?;
+                array = dict::clear_out_of_range_null_keys(array)?;
                 Self::extract_validity_buf(array, repdef, keep_original_array)
             }
             // Extract our validity buf but NOT any child validity bufs. (they will be encoded in
@@ -7074,9 +7211,16 @@ mod tests {
     use crate::format::pb21::compressive_encoding::Compression;
     use crate::repdef::build_control_word_iterator;
     use crate::testing::TestEncoding;
-    use crate::testing::{TestCases, check_round_trip_encoding_of_data};
-    use arrow_array::{ArrayRef, Int8Array, StringArray};
-    use arrow_buffer::ScalarBuffer;
+    use crate::testing::{
+        TestCases, check_round_trip_encoding_of_data,
+        check_round_trip_encoding_of_data_with_expected,
+    };
+    use arrow_array::{
+        Array, ArrayRef, DictionaryArray, Int8Array, PrimitiveArray, StringArray, UInt16Array,
+        new_null_array,
+        types::{Int8Type, Int32Type},
+    };
+    use arrow_buffer::{BooleanBuffer, NullBuffer, ScalarBuffer};
     use arrow_schema::{DataType, Field as ArrowField};
     use std::collections::HashMap;
     use std::{collections::VecDeque, sync::Arc};
@@ -7099,6 +7243,75 @@ mod tests {
         ]);
         let block = DataBlock::from_array(string_array);
         assert!((!PrimitiveStructuralEncoder::is_narrow(&block)));
+    }
+
+    fn valued_dictionary() -> ArrayRef {
+        Arc::new(
+            DictionaryArray::<Int32Type>::try_new(
+                PrimitiveArray::<Int32Type>::from(vec![0]),
+                Arc::new(StringArray::from(vec!["a"])),
+            )
+            .unwrap(),
+        )
+    }
+
+    fn empty_dictionary() -> ArrayRef {
+        new_null_array(
+            &DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8)),
+            1,
+        )
+    }
+
+    fn null_valued_dictionary() -> ArrayRef {
+        Arc::new(
+            DictionaryArray::<Int32Type>::try_new(
+                PrimitiveArray::<Int32Type>::from(vec![0]),
+                Arc::new(StringArray::from(vec![None::<&str>])),
+            )
+            .unwrap(),
+        )
+    }
+
+    fn sliced_empty_dictionary_with_hidden_key_payload() -> ArrayRef {
+        let keys = PrimitiveArray::<Int32Type>::new(
+            ScalarBuffer::from(vec![5, 7, 9]),
+            Some(NullBuffer::new(BooleanBuffer::new_unset(3))),
+        );
+        let values = Arc::new(StringArray::from(Vec::<&str>::new())) as ArrayRef;
+        let dictionary = DictionaryArray::<Int32Type>::try_new(keys, values).unwrap();
+        Arc::new(dictionary.slice(1, 1))
+    }
+
+    #[rstest::rstest]
+    #[case::empty_after_value(vec![valued_dictionary(), empty_dictionary()])]
+    #[case::empty_before_value(vec![empty_dictionary(), valued_dictionary()])]
+    #[case::null_value_after_value(vec![valued_dictionary(), null_valued_dictionary()])]
+    #[case::hidden_sliced_after_value(vec![
+        valued_dictionary(),
+        sliced_empty_dictionary_with_hidden_key_payload(),
+    ])]
+    #[tokio::test]
+    async fn test_mixed_valued_and_all_null_dictionary_chunks(#[case] dictionaries: Vec<ArrayRef>) {
+        check_round_trip_encoding_of_data(
+            dictionaries,
+            &TestCases::default()
+                .with_structural_encodings()
+                .with_page_sizes(vec![4096]),
+            HashMap::new(),
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn test_sliced_empty_dictionary_with_hidden_key_payload() {
+        check_round_trip_encoding_of_data(
+            vec![sliced_empty_dictionary_with_hidden_key_payload()],
+            &TestCases::default()
+                .with_structural_encodings()
+                .with_page_sizes(vec![4096]),
+            HashMap::new(),
+        )
+        .await;
     }
 
     #[test]
@@ -9581,6 +9794,43 @@ mod tests {
         check_round_trip_encoding_of_data(vec![arr], &test_cases, HashMap::new()).await;
     }
 
+    fn hand_built_dictionary_with_out_of_range_null_keys() -> ArrayRef {
+        use arrow_array::{DictionaryArray, Int32Array, types::Int32Type};
+        use arrow_buffer::NullBuffer;
+
+        let keys = Int32Array::new(
+            vec![0, 7, 7].into(),
+            Some(NullBuffer::from(vec![true, false, false])),
+        );
+        let values = Arc::new(StringArray::from(vec!["a"]));
+        Arc::new(DictionaryArray::<Int32Type>::try_new(keys, values).unwrap()) as ArrayRef
+    }
+
+    fn concatenated_dictionary_with_out_of_range_null_keys() -> ArrayRef {
+        use arrow_array::{builder::StringDictionaryBuilder, new_null_array, types::Int32Type};
+
+        let mut builder = StringDictionaryBuilder::<Int32Type>::new();
+        builder.append_value("a");
+        for _ in 0..7 {
+            builder.append_null();
+        }
+        let valued = Arc::new(builder.finish()) as ArrayRef;
+        let all_null = new_null_array(valued.data_type(), 8);
+        arrow_select::concat::concat(&[valued.as_ref(), all_null.as_ref()]).unwrap()
+    }
+
+    #[rstest::rstest]
+    #[case::hand_built(hand_built_dictionary_with_out_of_range_null_keys())]
+    #[case::concatenated(concatenated_dictionary_with_out_of_range_null_keys())]
+    #[tokio::test]
+    async fn test_dictionary_out_of_range_null_keys_round_trip(#[case] dictionary: ArrayRef) {
+        let test_cases = TestCases::default()
+            .with_encoding(TestEncoding::StructuralU32)
+            .with_page_sizes(vec![4096]);
+
+        check_round_trip_encoding_of_data(vec![dictionary], &test_cases, HashMap::new()).await;
+    }
+
     #[test]
     fn test_encode_decode_complex_all_null_vals_roundtrip() {
         use crate::compression::{DecompressionStrategy, DefaultDecompressionStrategy};
@@ -10258,5 +10508,247 @@ mod tests {
                 "error should say what is wrong, got: {msg}"
             );
         }
+    }
+
+    /// Drains `num_rows` from a single-buffer fixed full-zip page built from `buf`.
+    ///
+    /// `bits_rep` picks the control word width (1 -> one byte, 9 -> two bytes) and each
+    /// visible item is a one-word control plus a 4 byte value.
+    fn drain_fixed_full_zip(buf: Vec<u8>, bits_rep: u8, num_rows: u64) -> lance_core::Result<()> {
+        use crate::compression::FixedPerValueDecompressor;
+        use crate::decoder::StructuralPageDecoder;
+        use crate::repdef::{ControlWordParser, DefinitionInterpretation};
+        use std::collections::VecDeque;
+        use std::sync::Arc;
+
+        #[derive(Debug)]
+        struct UnusedFixedDecompressor;
+
+        impl FixedPerValueDecompressor for UnusedFixedDecompressor {
+            fn decompress(&self, _: FixedWidthDataBlock, _: u64) -> crate::Result<DataBlock> {
+                unreachable!("these cases fail while slicing, before any value is decoded")
+            }
+
+            fn bits_per_value(&self) -> u64 {
+                32
+            }
+        }
+
+        let details = Arc::new(super::FullZipDecodeDetails {
+            value_decompressor: super::PerValueDecompressor::Fixed(Arc::new(
+                UnusedFixedDecompressor,
+            )),
+            def_meaning: vec![DefinitionInterpretation::AllValidList].into(),
+            ctrl_word_parser: ControlWordParser::new(bits_rep, 0),
+            max_rep: 1,
+            max_visible_def: 0,
+        });
+        let bytes_per_word = bits_rep.div_ceil(8) as usize;
+
+        let mut data = VecDeque::new();
+        data.push_back(crate::buffer::LanceBuffer::from(buf));
+        let mut decoder = super::FixedFullZipDecoder {
+            details,
+            data,
+            offset_in_current: 0,
+            bytes_per_value: 4,
+            total_bytes_per_value: 4 + bytes_per_word,
+            num_rows,
+        };
+        decoder.drain(num_rows).map(|_| ())
+    }
+
+    /// Two one-item rows, each a control word plus a 4 byte value, slice cleanly.
+    #[test]
+    fn fixed_full_zip_wellformed_page_slices() {
+        assert!(drain_fixed_full_zip(vec![1, 0, 0, 0, 0, 1, 0, 0, 0, 0], 1, 2).is_ok());
+    }
+
+    /// The item walk is driven by the page's own control words, so a page that disagrees
+    /// with its layout can run off the end of the buffer.  Each way of doing so must
+    /// surface a corrupt-file error.
+    ///
+    /// These assert the error variant and message rather than merely expecting a panic:
+    /// before the walk was bounds checked these aborted the process inside
+    /// `LanceBuffer::slice_with_length`, which a `#[should_panic]` test would have
+    /// accepted as a pass.
+    #[rstest::rstest]
+    // Second value is one byte short of a full 4 byte value
+    #[case::truncated_item(vec![1, 0, 0, 0, 0, 1, 0, 0, 0], 1, 2, "truncated item")]
+    // Two byte control words, with a lone trailing byte after the first item
+    #[case::truncated_control_word(
+        vec![1, 0, 0, 0, 0, 0, 1],
+        9,
+        2,
+        "truncated control word"
+    )]
+    // A well-formed two row page cannot satisfy a request for three rows
+    #[case::page_exhausted(vec![1, 0, 0, 0, 0, 1, 0, 0, 0, 0], 1, 3, "page data ran out")]
+    fn fixed_full_zip_malformed_page_is_corrupt_file(
+        #[case] buf: Vec<u8>,
+        #[case] bits_rep: u8,
+        #[case] num_rows: u64,
+        #[case] expected_msg: &str,
+    ) {
+        use lance_core::Error;
+
+        let err = drain_fixed_full_zip(buf, bits_rep, num_rows)
+            .expect_err("a malformed page must not slice");
+        assert!(
+            matches!(err, Error::CorruptFile { .. }),
+            "expected CorruptFile, got: {err:?}"
+        );
+        let msg = err.to_string();
+        assert!(
+            msg.contains(expected_msg),
+            "error should say what is wrong, got: {msg}"
+        );
+    }
+
+    fn int8_dictionary_with_all_values() -> ArrayRef {
+        let values: Vec<u16> = (0..127u16).collect();
+        let keys: Vec<i8> = (0..127)
+            .map(|i| ((i as u64).wrapping_mul(2_654_435_761) % 127) as i8)
+            .collect();
+        Arc::new(
+            DictionaryArray::<Int8Type>::try_new(
+                Int8Array::from(keys),
+                Arc::new(UInt16Array::from(values)),
+            )
+            .unwrap(),
+        )
+    }
+
+    #[rstest::rstest]
+    // Both chunks land in one page, which the writer merges.
+    #[case::one_page(4096, vec![TestEncoding::StructuralU32])]
+    // Each chunk is its own page, so the reader merges the two decoded dictionaries
+    // for a batch that spans both pages.
+    #[case::page_per_chunk(
+        64,
+        vec![TestEncoding::Array, TestEncoding::StructuralU16, TestEncoding::StructuralU32]
+    )]
+    #[tokio::test]
+    async fn test_dictionary_merge_keeps_declared_key_type_round_trip(
+        #[case] page_size: u64,
+        #[case] encodings: Vec<TestEncoding>,
+    ) {
+        // Two Dictionary(Int8, UInt16) chunks, each holding all 127 values an Int8
+        // key can address.  Arrow's lossy concat merge over-counts the union (hash
+        // collisions in its interner) and overflows Int8, although the exact union
+        // fits.  The column must round-trip with its declared key type.
+        let a = int8_dictionary_with_all_values();
+        let b = int8_dictionary_with_all_values();
+        // Build the expected array directly: `concat` hits the same Arrow
+        // interner overflow, so the test harness cannot derive it.
+        let values: Vec<u16> = (0..127u16).collect();
+        let permutation: Vec<i8> = (0..127)
+            .map(|i| ((i as u64).wrapping_mul(2_654_435_761) % 127) as i8)
+            .collect();
+        let mut keys = permutation.clone();
+        keys.extend_from_slice(&permutation);
+        let expected: ArrayRef = Arc::new(
+            DictionaryArray::<Int8Type>::try_new(
+                Int8Array::from(keys),
+                Arc::new(UInt16Array::from(values)),
+            )
+            .unwrap(),
+        );
+        let test_cases = TestCases::default()
+            .with_encodings(encodings)
+            .with_page_sizes(vec![page_size])
+            .with_batch_size(1000);
+        check_round_trip_encoding_of_data_with_expected(
+            vec![a, b],
+            Some(expected),
+            &test_cases,
+            HashMap::new(),
+        )
+        .await;
+    }
+
+    fn disjoint_int8_dictionary(offset: u16) -> ArrayRef {
+        let values: Vec<u16> = (0..100u16).map(|value| value + offset).collect();
+        let keys: Vec<i8> = (0..100).map(|i| i as i8).collect();
+        Arc::new(
+            DictionaryArray::<Int8Type>::try_new(
+                Int8Array::from(keys),
+                Arc::new(UInt16Array::from(values)),
+            )
+            .unwrap(),
+        )
+    }
+
+    #[tokio::test]
+    async fn test_dictionary_merge_overflow_is_rejected_at_write() {
+        // Two chunks with disjoint dictionaries whose exact union (200 values)
+        // cannot be addressed by Int8 indices.  The writer must reject the
+        // mismatch instead of persisting indices wider than the declared key.
+        use crate::encoder::{
+            ColumnIndexSequence, EncodingOptions, MIN_PAGE_BUFFER_ALIGNMENT, OutOfLineBuffers,
+        };
+        use crate::repdef::RepDefBuilder;
+        use crate::testing::{create_test_field_encoder, test_encoding_strategy};
+
+        let a = disjoint_int8_dictionary(0);
+        let b = disjoint_int8_dictionary(1000);
+        let field = ArrowField::new("d", a.data_type().clone(), false);
+        let lance_field = lance_core::datatypes::Field::try_from(&field).unwrap();
+        let encoding_strategy = test_encoding_strategy(TestEncoding::StructuralU32);
+        let mut column_index_seq = ColumnIndexSequence::default();
+        let encoding_options = EncodingOptions {
+            cache_bytes_per_column: 1024 * 1024,
+            max_page_bytes: 32 * 1024 * 1024,
+            keep_original_array: true,
+            buffer_alignment: MIN_PAGE_BUFFER_ALIGNMENT,
+        };
+        let mut encoder = create_test_field_encoder(
+            encoding_strategy.as_ref(),
+            &lance_field,
+            &mut column_index_seq,
+            &encoding_options,
+        )
+        .unwrap();
+
+        let mut external_buffers = OutOfLineBuffers::new(0, MIN_PAGE_BUFFER_ALIGNMENT);
+        let mut error = None;
+        for (index, array) in [a, b].into_iter().enumerate() {
+            let row_number = (index * 100) as u64;
+            match encoder.maybe_encode(
+                array,
+                &mut external_buffers,
+                RepDefBuilder::default(),
+                row_number,
+                100,
+            ) {
+                Ok(tasks) => {
+                    for task in tasks {
+                        if let Err(err) = task.await {
+                            error = Some(err);
+                            break;
+                        }
+                    }
+                }
+                Err(err) => error = Some(err),
+            }
+            if error.is_some() {
+                break;
+            }
+        }
+        if error.is_none() {
+            for task in encoder.flush(&mut external_buffers).unwrap() {
+                if let Err(err) = task.await {
+                    error = Some(err);
+                    break;
+                }
+            }
+        }
+
+        let error = error.expect("oversized dictionary merge must be rejected");
+        assert!(matches!(error, lance_core::Error::InvalidInput { .. }));
+        assert!(
+            error.to_string().contains("widen the dictionary key type"),
+            "unexpected error: {error}"
+        );
     }
 }

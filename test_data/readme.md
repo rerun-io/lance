@@ -36,3 +36,7 @@ folder contains a `datagen.py` script that generates one or more lance datasets.
   that cross the layout's block boundary and positions used by phrase queries.
   The v1 fixture also retains the retired `skip_merge` parameter written by Lance
   3.0.1.
+* `v10.0.0/null_slot_v2_0.lance` and `v10.0.0/disjoint_v2_1.lance`: Int8
+  dictionary columns whose pages store 32-bit indices. Lance 10.0.0 widened
+  them for the null slot it appended past the last Int8 key, and for two
+  chunks whose dictionaries did not fit Int8 together.
