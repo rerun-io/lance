@@ -159,10 +159,20 @@ impl CacheKey for FragReuseIndexKey<'_> {
     }
 }
 
+/// Cache key for the manifest's own index list, as read from the index section.
+///
+/// The cache handle is already prefixed by the dataset URI. The key adds the object
+/// store's own prefix, which carries what the URI does not (account, storage options),
+/// the version, and the manifest's `e_tag`. The `e_tag` tells apart a dataset recreated
+/// at the same location, whose version numbers start over, from the one it replaced. It
+/// is `None` where the location was not resolved against the store (after a rename-based
+/// commit, for detached versions, for a V1-named manifest, through an external manifest
+/// store), and the key then falls back to store and version.
 #[derive(Clone, Copy, Debug)]
 pub struct IndexMetadataKey<'a> {
     pub version: u64,
     pub store_identity: &'a str,
+    pub e_tag: Option<&'a str>,
 }
 
 impl CacheKey for IndexMetadataKey<'_> {
@@ -170,10 +180,11 @@ impl CacheKey for IndexMetadataKey<'_> {
 
     fn key(&self) -> Cow<'_, str> {
         Cow::Owned(format!(
-            "{}:{}/{}",
+            "{}:{}/{}/{}",
             self.store_identity.len(),
             self.store_identity,
-            self.version
+            self.version,
+            self.e_tag.unwrap_or("")
         ))
     }
 
@@ -188,10 +199,44 @@ impl CacheKey for IndexMetadataKey<'_> {
     fn write_key(&self, builder: &mut KeyBuilder) {
         builder.write_str(self.store_identity);
         builder.write_u64(self.version);
+        match self.e_tag {
+            Some(e_tag) => {
+                builder.write_some();
+                builder.write_str(e_tag);
+            }
+            None => builder.write_none(),
+        }
     }
 
     fn codec() -> Option<lance_core::cache::CacheCodec> {
         Some(lance_table::format::index_metadata_codec())
+    }
+}
+
+/// The index list of the snapshot a [`IndexMetadataKey`] names, with every entry's fragment
+/// bitmap remapped through the fragment reuse index. Its own namespace, memory-only: cheap
+/// to recompute per process. The remap reads only the reuse index's recorded rewrites, not
+/// the form it was opened in, so the entry is shared across forms like the raw list.
+#[derive(Clone, Copy, Debug)]
+pub struct DerivedIndexListingKey<'a>(pub IndexMetadataKey<'a>);
+
+impl CacheKey for DerivedIndexListingKey<'_> {
+    type ValueType = Vec<IndexMetadata>;
+
+    fn key(&self) -> Cow<'_, str> {
+        self.0.key()
+    }
+
+    fn type_name() -> &'static str {
+        "Vec<IndexMetadata>"
+    }
+
+    fn schema() -> CacheKeySchema {
+        CacheKeySchema::new("lance.index.derived-listing-key", 1)
+    }
+
+    fn write_key(&self, builder: &mut KeyBuilder) {
+        self.0.write_key(builder);
     }
 }
 
@@ -243,13 +288,46 @@ mod tests {
         let first = IndexMetadataKey {
             version: 7,
             store_identity: "s3$first-options",
+            e_tag: None,
         };
         let second = IndexMetadataKey {
             version: 7,
             store_identity: "s3$second-options",
+            e_tag: None,
         };
 
         assert_ne!(first.key(), second.key());
+    }
+
+    /// A dataset recreated at the same location starts its versions over; the manifest
+    /// generation is what tells its index list apart from the one it replaced.
+    #[test]
+    fn index_metadata_key_isolates_version_and_generation() {
+        let base = IndexMetadataKey {
+            version: 7,
+            store_identity: "s3$options",
+            e_tag: Some("etag"),
+        };
+        let other_version = IndexMetadataKey { version: 8, ..base };
+        let other_generation = IndexMetadataKey {
+            e_tag: Some("other-etag"),
+            ..base
+        };
+        let no_generation = IndexMetadataKey {
+            e_tag: None,
+            ..base
+        };
+
+        for other in [other_version, other_generation, no_generation] {
+            assert_ne!(base.key(), other.key());
+        }
+
+        // The remapped list shares the raw list's identity but not its namespace.
+        assert_eq!(DerivedIndexListingKey(base).key(), base.key());
+        assert_ne!(
+            DerivedIndexListingKey::schema().id(),
+            IndexMetadataKey::schema().id()
+        );
     }
 
     /// The remap form is its own hierarchy segment, so it cannot be confused with a URI
