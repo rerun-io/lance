@@ -4703,15 +4703,15 @@ mod tests {
         assert_eq!(after.hits - before.hits, 31);
     }
 
-    #[tokio::test]
-    async fn test_open_frag_reuse_index_with_zero_capacity_cache() {
-        let test_dir = TempStrDir::default();
+    /// A dataset with a fragment reuse index: four fragments, a btree on `id`, then a
+    /// compaction whose index remap is deferred so the index list needs remapping on load.
+    async fn write_dataset_with_frag_reuse_index(uri: &str) -> Dataset {
         let data = gen_batch()
             .col("id", array::step::<Int32Type>())
             .into_reader_rows(RowCount::from(400), BatchCount::from(1));
         let mut dataset = Dataset::write(
             data,
-            &test_dir,
+            uri,
             Some(WriteParams {
                 max_rows_per_file: 100,
                 ..Default::default()
@@ -4740,6 +4740,13 @@ mod tests {
         )
         .await
         .unwrap();
+        dataset
+    }
+
+    #[tokio::test]
+    async fn test_open_frag_reuse_index_with_zero_capacity_cache() {
+        let test_dir = TempStrDir::default();
+        let dataset = write_dataset_with_frag_reuse_index(&test_dir).await;
         assert!(
             dataset
                 .load_index_by_name(FRAG_REUSE_INDEX_NAME)
