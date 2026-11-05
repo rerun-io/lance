@@ -213,6 +213,33 @@ impl CacheKey for IndexMetadataKey<'_> {
     }
 }
 
+/// The index list of the snapshot a [`IndexMetadataKey`] names, with every entry's fragment
+/// bitmap remapped through the fragment reuse index. Its own namespace, memory-only: cheap
+/// to recompute per process. The remap reads only the reuse index's recorded rewrites, not
+/// the form it was opened in, so the entry is shared across forms like the raw list.
+#[derive(Clone, Copy, Debug)]
+pub struct DerivedIndexListingKey<'a>(pub IndexMetadataKey<'a>);
+
+impl CacheKey for DerivedIndexListingKey<'_> {
+    type ValueType = Vec<IndexMetadata>;
+
+    fn key(&self) -> Cow<'_, str> {
+        self.0.key()
+    }
+
+    fn type_name() -> &'static str {
+        "Vec<IndexMetadata>"
+    }
+
+    fn schema() -> CacheKeySchema {
+        CacheKeySchema::new("lance.index.derived-listing-key", 1)
+    }
+
+    fn write_key(&self, builder: &mut KeyBuilder) {
+        self.0.write_key(builder);
+    }
+}
+
 pub struct ProstAny(pub Arc<prost_types::Any>);
 
 impl DeepSizeOf for ProstAny {
@@ -294,6 +321,13 @@ mod tests {
         for other in [other_version, other_generation, no_generation] {
             assert_ne!(base.key(), other.key());
         }
+
+        // The remapped list shares the raw list's identity but not its namespace.
+        assert_eq!(DerivedIndexListingKey(base).key(), base.key());
+        assert_ne!(
+            DerivedIndexListingKey::schema().id(),
+            IndexMetadataKey::schema().id()
+        );
     }
 
     /// The remap form is its own hierarchy segment, so it cannot be confused with a URI

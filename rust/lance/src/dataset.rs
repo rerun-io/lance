@@ -189,9 +189,9 @@ pub struct Dataset {
     /// its prefix also carries the remap form. See [`Self::manifest_index_cache`] for the
     /// entries that must not be partitioned that way.
     pub(crate) index_cache: Arc<DSIndexCache>,
-    /// Entries that come straight from the manifest rather than from translated index
-    /// state, and so are identical under either remap form. Only the manifest's own index
-    /// list lives here; anything the form can change belongs in [`Self::index_cache`].
+    /// Entries that are identical under either remap form: the manifest's own index list,
+    /// and that list remapped through the fragment reuse index, which reads only the
+    /// recorded rewrites. Anything the form can change belongs in [`Self::index_cache`].
     pub(crate) manifest_index_cache: Arc<DSIndexCache>,
     pub(crate) metadata_cache: Arc<DSMetadataCache>,
 
