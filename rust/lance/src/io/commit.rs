@@ -1078,6 +1078,7 @@ pub(crate) async fn commit_transaction(
                     let key = IndexMetadataKey {
                         version: target_version,
                         store_identity: &dataset.object_store.store_prefix,
+                        e_tag: manifest_location.e_tag.as_deref(),
                     };
                     dataset
                         .manifest_index_cache

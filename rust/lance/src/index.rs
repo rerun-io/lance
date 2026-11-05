@@ -1502,6 +1502,7 @@ impl DatasetIndexExt for Dataset {
         let metadata_key = IndexMetadataKey {
             version: self.version().version,
             store_identity: &self.object_store.store_prefix,
+            e_tag: self.manifest_location.e_tag.as_deref(),
         };
         let mut indices = self
             .manifest_index_cache
@@ -5189,6 +5190,7 @@ mod tests {
         let metadata_key = crate::session::index_caches::IndexMetadataKey {
             version: dataset.version().version,
             store_identity: &dataset.object_store.store_prefix,
+            e_tag: dataset.manifest_location.e_tag.as_deref(),
         };
         dataset
             .manifest_index_cache
@@ -5310,6 +5312,7 @@ mod tests {
         let metadata_key = crate::session::index_caches::IndexMetadataKey {
             version: dataset.version().version,
             store_identity: &dataset.object_store.store_prefix,
+            e_tag: dataset.manifest_location.e_tag.as_deref(),
         };
         dataset
             .manifest_index_cache
