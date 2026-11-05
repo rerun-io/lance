@@ -64,7 +64,8 @@ use serde_json::json;
 use tracing::{info, instrument, warn};
 use uuid::Uuid;
 use vector::details::{
-    derive_vector_index_type, infer_missing_vector_details, vector_details_as_json,
+    derive_vector_index_type, infer_missing_vector_details, needs_vector_details_inference,
+    vector_details_as_json,
 };
 pub(crate) use vector::details::{vector_index_details, vector_index_details_default};
 use vector::ivf::v2::{IVFIndex, IvfStateEntryBox};
@@ -92,7 +93,9 @@ use crate::index::mem_wal::open_mem_wal_index;
 pub use crate::index::prefilter::{FilterLoader, PreFilter};
 use crate::index::scalar::{IndexDetails, fetch_index_details, load_training_data};
 pub use crate::index::vector::{LogicalIvfView, LogicalVectorIndex};
-use crate::session::index_caches::{FragReuseIndexKey, IndexMetadataKey, write_index_identity};
+use crate::session::index_caches::{
+    DerivedIndexListingKey, FragReuseIndexKey, IndexMetadataKey, write_index_identity,
+};
 use crate::{Error, Result, dataset::Dataset};
 pub use create::CreateIndexBuilder;
 pub use lance_index::IndexDescription;
@@ -1501,6 +1504,7 @@ impl DatasetIndexExt for Dataset {
         let metadata_key = IndexMetadataKey {
             version: self.version().version,
             store_identity: &self.object_store.store_prefix,
+            e_tag: self.manifest_location.e_tag.as_deref(),
         };
         let mut indices = self
             .manifest_index_cache
@@ -1519,9 +1523,17 @@ impl DatasetIndexExt for Dataset {
         // Infer details for legacy vector indices (once per index name, concurrently).
         // This may run on indices that were opportunistically cached during Dataset::open
         // before the full Dataset was available for inference.
+        let mut inference_incomplete = false;
+        if indices
+            .iter()
+            .any(|idx| needs_vector_details_inference(idx, self.schema()))
         {
             let mut updated = indices.as_ref().clone();
             infer_missing_vector_details(self, &mut updated).await;
+            // Inference skips an index it cannot read; a later call may still succeed.
+            inference_incomplete = updated
+                .iter()
+                .any(|idx| needs_vector_details_inference(idx, self.schema()));
             if updated != *indices {
                 indices = Arc::new(updated);
                 // Written back through the same handle it was read from. The remap-partitioned
@@ -1536,6 +1548,11 @@ impl DatasetIndexExt for Dataset {
         if let Some(frag_reuse_index_meta) =
             indices.iter().find(|idx| idx.name == FRAG_REUSE_INDEX_NAME)
         {
+            // Planning loads the index list many times per scan; remap it once per snapshot.
+            let derived_key = DerivedIndexListingKey(metadata_key);
+            if let Some(remapped) = self.manifest_index_cache.get_with_key(&derived_key).await {
+                return Ok(remapped);
+            }
             // Isolation between the two forms comes from the cache's own prefix, which the
             // dataset built with its remap mode, so the key itself needs only the uuid.
             let mode = self.frag_reuse_remap_mode;
@@ -1555,13 +1572,21 @@ impl DatasetIndexExt for Dataset {
                     .await
                 })
                 .await?;
-            let mut indices = indices.as_ref().clone();
-            for idx in indices.iter_mut() {
+            let mut remapped = indices.as_ref().clone();
+            for idx in remapped.iter_mut() {
                 if let Some(bitmap) = idx.fragment_bitmap.as_mut() {
                     frag_reuse_index.remap_fragment_bitmap(bitmap)?;
                 }
             }
-            Ok(Arc::new(indices))
+            let remapped = Arc::new(remapped);
+            // A remapped list pinned while inference still has work to do would hide the
+            // inferred list a later call writes back.
+            if !inference_incomplete {
+                self.manifest_index_cache
+                    .insert_with_key(&derived_key, remapped.clone())
+                    .await;
+            }
+            Ok(remapped)
         } else {
             Ok(indices)
         }
@@ -4703,15 +4728,15 @@ mod tests {
         assert_eq!(after.hits - before.hits, 31);
     }
 
-    #[tokio::test]
-    async fn test_open_frag_reuse_index_with_zero_capacity_cache() {
-        let test_dir = TempStrDir::default();
+    /// A dataset with a fragment reuse index: four fragments, a btree on `id`, then a
+    /// compaction whose index remap is deferred so the index list needs remapping on load.
+    async fn write_dataset_with_frag_reuse_index(uri: &str) -> Dataset {
         let data = gen_batch()
             .col("id", array::step::<Int32Type>())
             .into_reader_rows(RowCount::from(400), BatchCount::from(1));
         let mut dataset = Dataset::write(
             data,
-            &test_dir,
+            uri,
             Some(WriteParams {
                 max_rows_per_file: 100,
                 ..Default::default()
@@ -4740,6 +4765,13 @@ mod tests {
         )
         .await
         .unwrap();
+        dataset
+    }
+
+    #[tokio::test]
+    async fn test_open_frag_reuse_index_with_zero_capacity_cache() {
+        let test_dir = TempStrDir::default();
+        let dataset = write_dataset_with_frag_reuse_index(&test_dir).await;
         assert!(
             dataset
                 .load_index_by_name(FRAG_REUSE_INDEX_NAME)
@@ -4767,6 +4799,120 @@ mod tests {
         .expect("opening the fragment reuse index deadlocked")
         .unwrap();
         assert!(frag_reuse_index.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_load_indices_caches_remapped_list_per_snapshot() {
+        let test_dir = TempStrDir::default();
+        write_dataset_with_frag_reuse_index(&test_dir).await;
+        let no_cache_session = || {
+            Arc::new(Session::with_index_cache_backend(
+                Arc::new(lance_core::cache::MokaCacheBackend::no_cache()),
+                128 * 1024 * 1024,
+                Default::default(),
+            ))
+        };
+        let id_idx = |list: &[IndexMetadata]| {
+            list.iter()
+                .find(|idx| idx.name == "id_idx")
+                .cloned()
+                .unwrap()
+        };
+        // Reopen so the list is read back from the manifest, at a location resolved against
+        // the store and so carrying the manifest's e_tag.
+        let session = Arc::new(Session::default());
+        let dataset = DatasetBuilder::from_uri(&test_dir)
+            .with_session(session.clone())
+            .load()
+            .await
+            .unwrap();
+        let raw_key = crate::session::index_caches::IndexMetadataKey {
+            version: dataset.version().version,
+            store_identity: &dataset.object_store.store_prefix,
+            e_tag: dataset.manifest_location.e_tag.as_deref(),
+        };
+
+        let first = dataset.load_indices().await.unwrap();
+        let raw = dataset
+            .manifest_index_cache
+            .get_with_key(&raw_key)
+            .await
+            .unwrap();
+        assert_ne!(
+            id_idx(&first).fragment_bitmap,
+            id_idx(&raw).fragment_bitmap,
+            "the list must actually be remapped"
+        );
+
+        // A hit returns the remapped list built by the first call.
+        assert!(Arc::ptr_eq(&first, &dataset.load_indices().await.unwrap()));
+
+        // It equals what a dataset without any cache computes.
+        let uncached = DatasetBuilder::from_uri(&test_dir)
+            .with_session(no_cache_session())
+            .load()
+            .await
+            .unwrap();
+        assert_eq!(*first, *uncached.load_indices().await.unwrap());
+
+        // While inference still has work to do on the raw list, the remapped list is not
+        // pinned: a later call may infer the details and write the list back.
+        let dataset = DatasetBuilder::from_uri(&test_dir)
+            .with_session(Arc::new(Session::default()))
+            .load()
+            .await
+            .unwrap();
+        let mut legacy = id_idx(&raw);
+        legacy.uuid = Uuid::new_v4();
+        legacy.name = "legacy_vec".to_owned();
+        legacy.index_details = Some(Arc::new(vector_index_details_default()));
+        let mut with_legacy = raw.as_ref().clone();
+        with_legacy.push(legacy);
+        dataset
+            .manifest_index_cache
+            .insert_with_key(&raw_key, Arc::new(with_legacy))
+            .await;
+        let unpinned = dataset.load_indices().await.unwrap();
+        assert_eq!(
+            id_idx(&unpinned).fragment_bitmap,
+            id_idx(&first).fragment_bitmap
+        );
+        assert!(unpinned.iter().any(|idx| idx.name == "legacy_vec"));
+        assert!(
+            dataset
+                .manifest_index_cache
+                .get_with_key(&DerivedIndexListingKey(raw_key))
+                .await
+                .is_none(),
+            "a remapped list built from a list that still needs inference was cached"
+        );
+        dataset
+            .manifest_index_cache
+            .insert_with_key(&raw_key, raw.clone())
+            .await;
+        let pinned = dataset.load_indices().await.unwrap();
+        assert_eq!(*pinned, *first);
+        assert!(Arc::ptr_eq(&pinned, &dataset.load_indices().await.unwrap()));
+
+        // A dataset recreated at the same location reaches the same version numbers with
+        // a different list; the manifest's e_tag keeps the old entry from serving it.
+        drop(dataset);
+        std::fs::remove_dir_all(&*test_dir).unwrap();
+        write_dataset_with_frag_reuse_index(&test_dir).await;
+        let recreated = DatasetBuilder::from_uri(&test_dir)
+            .with_session(session)
+            .load()
+            .await
+            .unwrap();
+        assert_eq!(recreated.version().version, uncached.version().version);
+        let after = recreated.load_indices().await.unwrap();
+        assert_ne!(id_idx(&after).uuid, id_idx(&first).uuid);
+        let recreated_uncached = DatasetBuilder::from_uri(&test_dir)
+            .with_session(no_cache_session())
+            .load()
+            .await
+            .unwrap();
+        assert_eq!(*after, *recreated_uncached.load_indices().await.unwrap());
     }
 
     /// Both forms of an all-rows-deleted remap. This is the one place `fully_deleted_fragments`
@@ -5178,6 +5324,7 @@ mod tests {
         let metadata_key = crate::session::index_caches::IndexMetadataKey {
             version: dataset.version().version,
             store_identity: &dataset.object_store.store_prefix,
+            e_tag: dataset.manifest_location.e_tag.as_deref(),
         };
         dataset
             .manifest_index_cache
@@ -5299,6 +5446,7 @@ mod tests {
         let metadata_key = crate::session::index_caches::IndexMetadataKey {
             version: dataset.version().version,
             store_identity: &dataset.object_store.store_prefix,
+            e_tag: dataset.manifest_location.e_tag.as_deref(),
         };
         dataset
             .manifest_index_cache
