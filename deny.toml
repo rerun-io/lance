@@ -95,8 +95,7 @@ ignore = [
     { id = "RUSTSEC-2026-0391", reason = "`zstd` 0.13 via arrow; not exercised, nothing calls the stream `with_context` constructors" },
     { id = "RUSTSEC-2026-0398", reason = "`zstd-safe` 7.2 via zstd 0.13; not exercised, `Seekable` needs the `seekable` feature, which is off" },
     { id = "RUSTSEC-2026-0403", reason = "`zstd-safe` 7.2 via zstd 0.13; `legacy` is on, but no consumer uses `stream::write::Decoder`; `bulk` and `read::Decoder` are excluded by the advisory" },
-    # TODO: Remove when parquet no longer requires thrift 0.17.
-    { id = "RUSTSEC-2026-0435", reason = "`thrift` 0.17 via parquet 58; parquet uses the compact protocol, not the affected TBinaryInputProtocol::read_bytes" },
+    { id = "RUSTSEC-2026-0441", reason = "no fix: `pin-utils` is unmaintained and archived; `aws-smithy-http` depends on 0.1.0 and no patched release is available" },
 ]
 # If this is true, then cargo deny will use the git executable to fetch advisory database.
 # If this is false, then it uses a built-in git library.
