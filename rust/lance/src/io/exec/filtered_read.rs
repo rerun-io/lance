@@ -537,6 +537,7 @@ impl FilteredReadStream {
         options: FilteredReadOptions,
         global_metrics: Arc<FilteredReadGlobalMetrics>,
         plan: FilteredReadInternalPlan,
+        output_schema: SchemaRef,
         scan_scheduler: Option<Arc<ScanScheduler>>,
         priority_offset: Option<u32>,
     ) -> Result<Self> {
@@ -562,18 +563,17 @@ impl FilteredReadStream {
             io_parallelism
         );
 
-        let output_schema = public_blob_v2_binary_projection_schema(&options.projection);
-
         // Get scan_range_after_filter from the plan
         let scan_range_after_filter = plan.scan_range_after_filter.clone();
 
         // Convert plan to scoped fragments for I/O
-        let mut scoped_fragments = Self::plan_to_scoped_fragments(
+        let mut scoped_fragments = Self::plan_to_scoped_fragments_with_schema(
             &plan,
             &fragment_descriptors,
             &dataset,
             &options,
             scan_scheduler.clone(),
+            output_schema.clone(),
         )?;
         if let Some(priority_offset) = priority_offset.filter(|offset| *offset != 0) {
             for scoped in &mut scoped_fragments {
@@ -890,12 +890,32 @@ impl FilteredReadStream {
     /// list so a sparse plan keeps the original I/O order. Each distinct
     /// filter is planned once here and shared by the fragments that use it;
     /// fails if a filter cannot be planned.
+    #[cfg(test)]
     fn plan_to_scoped_fragments(
         plan: &FilteredReadInternalPlan,
         fragments: &[Fragment],
         dataset: &Arc<Dataset>,
         options: &FilteredReadOptions,
         scan_scheduler: Arc<ScanScheduler>,
+    ) -> Result<Vec<ScopedFragmentRead>> {
+        Self::plan_to_scoped_fragments_with_schema(
+            plan,
+            fragments,
+            dataset,
+            options,
+            scan_scheduler,
+            public_blob_v2_binary_projection_schema(&options.projection),
+        )
+    }
+
+    /// `output_schema` must match what `options.projection` derives.
+    fn plan_to_scoped_fragments_with_schema(
+        plan: &FilteredReadInternalPlan,
+        fragments: &[Fragment],
+        dataset: &Arc<Dataset>,
+        options: &FilteredReadOptions,
+        scan_scheduler: Arc<ScanScheduler>,
+        output_schema: SchemaRef,
     ) -> Result<Vec<ScopedFragmentRead>> {
         let default_batch_size = options.batch_size.unwrap_or_else(|| {
             get_default_batch_size().unwrap_or_else(|| {
@@ -913,7 +933,6 @@ impl FilteredReadStream {
             HashMap::new();
         // Schemas for each distinct read projection; the keys stay valid because
         // `projection` and `planned_filters` keep every read projection alive
-        let output_schema = public_blob_v2_binary_projection_schema(&options.projection);
         let mut read_schemas: HashMap<*const Projection, Arc<FragmentReadSchemas>> = HashMap::new();
 
         for (priority, fragment) in fragments.iter().enumerate() {
@@ -932,7 +951,7 @@ impl FilteredReadStream {
                             match planned_filters.entry(Arc::as_ptr(filter)) {
                                 Entry::Occupied(planned) => planned.into_mut(),
                                 Entry::Vacant(entry) => {
-                                    let (read_projection, physical_filter) =
+                                    let (read_projection, _, physical_filter) =
                                         options.plan_filter(filter)?;
                                     entry.insert((Arc::new(read_projection), physical_filter))
                                 }
@@ -1817,16 +1836,16 @@ impl FilteredReadOptions {
     }
 
     /// Plan `filter` for a read: returns the projection to read (the scan's
-    /// projection plus the columns the filter needs) and the physical filter.
-    fn plan_filter(&self, filter: &Expr) -> Result<(Projection, Arc<dyn PhysicalExpr>)> {
+    /// projection plus the columns the filter needs), its output schema and the
+    /// physical filter.
+    fn plan_filter(&self, filter: &Expr) -> Result<(Projection, SchemaRef, Arc<dyn PhysicalExpr>)> {
         let read_projection = self
             .projection
             .clone()
             .union_columns(Planner::column_names_in_expr(filter), OnMissing::Error)?;
-        let physical_filter =
-            Planner::new(public_blob_v2_binary_projection_schema(&read_projection))
-                .create_physical_expr(filter)?;
-        Ok((read_projection, physical_filter))
+        let read_schema = public_blob_v2_binary_projection_schema(&read_projection);
+        let physical_filter = Planner::new(read_schema.clone()).create_physical_expr(filter)?;
+        Ok((read_projection, read_schema, physical_filter))
     }
 
     /// Specify the projection to use for the scan
@@ -1936,6 +1955,8 @@ struct RowStreamSource {
     read_options: FilteredReadOptions,
     /// The schema for newly read columns
     new_fields_schema: SchemaRef,
+    /// `public_blob_v2_binary_projection_schema(&read_options.projection)`
+    read_output_schema: SchemaRef,
 }
 
 /// Public plan for distributed execution - uses bitmap for flexibility
@@ -2123,6 +2144,7 @@ impl FilteredReadExec {
             fields_to_read.with_row_addr()
         };
 
+        let read_output_schema = public_blob_v2_binary_projection_schema(&read_options.projection);
         Ok(Self {
             dataset,
             options,
@@ -2133,6 +2155,7 @@ impl FilteredReadExec {
                 key_column,
                 read_options,
                 new_fields_schema,
+                read_output_schema,
             })),
             plan: Arc::new(OnceCell::new()),
             running_stream: Arc::new(AsyncMutex::new(None)),
@@ -2141,8 +2164,18 @@ impl FilteredReadExec {
 
     fn try_new_scan(
         dataset: Arc<Dataset>,
+        options: FilteredReadOptions,
+        index_input: Option<Arc<dyn ExecutionPlan>>,
+    ) -> Result<Self> {
+        Self::try_new_scan_with_schema(dataset, options, index_input, None)
+    }
+
+    /// `output_schema` must match what `options.projection` derives.
+    fn try_new_scan_with_schema(
+        dataset: Arc<Dataset>,
         mut options: FilteredReadOptions,
         index_input: Option<Arc<dyn ExecutionPlan>>,
+        output_schema: Option<SchemaRef>,
     ) -> Result<Self> {
         let input = match index_input {
             Some(plan) => RowSelector::RowSet(plan),
@@ -2197,7 +2230,8 @@ impl FilteredReadExec {
                 ));
             }
         }
-        let output_schema = public_blob_v2_binary_projection_schema(&options.projection);
+        let output_schema = output_schema
+            .unwrap_or_else(|| public_blob_v2_binary_projection_schema(&options.projection));
         let num_partitions = match options.threading_mode {
             FilteredReadThreadingMode::OnePartitionMultipleThreads(_) => 1,
             FilteredReadThreadingMode::MultiplePartitions(n) => n,
@@ -2371,6 +2405,7 @@ impl FilteredReadExec {
         let metrics = self.metrics.clone();
         let index_input = self.input.row_set_plan().cloned();
         let plan_cell = self.plan.clone();
+        let output_schema = self.schema();
 
         let stream = futures::stream::once(async move {
             let mut running_stream = running_stream_lock.lock().await;
@@ -2392,6 +2427,7 @@ impl FilteredReadExec {
                     options,
                     Arc::new(FilteredReadGlobalMetrics::new(&metrics)),
                     plan.clone(),
+                    output_schema,
                     None,
                     None,
                 )
@@ -2726,6 +2762,7 @@ impl RowStreamRead {
             self.source.read_options.clone(),
             self.global_metrics.clone(),
             internal_plan,
+            self.source.read_output_schema.clone(),
             Some(self.scan_scheduler.clone()),
             Some(priority_offset),
         )?;
@@ -3079,10 +3116,9 @@ impl ExecutionPlan for FilteredReadExec {
         // stats and basic filter shape)
 
         // Need to add in filter columns even though they aren't part of the projection
-        let (read_projection, physical_filter) = self.options.plan_filter(filter)?;
-        let read_schema = public_blob_v2_binary_projection_schema(&read_projection);
+        let (read_projection, read_schema, physical_filter) = self.options.plan_filter(filter)?;
 
-        let mock_input = Arc::new(Self::try_new(
+        let mock_input = Arc::new(Self::try_new_scan_with_schema(
             self.dataset.clone(),
             FilteredReadOptions {
                 scan_range_after_filter: None,
@@ -3092,6 +3128,7 @@ impl ExecutionPlan for FilteredReadExec {
                 ..self.options.clone()
             },
             None,
+            Some(read_schema.clone()),
         )?);
         let df_filter_exec = FilterExec::try_new(physical_filter, mock_input)?;
         let mut df_stats = Arc::unwrap_or_clone(df_filter_exec.partition_statistics(partition)?);
@@ -3142,6 +3179,18 @@ impl ExecutionPlan for FilteredReadExec {
                 Error::internal("A FilteredReadExec cannot have two children".to_string()).into(),
             ))
         } else {
+            // Leaf: options already validated; only execution state is reset.
+            if children.is_empty() && matches!(self.input, RowSelector::AllRows) {
+                return Ok(Arc::new(Self {
+                    dataset: self.dataset.clone(),
+                    options: self.options.clone(),
+                    properties: self.properties.clone(),
+                    running_stream: Arc::new(AsyncMutex::new(None)),
+                    metrics: ExecutionPlanMetricsSet::new(),
+                    input: RowSelector::AllRows,
+                    plan: Arc::new(OnceCell::new()),
+                }));
+            }
             // Rebuild via try_new so the selector and derived state are
             // re-derived from the new child's schema
             let child = children.into_iter().next();
