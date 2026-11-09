@@ -628,19 +628,19 @@ impl Schema {
 
     /// Get the sequence of fields from the root to the field with the given id.
     pub fn field_ancestry_by_id(&self, id: i32) -> Option<Vec<&Field>> {
-        let mut to_visit = self.fields.iter().map(|f| vec![f]).collect::<Vec<_>>();
-        while let Some(path) = to_visit.pop() {
-            let field = path.last().unwrap();
-            if field.id == id {
-                return Some(path);
+        fn descend<'a>(field: &'a Field, id: i32, path: &mut Vec<&'a Field>) -> bool {
+            path.push(field);
+            if field.id == id || field.children.iter().any(|c| descend(c, id, path)) {
+                return true;
             }
-            for child in field.children.iter() {
-                let mut new_path = path.clone();
-                new_path.push(child);
-                to_visit.push(new_path);
-            }
+            path.pop();
+            false
         }
-        None
+        let mut path = Vec::new();
+        self.fields
+            .iter()
+            .any(|f| descend(f, id, &mut path))
+            .then_some(path)
     }
 
     pub fn mut_field_by_id(&mut self, id: impl Into<i32>) -> Option<&mut Field> {
@@ -1963,6 +1963,49 @@ mod tests {
     }
 
     use arrow_schema::DataType;
+
+    #[test]
+    fn test_field_ancestry_by_id() {
+        let arrow_schema = ArrowSchema::new(vec![
+            ArrowField::new("a", DataType::Int32, false),
+            ArrowField::new(
+                "b",
+                DataType::Struct(ArrowFields::from(vec![
+                    ArrowField::new("f1", DataType::Utf8, true),
+                    ArrowField::new(
+                        "f2",
+                        DataType::Struct(ArrowFields::from(vec![ArrowField::new(
+                            "g",
+                            DataType::Boolean,
+                            false,
+                        )])),
+                        true,
+                    ),
+                ])),
+                true,
+            ),
+            ArrowField::new("c", DataType::Float64, false),
+        ]);
+        let schema = Schema::try_from(&arrow_schema).unwrap();
+        let names = |id: i32| {
+            schema
+                .field_ancestry_by_id(id)
+                .map(|path| path.iter().map(|f| f.name.clone()).collect::<Vec<_>>())
+        };
+        let id_of = |path: &str| schema.field(path).unwrap().id;
+
+        assert_eq!(names(id_of("a")), Some(vec!["a".to_owned()]));
+        assert_eq!(names(id_of("c")), Some(vec!["c".to_owned()]));
+        assert_eq!(
+            names(id_of("b.f1")),
+            Some(vec!["b".to_owned(), "f1".to_owned()])
+        );
+        assert_eq!(
+            names(id_of("b.f2.g")),
+            Some(vec!["b".to_owned(), "f2".to_owned(), "g".to_owned()])
+        );
+        assert_eq!(names(999), None);
+    }
 
     #[test]
     fn test_schema_projection() {

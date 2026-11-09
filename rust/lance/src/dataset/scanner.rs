@@ -2990,9 +2990,8 @@ impl Scanner {
     ) -> Result<Arc<dyn ExecutionPlan>> {
         // Kept for the overlay stale-Take path below, which re-evaluates blocked stale rows.
         let user_projection = projection.clone();
-        let mut read_options = FilteredReadOptions::basic_full_read(&self.dataset)
-            .with_filter_plan(filter_plan.clone())
-            .with_projection(projection);
+        let mut read_options =
+            FilteredReadOptions::new(projection).with_filter_plan(filter_plan.clone());
 
         if let Some(fragments) = fragments {
             read_options = read_options.with_fragments(fragments);
