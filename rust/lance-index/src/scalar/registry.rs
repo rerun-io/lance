@@ -4,15 +4,18 @@
 use std::borrow::Cow;
 use std::sync::Arc;
 
-use arrow_schema::{DataType, Field};
+use arrow_schema::{DataType, Field, SortOptions};
 use async_trait::async_trait;
 use datafusion::execution::SendableRecordBatchStream;
+use datafusion::physical_plan::{ExecutionPlan, sorts::sort::SortExec};
+use datafusion_physical_expr::{PhysicalSortExpr, expressions::Column};
 use futures::future::BoxFuture;
 use lance_core::{
     Result,
     cache::{CacheKey, CacheKeySchema, KeyBuilder, LanceCache, UnsizedCacheKey},
     deepsize::DeepSizeOf,
 };
+use lance_datafusion::exec::{LanceExecutionOptions, OneShotExec, execute_plan};
 
 use crate::progress::IndexBuildProgress;
 use crate::registry::IndexPluginRegistry;
@@ -22,6 +25,36 @@ use crate::scalar::{CreatedIndex, IndexStore, ScalarIndex, expression::ScalarQue
 pub use crate::scalar::{TrainingCriteria, TrainingOrdering};
 
 pub const VALUE_COLUMN_NAME: &str = "value";
+
+/// Sort a `(value, row_id)` stream ascending by value, nulls first: the order
+/// [`TrainingOrdering::Values`] asks the scanner for, produced in-process by a
+/// spilling DataFusion sort over `data`.
+///
+/// For a trainer whose input the scanner could not sort (the JSON index sorts
+/// on the value extracted at `path`, not on the raw column) or chose not to
+/// (the bitmap index sorts only the part of its input it does not group in
+/// memory), this is the only sort on the training path.
+pub(crate) fn sort_stream_by_value(
+    data: SendableRecordBatchStream,
+) -> Result<SendableRecordBatchStream> {
+    let input = Arc::new(OneShotExec::new(data));
+    let value_idx = input.schema().index_of(VALUE_COLUMN_NAME)?;
+    let sort_expr = PhysicalSortExpr {
+        expr: Arc::new(Column::new(VALUE_COLUMN_NAME, value_idx)),
+        options: SortOptions {
+            descending: false,
+            nulls_first: true,
+        },
+    };
+    let plan = Arc::new(SortExec::new([sort_expr].into(), input));
+    execute_plan(
+        plan,
+        LanceExecutionOptions {
+            use_spilling: true,
+            ..Default::default()
+        },
+    )
+}
 
 /// A trait object for plugin-specific training parameters and data requirements.
 ///
