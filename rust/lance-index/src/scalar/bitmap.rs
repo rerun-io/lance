@@ -58,6 +58,7 @@ use crate::{
 use crate::{scalar::IndexReader, scalar::expression::ScalarQueryParser};
 
 mod build;
+mod keys;
 
 use build::SortedRuns;
 
