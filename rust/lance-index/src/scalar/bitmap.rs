@@ -1805,7 +1805,8 @@ impl BitmapIndexPlugin {
     }
 
     /// Builds and writes a bitmap index in a streaming fashion from value-sorted
-    /// input.
+    /// input. Boolean input may be unordered: it is grouped into at most three
+    /// row sets, all resident at once, before anything is written.
     ///
     /// `old_segments` are merged with the new data via a k-way sorted merge-join
     /// (each segment's index_map is a BTreeMap, already sorted by value), so the
@@ -2616,14 +2617,15 @@ mod tests {
     /// Boolean training data arrives unsorted and across batches.
     #[tokio::test]
     async fn test_bitmap_boolean_unsorted_input() {
-        assert_eq!(
-            bitmap_training_criteria(&DataType::Boolean).ordering,
-            TrainingOrdering::None
-        );
-        assert_eq!(
-            bitmap_training_criteria(&DataType::Utf8).ordering,
-            TrainingOrdering::Values
-        );
+        let ordering = |data_type| {
+            BitmapIndexPlugin
+                .new_training_request("", &Field::new("v", data_type, true))
+                .unwrap()
+                .criteria()
+                .ordering
+        };
+        assert_eq!(ordering(DataType::Boolean), TrainingOrdering::None);
+        assert_eq!(ordering(DataType::Utf8), TrainingOrdering::Values);
 
         let schema = value_row_id_schema(DataType::Boolean);
         let batch = |rows: &[(Option<bool>, u64)]| {
@@ -2658,6 +2660,10 @@ mod tests {
         );
         assert_eq!(search_bool_addrs(&old, Some(false)).await, vec![addr(0, 2)]);
         assert_eq!(search_bool_addrs(&old, None).await, vec![addr(0, 1)]);
+        assert_eq!(
+            old.update_criteria().data_criteria.ordering,
+            TrainingOrdering::None
+        );
 
         let dest_dir = TempObjDir::default();
         let dest_store = Arc::new(LanceIndexStore::new(
