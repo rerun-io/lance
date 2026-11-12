@@ -1835,9 +1835,6 @@ impl BitmapIndexPlugin {
 
         let mut old = OldSegments::new(old_segments);
 
-        // Current value being accumulated from the new data stream.
-        let mut current_key: Option<ScalarValue> = None;
-        let mut current_bitmap = RowAddrTreeMap::default();
         // Track whether we emitted a null bitmap (old index stores nulls
         // separately in null_map, not in index_map).
         let mut emitted_null = false;
@@ -1847,7 +1844,35 @@ impl BitmapIndexPlugin {
                 Self::finish_run(key, &mut bitmap, &mut old, &mut emitted_null, &mut writer)
                     .await?;
             }
+        } else {
+            Self::emit_sorted_runs(&mut data_source, &mut old, &mut emitted_null, &mut writer)
+                .await?;
         }
+
+        // Emit any remaining old-only entries.
+        while let Some((key, bitmap)) = old.take_smallest().await? {
+            writer.emit(key, &bitmap).await?;
+        }
+
+        // Emit old null bitmap if we didn't already merge it with new nulls.
+        if !emitted_null && let Some(null_bitmap) = old.take_null_bitmap().await? {
+            let null_key = new_null_array(&value_type, 1);
+            let null_key = ScalarValue::try_from_array(null_key.as_ref(), 0)?;
+            writer.emit(null_key, &null_bitmap).await?;
+        }
+
+        writer.finish().await
+    }
+
+    /// Emit the runs of value-sorted new data, merging each with `old`.
+    async fn emit_sorted_runs(
+        data_source: &mut SendableRecordBatchStream,
+        old: &mut OldSegments<'_>,
+        emitted_null: &mut bool,
+        writer: &mut BitmapBatchWriter,
+    ) -> Result<()> {
+        let mut current_key: Option<ScalarValue> = None;
+        let mut current_bitmap = RowAddrTreeMap::default();
 
         while let Some(batch) = data_source.try_next().await? {
             let values = batch.column_by_name(VALUE_COLUMN_NAME).expect_ok()?;
@@ -1866,16 +1891,10 @@ impl BitmapIndexPlugin {
                     _ => {
                         // Value changed — flush the previous run.
                         if let Some(prev_key) = current_key.take() {
-                            check_run_order(&prev_key, &key, emitted_null)?;
+                            check_run_order(&prev_key, &key, *emitted_null)?;
                             let mut prev_bitmap = std::mem::take(&mut current_bitmap);
-                            Self::finish_run(
-                                prev_key,
-                                &mut prev_bitmap,
-                                &mut old,
-                                &mut emitted_null,
-                                &mut writer,
-                            )
-                            .await?;
+                            Self::finish_run(prev_key, &mut prev_bitmap, old, emitted_null, writer)
+                                .await?;
                         }
                         current_key = Some(key);
                         current_bitmap = RowAddrTreeMap::default();
@@ -1888,29 +1907,9 @@ impl BitmapIndexPlugin {
         // Flush the last accumulated run from new data.
         if let Some(last_key) = current_key.take() {
             let mut last_bitmap = std::mem::take(&mut current_bitmap);
-            Self::finish_run(
-                last_key,
-                &mut last_bitmap,
-                &mut old,
-                &mut emitted_null,
-                &mut writer,
-            )
-            .await?;
+            Self::finish_run(last_key, &mut last_bitmap, old, emitted_null, writer).await?;
         }
-
-        // Emit any remaining old-only entries.
-        while let Some((key, bitmap)) = old.take_smallest().await? {
-            writer.emit(key, &bitmap).await?;
-        }
-
-        // Emit old null bitmap if we didn't already merge it with new nulls.
-        if !emitted_null && let Some(null_bitmap) = old.take_null_bitmap().await? {
-            let null_key = new_null_array(&value_type, 1);
-            let null_key = ScalarValue::try_from_array(null_key.as_ref(), 0)?;
-            writer.emit(null_key, &null_bitmap).await?;
-        }
-
-        writer.finish().await
+        Ok(())
     }
 
     /// Flush a completed value-run from the new data stream, emitting any
@@ -2614,9 +2613,9 @@ mod tests {
         assert_eq!(merged.value_type, DataType::Boolean);
     }
 
-    /// Boolean training data arrives unsorted and across batches.
+    /// Boolean columns are trained and updated from unordered input; others stay value-sorted.
     #[tokio::test]
-    async fn test_bitmap_boolean_unsorted_input() {
+    async fn test_bitmap_boolean_training_order() {
         let ordering = |data_type| {
             BitmapIndexPlugin
                 .new_training_request("", &Field::new("v", data_type, true))
@@ -2627,43 +2626,111 @@ mod tests {
         assert_eq!(ordering(DataType::Boolean), TrainingOrdering::None);
         assert_eq!(ordering(DataType::Utf8), TrainingOrdering::Values);
 
-        let schema = value_row_id_schema(DataType::Boolean);
-        let batch = |rows: &[(Option<bool>, u64)]| {
-            RecordBatch::try_new(
-                schema.clone(),
-                vec![
-                    Arc::new(BooleanArray::from(
-                        rows.iter().map(|(value, _)| *value).collect::<Vec<_>>(),
-                    )),
-                    Arc::new(UInt64Array::from(
-                        rows.iter().map(|(_, addr)| *addr).collect::<Vec<_>>(),
-                    )),
-                ],
-            )
-            .unwrap()
-        };
-        let unsorted = |batches: Vec<RecordBatch>| -> SendableRecordBatchStream {
-            Box::pin(RecordBatchStreamAdapter::new(
-                schema.clone(),
-                stream::iter(batches.into_iter().map(Ok)),
-            ))
-        };
-
-        let (_old_dir, old) = train_bitmap_segment_from(unsorted(vec![
-            batch(&[(Some(true), addr(0, 0)), (None, addr(0, 1))]),
-            batch(&[(Some(false), addr(0, 2)), (Some(true), addr(0, 3))]),
-        ]))
-        .await;
+        let (_bool_dir, bool_index) =
+            train_bitmap_segment_from(bool_value_row_id_stream(&[(Some(true), addr(0, 0))])).await;
         assert_eq!(
-            search_bool_addrs(&old, Some(true)).await,
-            vec![addr(0, 0), addr(0, 3)]
-        );
-        assert_eq!(search_bool_addrs(&old, Some(false)).await, vec![addr(0, 2)]);
-        assert_eq!(search_bool_addrs(&old, None).await, vec![addr(0, 1)]);
-        assert_eq!(
-            old.update_criteria().data_criteria.ordering,
+            bool_index.update_criteria().data_criteria.ordering,
             TrainingOrdering::None
         );
+        let (_utf8_dir, utf8_index) = train_bitmap_segment(&[(Some("a"), addr(0, 0))]).await;
+        assert_eq!(
+            utf8_index.update_criteria().data_criteria.ordering,
+            TrainingOrdering::Values
+        );
+    }
+
+    type BoolRows = Vec<(Option<bool>, u64)>;
+
+    /// Boolean training data arrives unsorted and across batches, for a fresh
+    /// build (`old`) and an update of that build with `new`.
+    #[rstest]
+    #[case::mixed(
+        vec![
+            vec![(Some(true), addr(0, 0)), (None, addr(0, 1))],
+            vec![(Some(false), addr(0, 2)), (Some(true), addr(0, 3))],
+        ],
+        vec![
+            vec![(Some(false), addr(1, 0)), (None, addr(1, 1))],
+            vec![(Some(true), addr(1, 2)), (Some(false), addr(1, 3))],
+        ],
+    )]
+    #[case::all_nulls(
+        vec![vec![(None, addr(0, 0))], vec![(None, addr(0, 1))]],
+        vec![vec![(None, addr(1, 0))]],
+    )]
+    #[case::only_true(
+        vec![vec![(Some(true), addr(0, 0)), (Some(true), addr(0, 1))]],
+        vec![vec![(Some(true), addr(1, 0))]],
+    )]
+    #[case::only_false(
+        vec![vec![(Some(false), addr(0, 0))]],
+        vec![vec![(Some(false), addr(1, 0)), (Some(false), addr(1, 1))]],
+    )]
+    #[case::nulls_and_true(
+        vec![vec![(Some(true), addr(0, 0)), (None, addr(0, 1))]],
+        vec![vec![(None, addr(1, 0)), (Some(true), addr(1, 1))]],
+    )]
+    #[case::empty(vec![], vec![])]
+    #[case::empty_new(
+        vec![vec![(Some(false), addr(0, 0)), (None, addr(0, 1)), (Some(true), addr(0, 2))]],
+        vec![],
+    )]
+    #[case::old_only_false_and_nulls(
+        vec![vec![(Some(false), addr(0, 0)), (None, addr(0, 1))], vec![(Some(true), addr(0, 2))]],
+        vec![vec![(Some(true), addr(1, 0))]],
+    )]
+    #[case::old_only_true_and_nulls(
+        vec![vec![(Some(true), addr(0, 0)), (None, addr(0, 1))], vec![(Some(false), addr(0, 2))]],
+        vec![vec![(Some(false), addr(1, 0))]],
+    )]
+    #[tokio::test]
+    async fn test_bitmap_boolean_unsorted_input(
+        #[case] old_batches: Vec<BoolRows>,
+        #[case] new_batches: Vec<BoolRows>,
+    ) {
+        let schema = value_row_id_schema(DataType::Boolean);
+        let unsorted = |batches: &[BoolRows]| -> SendableRecordBatchStream {
+            let batches = batches
+                .iter()
+                .map(|rows| {
+                    RecordBatch::try_new(
+                        schema.clone(),
+                        vec![
+                            Arc::new(BooleanArray::from(
+                                rows.iter().map(|(value, _)| *value).collect::<Vec<_>>(),
+                            )),
+                            Arc::new(UInt64Array::from(
+                                rows.iter().map(|(_, addr)| *addr).collect::<Vec<_>>(),
+                            )),
+                        ],
+                    )
+                })
+                .collect::<Vec<_>>();
+            Box::pin(RecordBatchStreamAdapter::new(
+                schema.clone(),
+                stream::iter(batches.into_iter().map(|batch| batch.map_err(Into::into))),
+            ))
+        };
+        let expected = |batches: &[&[BoolRows]], key: Option<bool>| {
+            let mut addrs = batches
+                .iter()
+                .flat_map(|side| side.iter().flatten())
+                .filter(|(value, _)| *value == key)
+                .map(|(_, addr)| *addr)
+                .collect::<Vec<_>>();
+            addrs.sort_unstable();
+            addrs
+        };
+        let keys = [None, Some(false), Some(true)];
+
+        let (_old_dir, old) = train_bitmap_segment_from(unsorted(&old_batches)).await;
+        for key in keys {
+            assert_eq!(
+                search_bool_addrs(&old, key).await,
+                expected(&[&old_batches], key),
+                "fresh build, key {key:?}"
+            );
+        }
 
         let dest_dir = TempObjDir::default();
         let dest_store = Arc::new(LanceIndexStore::new(
@@ -2671,31 +2738,19 @@ mod tests {
             dest_dir.clone(),
             Arc::new(LanceCache::no_cache()),
         ));
-        old.update(
-            unsorted(vec![
-                batch(&[(Some(false), addr(1, 0)), (None, addr(1, 1))]),
-                batch(&[(Some(true), addr(1, 2)), (Some(false), addr(1, 3))]),
-            ]),
-            dest_store.as_ref(),
-            None,
-        )
-        .await
-        .unwrap();
+        old.update(unsorted(&new_batches), dest_store.as_ref(), None)
+            .await
+            .unwrap();
         let updated = BitmapIndex::load(dest_store, None, &LanceCache::no_cache())
             .await
             .unwrap();
-        assert_eq!(
-            search_bool_addrs(&updated, Some(true)).await,
-            vec![addr(0, 0), addr(0, 3), addr(1, 2)]
-        );
-        assert_eq!(
-            search_bool_addrs(&updated, Some(false)).await,
-            vec![addr(0, 2), addr(1, 0), addr(1, 3)]
-        );
-        assert_eq!(
-            search_bool_addrs(&updated, None).await,
-            vec![addr(0, 1), addr(1, 1)]
-        );
+        for key in keys {
+            assert_eq!(
+                search_bool_addrs(&updated, key).await,
+                expected(&[&old_batches, &new_batches], key),
+                "update, key {key:?}"
+            );
+        }
     }
 
     /// Does `filter` keep `row_addr`? Mirrors
