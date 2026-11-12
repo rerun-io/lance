@@ -88,13 +88,29 @@ impl TrainingRequest for DefaultTrainingRequest {
     }
 }
 
+/// Training data that can be scanned more than once.
+///
+/// A [`BasicTrainer`] that may read its input more than once (the bitmap
+/// index reads it unsorted first and needs it again, sorted or in further
+/// passes, only when that first pass cannot finish the build) asks the
+/// source for a fresh stream per read rather than buffering the first. Each
+/// `open` may ask for a different ordering; an implementation backed by a
+/// dataset scan honors it the way it honors a training request's criteria.
+#[async_trait]
+pub trait TrainingDataSource: Send + Sync {
+    /// Open a new stream over the training data, prepared to `criteria`.
+    async fn open(&self, criteria: &TrainingCriteria) -> Result<SendableRecordBatchStream>;
+}
+
 /// Implemented by indexes that can train on a stream of column data.
 ///
 /// The training process has two stages. In the first stage, the caller provides
 /// index parameters and receives a [`TrainingRequest`] that describes what criteria
 /// the training data must satisfy (e.g. sort order, row-ID availability). In the
 /// second stage, the caller prepares the data accordingly and calls
-/// [`train_index`](Self::train_index).
+/// [`train_index`](Self::train_index), or hands over a [`TrainingDataSource`]
+/// through [`train_index_from_source`](Self::train_index_from_source) when it
+/// can prepare the data more than once.
 ///
 /// Any scalar index plugin that builds from a column data stream should implement
 /// this trait.
@@ -114,6 +130,12 @@ pub trait BasicTrainer: Send + Sync {
     /// [`new_training_request`](Self::new_training_request). It is the caller's
     /// responsibility to ensure this.
     ///
+    /// This must stay a complete build on its own: callers that only have a
+    /// one-shot stream (a preprocessed stream, an index append, a wrapping
+    /// plugin such as the JSON index) use it, and
+    /// [`train_index_from_source`](Self::train_index_from_source) is only
+    /// a way for a trainer to do better when the data can be read again.
+    ///
     /// Returns index details describing the index. These details may be useful for
     /// planning and must be provided when loading the index. It is the caller's
     /// responsibility to store them.
@@ -125,6 +147,29 @@ pub trait BasicTrainer: Send + Sync {
         fragment_ids: Option<Vec<u32>>,
         progress: Arc<dyn IndexBuildProgress>,
     ) -> Result<CreatedIndex>;
+
+    /// Train a new index from a source that can be scanned more than once.
+    ///
+    /// By default this opens the source once, to the request's criteria, and
+    /// trains from that stream exactly as [`train_index`](Self::train_index)
+    /// would. A trainer that builds in several passes overrides it to open the
+    /// source per pass.
+    ///
+    /// `fragment_ids` means what it means in `train_index`: the identity of a
+    /// distributed shard build. It does not restrict what `source` yields;
+    /// the source's scope is fixed by whoever created it.
+    async fn train_index_from_source(
+        &self,
+        source: &dyn TrainingDataSource,
+        index_store: &dyn IndexStore,
+        request: Box<dyn TrainingRequest>,
+        fragment_ids: Option<Vec<u32>>,
+        progress: Arc<dyn IndexBuildProgress>,
+    ) -> Result<CreatedIndex> {
+        let data = source.open(request.criteria()).await?;
+        self.train_index(data, index_store, request, fragment_ids, progress)
+            .await
+    }
 }
 
 /// A trait for scalar index plugins

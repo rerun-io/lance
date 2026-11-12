@@ -52,7 +52,8 @@ use lance_index::scalar::label_list::{
     LABEL_LIST_NULLS_METADATA_KEY, LABEL_LIST_NULLS_MIN_VERSION,
 };
 use lance_index::scalar::registry::{
-    ScalarIndexLoad, ScalarIndexPlugin, TrainingCriteria, TrainingOrdering, VALUE_COLUMN_NAME,
+    ScalarIndexLoad, ScalarIndexPlugin, TrainingCriteria, TrainingDataSource, TrainingOrdering,
+    VALUE_COLUMN_NAME,
 };
 use lance_index::scalar::{BuiltinIndexType, CreatedIndex, InvertedIndexParams};
 use lance_index::scalar::{
@@ -136,8 +137,8 @@ pub(crate) async fn scan_training_data(
     let num_rows = dataset.count_all_rows().await?;
 
     let mut scan = dataset.scan();
-    // Fragment filtering is now handled in load_training_data function
-    // This function just processes the fragments passed to it
+    // Fragment filtering is handled by resolve_training_fragments, upstream of here.
+    // This function just scans the fragments passed to it.
 
     // Note: we don't need to sort for TrainingOrdering::Addresses because
     // Lance will return data in the order of the row_address by default.
@@ -210,33 +211,74 @@ pub(crate) async fn load_training_data(
     });
 
     if train {
-        // Use the training request to scan data with fragment filtering
-        if let Some(ref fragment_ids) = training_request.fragment_ids {
-            let fragment_ids = fragment_ids
-                .clone()
-                .into_iter()
-                .sorted()
-                .dedup()
-                .collect_vec();
-            let frags = dataset.get_frags_from_ordered_ids(&fragment_ids);
-            let frags: Result<Vec<_>> = fragment_ids
-                .iter()
-                .zip(frags)
-                .map(|(id, frag)| {
-                    let Some(frag) = frag else {
-                        return Err(Error::invalid_input_source(
-                            format!("No fragment with id {}", id).into(),
-                        ));
-                    };
-                    Ok(frag.metadata().clone())
-                })
-                .collect();
-            scan_training_data(dataset, column, criteria, Some(frags?)).await
-        } else {
-            scan_training_data(dataset, column, criteria, fragments).await
-        }
+        let fragments =
+            resolve_training_fragments(dataset, fragments, training_request.fragment_ids)?;
+        scan_training_data(dataset, column, criteria, fragments).await
     } else {
         TrainingRequest::create_empty_stream(dataset, column, criteria).await
+    }
+}
+
+/// The fragments a training scan covers: the ones named by `fragment_ids`
+/// when given (sorted, deduplicated, every id checked), else `fragments`,
+/// else the whole dataset.
+fn resolve_training_fragments(
+    dataset: &Dataset,
+    fragments: Option<Vec<Fragment>>,
+    fragment_ids: Option<Vec<u32>>,
+) -> Result<Option<Vec<Fragment>>> {
+    let Some(fragment_ids) = fragment_ids else {
+        return Ok(fragments);
+    };
+    let fragment_ids = fragment_ids.into_iter().sorted().dedup().collect_vec();
+    let frags = dataset.get_frags_from_ordered_ids(&fragment_ids);
+    let frags = fragment_ids
+        .iter()
+        .zip(frags)
+        .map(|(id, frag)| {
+            let Some(frag) = frag else {
+                return Err(Error::invalid_input_source(
+                    format!("No fragment with id {}", id).into(),
+                ));
+            };
+            Ok(frag.metadata().clone())
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok(Some(frags))
+}
+
+/// One column of a dataset as training data a trainer can scan as often as
+/// it needs, each scan prepared to the criteria it asks for.
+pub(crate) struct DatasetTrainingSource {
+    dataset: Dataset,
+    column: String,
+    fragments: Option<Vec<Fragment>>,
+}
+
+impl DatasetTrainingSource {
+    pub(crate) fn new(
+        dataset: &Dataset,
+        column: &str,
+        fragment_ids: Option<Vec<u32>>,
+    ) -> Result<Self> {
+        Ok(Self {
+            dataset: dataset.clone(),
+            column: column.to_string(),
+            fragments: resolve_training_fragments(dataset, None, fragment_ids)?,
+        })
+    }
+}
+
+#[async_trait::async_trait]
+impl TrainingDataSource for DatasetTrainingSource {
+    async fn open(&self, criteria: &TrainingCriteria) -> Result<SendableRecordBatchStream> {
+        scan_training_data(
+            &self.dataset,
+            &self.column,
+            criteria,
+            self.fragments.clone(),
+        )
+        .await
     }
 }
 
@@ -310,32 +352,51 @@ pub(super) async fn build_scalar_index(
     let training_request =
         trainer.new_training_request(params.params.as_deref().unwrap_or("{}"), &field)?;
 
+    // A trainer that scans the dataset itself gets a source it can reopen; a
+    // preprocessed or empty (`train == false`) stream can only be read once.
     progress.stage_start("load_data", None, "rows").await?;
     let training_data = match preprocessed_data {
-        Some(preprocessed_data) => preprocessed_data,
-        None => {
+        Some(preprocessed_data) => Some(preprocessed_data),
+        None if train => None,
+        None => Some(
             load_training_data(
                 dataset,
                 column,
                 training_request.criteria(),
                 None,
-                train,
+                false,
                 fragment_ids.clone(),
             )
-            .await?
-        }
+            .await?,
+        ),
     };
     progress.stage_complete("load_data").await?;
 
-    let created_index = trainer
-        .train_index(
-            training_data,
-            &index_store,
-            training_request,
-            fragment_ids,
-            progress,
-        )
-        .await?;
+    let created_index = match training_data {
+        Some(training_data) => {
+            trainer
+                .train_index(
+                    training_data,
+                    &index_store,
+                    training_request,
+                    fragment_ids,
+                    progress,
+                )
+                .await?
+        }
+        None => {
+            let source = DatasetTrainingSource::new(dataset, column, fragment_ids.clone())?;
+            trainer
+                .train_index_from_source(
+                    &source,
+                    &index_store,
+                    training_request,
+                    fragment_ids,
+                    progress,
+                )
+                .await?
+        }
+    };
 
     Ok(created_index)
 }
@@ -371,22 +432,14 @@ pub(super) async fn build_bitmap_index_segment(
     })?;
     let training_request =
         trainer.new_training_request(params.params.as_deref().unwrap_or("{}"), &field)?;
-    let criteria = training_request.criteria();
 
     progress.stage_start("load_data", None, "rows").await?;
-    let training_data =
-        load_training_data(dataset, column, criteria, None, true, Some(fragment_ids)).await?;
+    let source = DatasetTrainingSource::new(dataset, column, Some(fragment_ids))?;
     progress.stage_complete("load_data").await?;
 
     let index_store = LanceIndexStore::from_dataset_for_new(dataset, &uuid)?;
     trainer
-        .train_index(
-            training_data,
-            &index_store,
-            training_request,
-            None,
-            progress,
-        )
+        .train_index_from_source(&source, &index_store, training_request, None, progress)
         .await
 }
 
