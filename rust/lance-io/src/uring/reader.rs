@@ -5,7 +5,7 @@
 
 use super::future::UringReadFuture;
 use super::requests::IoRequest;
-use super::thread::{SUBMITTED_COUNTER, THREAD_SELECTOR, URING_THREADS};
+use super::thread::{QueuedRequest, THREAD_SELECTOR, URING_THREADS};
 use super::{DEFAULT_URING_BLOCK_SIZE, DEFAULT_URING_IO_PARALLELISM, URING_BLOCK_SIZE};
 use crate::local::to_local_path;
 use crate::traits::Reader;
@@ -21,7 +21,6 @@ use std::fs::File;
 use std::future::Future;
 use std::io::{self, ErrorKind};
 use std::ops::Range;
-use std::os::unix::io::{AsRawFd, RawFd};
 use std::pin::Pin;
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, LazyLock, Mutex};
@@ -64,15 +63,11 @@ pub(super) static HANDLE_CACHE: LazyLock<moka::future::Cache<CacheKey, CachedRea
 
 /// File handle for io_uring operations.
 ///
-/// Keeps the file alive and provides the raw file descriptor.
+/// Keeps the file open; each read request issued against it holds the file too.
 #[derive(Debug)]
 pub(super) struct UringFileHandle {
-    /// The file (kept alive via Arc)
-    #[allow(unused)]
-    file: Arc<File>,
-
-    /// Raw file descriptor for io_uring
-    pub(super) fd: RawFd,
+    /// The file to read from
+    pub(super) file: Arc<File>,
 
     /// Object store path
     pub(super) path: Path,
@@ -80,10 +75,8 @@ pub(super) struct UringFileHandle {
 
 impl UringFileHandle {
     pub(super) fn new(file: File, path: Path) -> Self {
-        let fd = file.as_raw_fd();
         Self {
             file: Arc::new(file),
-            fd,
             path,
         }
     }
@@ -192,7 +185,7 @@ impl UringReader {
 
         // Create IoRequest with all data
         let request = Arc::new(IoRequest {
-            fd: self.handle.fd,
+            file: Arc::clone(&self.handle.file),
             offset,
             length,
             thread_id: std::thread::current().id(),
@@ -205,35 +198,54 @@ impl UringReader {
             }),
         });
 
-        // Increment submitted counter before sending to channel
-        SUBMITTED_COUNTER.fetch_add(1, Ordering::Relaxed);
+        if URING_THREADS.threads.is_empty() {
+            let initialization_errors = if URING_THREADS.initialization_errors.is_empty() {
+                "LANCE_URING_THREAD_COUNT is 0".to_owned()
+            } else {
+                URING_THREADS.initialization_errors.join("; ")
+            };
+            return Box::pin(async move {
+                Err(object_store::Error::Generic {
+                    store: "UringReader",
+                    source: Box::new(io::Error::other(format!(
+                        "no io_uring worker threads are available: {initialization_errors}"
+                    ))),
+                })
+            });
+        }
 
         // Select thread in round-robin fashion
-        let thread_idx =
-            (THREAD_SELECTOR.fetch_add(1, Ordering::Relaxed) as usize) % URING_THREADS.len();
+        let thread_idx = (THREAD_SELECTOR.fetch_add(1, Ordering::Relaxed) as usize)
+            % URING_THREADS.threads.len();
+        let thread = &URING_THREADS.threads[thread_idx];
+
+        if !thread.is_alive.load(Ordering::Acquire) {
+            return Box::pin(async move {
+                Err(object_store::Error::Generic {
+                    store: "UringReader",
+                    source: Box::new(io::Error::new(
+                        io::ErrorKind::BrokenPipe,
+                        "io_uring thread died",
+                    )),
+                })
+            });
+        }
 
         // Send to selected thread via channel
-        match URING_THREADS[thread_idx]
+        match thread
             .request_tx
-            .send(Arc::clone(&request))
+            .send(QueuedRequest::new(Arc::clone(&request)))
         {
-            Ok(()) => {
-                // Return future that will be woken when operation completes
-                Box::pin(UringReadFuture { request })
-            }
-            Err(_) => {
-                // Thread died - decrement counter and return error future
-                SUBMITTED_COUNTER.fetch_sub(1, Ordering::Relaxed);
-                Box::pin(async move {
-                    Err(object_store::Error::Generic {
-                        store: "UringReader",
-                        source: Box::new(io::Error::new(
-                            io::ErrorKind::BrokenPipe,
-                            "io_uring thread died",
-                        )),
-                    })
+            Ok(()) => Box::pin(UringReadFuture { request }),
+            Err(_) => Box::pin(async move {
+                Err(object_store::Error::Generic {
+                    store: "UringReader",
+                    source: Box::new(io::Error::new(
+                        io::ErrorKind::BrokenPipe,
+                        "io_uring thread died",
+                    )),
                 })
-            }
+            }),
         }
     }
 }

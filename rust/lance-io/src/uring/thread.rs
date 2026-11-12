@@ -8,11 +8,11 @@
 //! an MPSC channel, and the thread handles submission and completion processing.
 
 use super::DEFAULT_URING_QUEUE_DEPTH;
-use super::requests::IoRequest;
+use super::requests::{IoRequest, PendingRequests};
 use io_uring::{IoUring, opcode, types};
-use std::collections::HashMap;
 use std::io;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::os::unix::io::AsRawFd;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender, sync_channel};
 use std::sync::{Arc, LazyLock};
 use std::time::{Duration, Instant};
@@ -21,37 +21,105 @@ use std::time::{Duration, Instant};
 ///
 /// This provides a channel sender for submitting read requests to the thread.
 pub(super) struct UringThreadHandle {
-    pub request_tx: SyncSender<Arc<IoRequest>>,
+    pub request_tx: SyncSender<QueuedRequest>,
+    pub is_alive: Arc<AtomicBool>,
+}
+
+/// Owns the obligation to fail a request until a worker accepts it.
+///
+/// Dropping the receiver also drops every queued item. Keeping the failure
+/// obligation with the queued item guarantees that a request accepted during
+/// worker shutdown cannot be abandoned without waking its future.
+pub(super) struct QueuedRequest {
+    request: Option<Arc<IoRequest>>,
+}
+
+impl QueuedRequest {
+    pub(super) fn new(request: Arc<IoRequest>) -> Self {
+        SUBMITTED_COUNTER.fetch_add(1, Ordering::Relaxed);
+        Self {
+            request: Some(request),
+        }
+    }
+
+    fn into_request(mut self) -> Arc<IoRequest> {
+        SUBMITTED_COUNTER.fetch_sub(1, Ordering::Relaxed);
+        self.request.take().unwrap()
+    }
+
+    fn fail(mut self, error: io::Error) {
+        SUBMITTED_COUNTER.fetch_sub(1, Ordering::Relaxed);
+        self.request.take().unwrap().fail(error);
+    }
+}
+
+impl Drop for QueuedRequest {
+    fn drop(&mut self) {
+        if let Some(request) = self.request.take() {
+            SUBMITTED_COUNTER.fetch_sub(1, Ordering::Relaxed);
+            request.fail(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "io_uring worker stopped before accepting request",
+            ));
+        }
+    }
+}
+
+pub(super) struct UringThreadPool {
+    pub threads: Vec<UringThreadHandle>,
+    pub initialization_errors: Vec<String>,
 }
 
 /// Lazy-initialized io_uring thread pool.
 ///
 /// Multiple threads are spawned on first access and run until process exit.
-pub(super) static URING_THREADS: LazyLock<Vec<UringThreadHandle>> = LazyLock::new(|| {
+pub(super) static URING_THREADS: LazyLock<UringThreadPool> = LazyLock::new(|| {
     let queue_depth = get_queue_depth();
     let thread_count = get_thread_count();
 
     let mut threads = Vec::with_capacity(thread_count);
+    let mut initialization_errors = Vec::new();
 
     for i in 0..thread_count {
-        let (tx, rx) = sync_channel(queue_depth);
-
-        std::thread::Builder::new()
-            .name(format!("lance-uring-{}", i))
-            .spawn(move || run_uring_thread(rx, queue_depth, i))
-            .expect("Failed to spawn io_uring thread");
-
-        threads.push(UringThreadHandle { request_tx: tx });
+        match start_uring_thread(queue_depth, i) {
+            Ok(thread) => threads.push(thread),
+            Err(error) => {
+                let message = format!("thread {i}: {error}");
+                log::error!("Failed to start io_uring {message}");
+                initialization_errors.push(message);
+            }
+        }
     }
 
     log::info!(
         "io_uring thread pool spawned ({} threads, queue_depth={})",
-        thread_count,
+        threads.len(),
         queue_depth
     );
 
-    threads
+    UringThreadPool {
+        threads,
+        initialization_errors,
+    }
 });
+
+fn start_uring_thread(queue_depth: usize, thread_id: usize) -> io::Result<UringThreadHandle> {
+    // Initialize the ring before publishing its sender so a request can never be
+    // accepted by a worker that subsequently fails during startup.
+    let ring = IoUring::builder().build(queue_depth as u32)?;
+    let (request_tx, request_rx) = sync_channel(queue_depth);
+    let is_alive = Arc::new(AtomicBool::new(true));
+    let worker_is_alive = Arc::clone(&is_alive);
+
+    std::thread::Builder::new()
+        .name(format!("lance-uring-{}", thread_id))
+        .spawn(move || run_uring_thread(ring, request_rx, worker_is_alive, thread_id))?;
+
+    Ok(UringThreadHandle {
+        request_tx,
+        is_alive,
+    })
+}
 
 /// Atomic counter for round-robin thread selection.
 pub(super) static THREAD_SELECTOR: AtomicU64 = AtomicU64::new(0);
@@ -114,14 +182,14 @@ fn get_thread_count() -> usize {
 /// 2. Submits them to io_uring
 /// 3. Processes completions
 /// 4. Wakes futures via their wakers
-fn run_uring_thread(request_rx: Receiver<Arc<IoRequest>>, queue_depth: usize, thread_id: usize) {
-    // Create local io_uring instance
-    let mut ring = IoUring::builder()
-        // .setup_sqpoll(100)
-        .build(queue_depth as u32)
-        .expect("Failed to create io_uring");
-
-    let mut pending: HashMap<u64, Arc<IoRequest>> = HashMap::with_capacity(queue_depth);
+fn run_uring_thread(
+    mut ring: IoUring,
+    request_rx: Receiver<QueuedRequest>,
+    is_alive: Arc<AtomicBool>,
+    thread_id: usize,
+) {
+    let queue_depth = ring.submission().capacity();
+    let mut pending = PendingRequests::with_capacity(queue_depth);
     let poll_timeout = get_poll_timeout();
     let submit_batch_size = get_submit_batch_size();
     let mut last_log = Instant::now();
@@ -197,8 +265,7 @@ fn run_uring_thread(request_rx: Receiver<Arc<IoRequest>>, queue_depth: usize, th
 
             match recv_result {
                 Ok(request) => {
-                    // Decrement submitted counter when we receive the request from channel
-                    SUBMITTED_COUNTER.fetch_sub(1, Ordering::Relaxed);
+                    let request = request.into_request();
 
                     // Push to submission queue (but don't submit yet)
                     if let Err(e) = push_to_sq(&mut ring, &mut pending, request) {
@@ -218,14 +285,19 @@ fn run_uring_thread(request_rx: Receiver<Arc<IoRequest>>, queue_depth: usize, th
                 }
                 Err(std::sync::mpsc::TryRecvError::Disconnected) => {
                     // All senders dropped - submit batch and shutdown
-                    if batch_count > 0
-                        && let Err(e) = ring.submit()
-                    {
-                        log::error!(
-                            "io_uring[{}]: Failed to submit io_uring batch: {}",
-                            thread_id,
-                            e
-                        );
+                    if batch_count > 0 {
+                        let queued = ring.submission().len();
+                        if let Err(error) = submit_all(queued, || ring.submit()) {
+                            shutdown_with_error(
+                                ring,
+                                pending,
+                                &request_rx,
+                                &is_alive,
+                                thread_id,
+                                error,
+                            );
+                            return;
+                        }
                     }
                     log::info!(
                         "io_uring thread {} shutting down (channel disconnected)",
@@ -237,15 +309,66 @@ fn run_uring_thread(request_rx: Receiver<Arc<IoRequest>>, queue_depth: usize, th
         }
 
         // Submit if we have any requests (from channel or retries)
-        if (batch_count > 0 || needs_submit)
-            && let Err(e) = ring.submit()
-        {
-            log::error!(
-                "Failed to submit io_uring batch of {} requests: {}",
-                batch_count,
-                e
-            );
+        if batch_count > 0 || needs_submit {
+            let queued = ring.submission().len();
+            if let Err(error) = submit_all(queued, || ring.submit()) {
+                shutdown_with_error(ring, pending, &request_rx, &is_alive, thread_id, error);
+                return;
+            }
         }
+    }
+}
+
+/// Submit every entry currently published to the submission queue.
+///
+/// `io_uring_enter` may be interrupted or accept only part of a batch. The
+/// remaining entries stay in the userspace submission queue and must be retried;
+/// otherwise their requests remain pending without a possible completion.
+fn submit_all(mut queued: usize, mut submit: impl FnMut() -> io::Result<usize>) -> io::Result<()> {
+    while queued > 0 {
+        match submit() {
+            Ok(0) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::WriteZero,
+                    format!("io_uring submitted 0 of {queued} queued requests"),
+                ));
+            }
+            Ok(submitted) if submitted <= queued => queued -= submitted,
+            Ok(submitted) => {
+                return Err(io::Error::other(format!(
+                    "io_uring reported {submitted} submissions for {queued} queued requests"
+                )));
+            }
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(error),
+        }
+    }
+
+    Ok(())
+}
+
+fn shutdown_with_error(
+    ring: IoUring,
+    pending: PendingRequests,
+    request_rx: &Receiver<QueuedRequest>,
+    is_alive: &AtomicBool,
+    thread_id: usize,
+    error: io::Error,
+) {
+    let error_kind = error.kind();
+    let error_message = format!("io_uring worker {thread_id} stopped: {error}");
+    log::error!("{}", error_message);
+
+    drop(ring);
+    is_alive.store(false, Ordering::Release);
+
+    // Closing the ring need not wait for reads already in flight. The failed requests stay in
+    // `pending`, whose drop leaks them, so the kernel never writes into a freed buffer.
+    for request in pending.values() {
+        request.fail(io::Error::new(error_kind, error_message.clone()));
+    }
+    for request in request_rx.try_iter() {
+        request.fail(io::Error::new(error_kind, error_message.clone()));
     }
 }
 
@@ -255,7 +378,7 @@ fn run_uring_thread(request_rx: Receiver<Arc<IoRequest>>, queue_depth: usize, th
 /// and pushes it to the SQ. The caller is responsible for calling ring.submit().
 pub(super) fn push_to_sq(
     ring: &mut IoUring,
-    pending: &mut HashMap<u64, Arc<IoRequest>>,
+    pending: &mut PendingRequests,
     request: Arc<IoRequest>,
 ) -> io::Result<()> {
     // Generate unique user_data
@@ -273,8 +396,8 @@ pub(super) fn push_to_sq(
     };
 
     // Prepare read operation
-    let read_op =
-        opcode::Read::new(types::Fd(request.fd), buffer_ptr, read_length).offset(read_offset);
+    let read_op = opcode::Read::new(types::Fd(request.file.as_raw_fd()), buffer_ptr, read_length)
+        .offset(read_offset);
 
     // Get submission queue
     let mut sq = ring.submission();
@@ -293,6 +416,11 @@ pub(super) fn push_to_sq(
     }
 
     // Push to SQ
+    // SAFETY: the read writes into `request`'s buffer from the file that `request` keeps open.
+    // `pending` keeps `request` alive until this read's completion is reaped, and leaks it if
+    // the ring goes away first. Nothing resizes or takes the buffer before that reap: a future
+    // takes it only on success, and after a failure it returns the error once (`get_range` and
+    // `get_all` wrap it in `map`, which panics if polled again).
     unsafe {
         if sq.push(&read_op.build().user_data(user_data)).is_err() {
             drop(sq);
@@ -323,7 +451,7 @@ struct CompletionResult {
 /// Returns completion stats and a list of requests needing resubmission.
 fn process_completions(
     ring: &mut IoUring,
-    pending: &mut HashMap<u64, Arc<IoRequest>>,
+    pending: &mut PendingRequests,
 ) -> io::Result<CompletionResult> {
     let mut iops = 0;
     let mut sectors = 0;
@@ -393,4 +521,125 @@ fn process_completions(
         sectors,
         retries,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{QueuedRequest, shutdown_with_error, start_uring_thread, submit_all};
+    use crate::uring::requests::{IoRequest, PendingRequests, RequestState};
+    use bytes::BytesMut;
+    use io_uring::IoUring;
+    use std::collections::VecDeque;
+    use std::io;
+    use std::sync::atomic::AtomicBool;
+    use std::sync::mpsc::sync_channel;
+    use std::sync::{Arc, Barrier, Mutex};
+    use std::thread;
+
+    fn new_request() -> Arc<IoRequest> {
+        Arc::new(IoRequest {
+            file: Arc::new(tempfile::tempfile().unwrap()),
+            offset: 0,
+            length: 1,
+            thread_id: thread::current().id(),
+            state: Mutex::new(RequestState {
+                completed: false,
+                waker: None,
+                err: None,
+                buffer: BytesMut::zeroed(1),
+                bytes_read: 0,
+            }),
+        })
+    }
+
+    #[test]
+    fn test_submit_all_retries_interrupted_and_partial_submissions() {
+        let mut results = VecDeque::from([
+            Err(io::Error::from(io::ErrorKind::Interrupted)),
+            Ok(1),
+            Ok(2),
+        ]);
+
+        submit_all(3, || results.pop_front().unwrap()).unwrap();
+
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn test_submit_all_rejects_zero_progress() {
+        let error = submit_all(1, || Ok(0)).unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::WriteZero);
+        assert!(error.to_string().contains("submitted 0 of 1"));
+    }
+
+    #[test]
+    fn test_worker_is_not_published_when_ring_initialization_fails() {
+        let result = start_uring_thread(0, 0);
+
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_late_queued_request_is_failed_when_worker_receiver_drops() {
+        let request = new_request();
+        let (request_tx, request_rx) = sync_channel(1);
+        let drained = Arc::new(Barrier::new(2));
+        let request_sent = Arc::new(Barrier::new(2));
+
+        let sender = {
+            let request = Arc::clone(&request);
+            let drained = Arc::clone(&drained);
+            let request_sent = Arc::clone(&request_sent);
+            thread::spawn(move || {
+                drained.wait();
+                assert!(request_tx.send(QueuedRequest::new(request)).is_ok());
+                request_sent.wait();
+            })
+        };
+
+        assert!(request_rx.try_recv().is_err());
+        drained.wait();
+        request_sent.wait();
+        drop(request_rx);
+        sender.join().unwrap();
+
+        let state = request.state.lock().unwrap();
+        assert!(state.completed);
+        assert_eq!(
+            state.err.as_ref().unwrap().kind(),
+            io::ErrorKind::BrokenPipe
+        );
+    }
+
+    #[test]
+    fn test_shutdown_with_error_fails_and_leaks_pending_requests() {
+        // Without io_uring support there is no ring to shut down.
+        let Ok(ring) = IoUring::new(2) else {
+            return;
+        };
+        let request = new_request();
+        let mut pending = PendingRequests::default();
+        pending.insert(1, Arc::clone(&request));
+        let (_request_tx, request_rx) = sync_channel(1);
+
+        shutdown_with_error(
+            ring,
+            pending,
+            &request_rx,
+            &AtomicBool::new(true),
+            0,
+            io::Error::other("submit failed"),
+        );
+
+        let state = request.state.lock().unwrap();
+        assert!(state.completed);
+        let error = state.err.as_ref().unwrap();
+        assert_eq!(error.kind(), io::ErrorKind::Other);
+        assert!(error.to_string().contains("submit failed"), "{error}");
+        drop(state);
+        // The request was left in `pending`, so dropping `pending` leaked it instead of freeing a
+        // buffer the kernel may still be writing.
+        assert_eq!(Arc::strong_count(&request), 2);
+    }
 }

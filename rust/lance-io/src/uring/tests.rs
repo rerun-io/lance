@@ -3,11 +3,44 @@
 
 //! Tests for io_uring reader implementation.
 
+use super::current_thread::{UringCurrentThreadReader, push_request};
+use super::current_thread_future::UringCurrentThreadFuture;
+use super::future::UringReadFuture;
+use super::reader::{CacheKey, HANDLE_CACHE};
+use super::requests::{IoRequest, PendingRequests, RequestState};
+use super::thread::push_to_sq;
 use crate::object_store::ObjectStore;
+use crate::utils::tracking_store::IOTracker;
+use bytes::BytesMut;
+use io_uring::IoUring;
 use lance_core::Result;
+use std::fs::File;
 use std::io::Write;
+use std::os::fd::OwnedFd;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tempfile::NamedTempFile;
+
+macro_rules! skip_if_no_uring_workers {
+    () => {
+        if super::thread::URING_THREADS.threads.is_empty() {
+            return Ok(());
+        }
+    };
+}
+
+macro_rules! skip_if_no_thread_local_uring {
+    () => {
+        // The thread-local ring needs Linux 6.1 for `IORING_SETUP_DEFER_TASKRUN`.
+        let ring: std::io::Result<IoUring> = IoUring::builder()
+            .setup_defer_taskrun()
+            .setup_single_issuer()
+            .build(super::current_thread::DEFAULT_THREAD_LOCAL_QUEUE_DEPTH as u32);
+        if ring.is_err() {
+            return Ok(());
+        }
+    };
+}
 
 /// Helper to create a temporary file with test data
 fn create_test_file(size: usize) -> Result<(NamedTempFile, Vec<u8>)> {
@@ -20,6 +53,7 @@ fn create_test_file(size: usize) -> Result<(NamedTempFile, Vec<u8>)> {
 
 #[tokio::test]
 async fn test_read_small_file() -> Result<()> {
+    skip_if_no_uring_workers!();
     let (file, expected_data) = create_test_file(1024)?;
     let file_path = file.path().to_str().unwrap();
     let uri = format!("file+uring://{}", file_path);
@@ -36,6 +70,7 @@ async fn test_read_small_file() -> Result<()> {
 
 #[tokio::test]
 async fn test_read_range() -> Result<()> {
+    skip_if_no_uring_workers!();
     let (file, expected_data) = create_test_file(4096)?;
     let file_path = file.path().to_str().unwrap();
     let uri = format!("file+uring://{}", file_path);
@@ -53,6 +88,7 @@ async fn test_read_range() -> Result<()> {
 
 #[tokio::test]
 async fn test_read_multiple_ranges() -> Result<()> {
+    skip_if_no_uring_workers!();
     let (file, expected_data) = create_test_file(8192)?;
     let file_path = file.path().to_str().unwrap();
     let uri = format!("file+uring://{}", file_path);
@@ -72,6 +108,7 @@ async fn test_read_multiple_ranges() -> Result<()> {
 
 #[tokio::test]
 async fn test_file_size() -> Result<()> {
+    skip_if_no_uring_workers!();
     let size = 5000;
     let (file, _) = create_test_file(size)?;
     let file_path = file.path().to_str().unwrap();
@@ -87,6 +124,7 @@ async fn test_file_size() -> Result<()> {
 
 #[tokio::test]
 async fn test_concurrent_reads() -> Result<()> {
+    skip_if_no_uring_workers!();
     let (file, expected_data) = create_test_file(16384)?;
     let file_path = file.path().to_str().unwrap();
     let uri = format!("file+uring://{}", file_path);
@@ -115,6 +153,7 @@ async fn test_concurrent_reads() -> Result<()> {
 
 #[tokio::test]
 async fn test_large_file_read() -> Result<()> {
+    skip_if_no_uring_workers!();
     // Test with a larger file (1MB)
     let size = 1024 * 1024;
     let (file, expected_data) = create_test_file(size)?;
@@ -134,6 +173,7 @@ async fn test_large_file_read() -> Result<()> {
 
 #[tokio::test]
 async fn test_read_edge_cases() -> Result<()> {
+    skip_if_no_uring_workers!();
     let (file, expected_data) = create_test_file(4096)?;
     let file_path = file.path().to_str().unwrap();
     let uri = format!("file+uring://{}", file_path);
@@ -157,17 +197,21 @@ async fn test_read_edge_cases() -> Result<()> {
 }
 
 #[tokio::test]
-async fn test_file_not_found() {
+async fn test_file_not_found() -> Result<()> {
+    skip_if_no_uring_workers!();
     let uri = "file+uring:///nonexistent/file.dat";
     let (store, path) = ObjectStore::from_uri(uri).await.unwrap();
 
     // Should fail to open non-existent file
     let result = store.open(&path).await;
     assert!(result.is_err());
+
+    Ok(())
 }
 
 #[tokio::test]
 async fn test_block_size_and_parallelism() -> Result<()> {
+    skip_if_no_uring_workers!();
     let (file, _) = create_test_file(1024)?;
     let file_path = file.path().to_str().unwrap();
     let uri = format!("file+uring://{}", file_path);
@@ -184,6 +228,7 @@ async fn test_block_size_and_parallelism() -> Result<()> {
 
 #[tokio::test]
 async fn test_path() -> Result<()> {
+    skip_if_no_uring_workers!();
     let (file, _) = create_test_file(1024)?;
     let file_path = file.path().to_str().unwrap();
     let uri = format!("file+uring://{}", file_path);
@@ -203,6 +248,7 @@ async fn test_path() -> Result<()> {
 /// than the actual file, causing io_uring to hit EOF before the full read completes.
 #[tokio::test]
 async fn test_short_read_get_all() -> Result<()> {
+    skip_if_no_uring_workers!();
     let actual_size: usize = 8192;
     let (file, _expected_data) = create_test_file(actual_size)?;
     let file_path = file.path().to_str().unwrap();
@@ -225,6 +271,7 @@ async fn test_short_read_get_all() -> Result<()> {
 /// Test that a range read extending past EOF returns an error.
 #[tokio::test]
 async fn test_short_read_get_range_past_eof() -> Result<()> {
+    skip_if_no_uring_workers!();
     let actual_size: usize = 8192;
     let (file, _expected_data) = create_test_file(actual_size)?;
     let file_path = file.path().to_str().unwrap();
@@ -257,26 +304,18 @@ async fn test_short_read_get_range_past_eof() -> Result<()> {
 /// future hangs and the timeout fires.
 #[tokio::test]
 async fn test_retry_sq_full_thread() -> Result<()> {
-    use super::future::UringReadFuture;
-    use super::requests::{IoRequest, RequestState};
-    use super::thread::push_to_sq;
-    use bytes::BytesMut;
-    use io_uring::IoUring;
-    use std::collections::HashMap;
-    use std::os::unix::io::AsRawFd;
-    use std::sync::{Arc, Mutex};
-
+    skip_if_no_uring_workers!();
     let (file, _) = create_test_file(4096)?;
-    let fd = file.as_file().as_raw_fd();
+    let file = Arc::new(file.reopen()?);
 
     // Create a tiny ring with queue_depth=2
     let mut ring = IoUring::new(2).unwrap();
-    let mut pending: HashMap<u64, Arc<IoRequest>> = HashMap::new();
+    let mut pending = PendingRequests::default();
 
     // Helper to create a request
     let make_request = || {
         Arc::new(IoRequest {
-            fd,
+            file: Arc::clone(&file),
             offset: 0,
             length: 4096,
             thread_id: std::thread::current().id(),
@@ -321,25 +360,17 @@ async fn test_retry_sq_full_thread() -> Result<()> {
 /// has already completed the request with an error.
 #[tokio::test(flavor = "current_thread")]
 async fn test_retry_sq_full_current_thread() -> Result<()> {
-    use super::current_thread_future::UringCurrentThreadFuture;
-    use super::requests::{IoRequest, RequestState};
-    use super::thread::push_to_sq;
-    use bytes::BytesMut;
-    use io_uring::IoUring;
-    use std::collections::HashMap;
-    use std::os::unix::io::AsRawFd;
-    use std::sync::{Arc, Mutex};
-
+    skip_if_no_uring_workers!();
     let (file, _) = create_test_file(4096)?;
-    let fd = file.as_file().as_raw_fd();
+    let file = Arc::new(file.reopen()?);
 
     // Create a tiny ring with queue_depth=2
     let mut ring = IoUring::new(2).unwrap();
-    let mut pending: HashMap<u64, Arc<IoRequest>> = HashMap::new();
+    let mut pending = PendingRequests::default();
 
     let make_request = || {
         Arc::new(IoRequest {
-            fd,
+            file: Arc::clone(&file),
             offset: 0,
             length: 4096,
             thread_id: std::thread::current().id(),
@@ -370,6 +401,74 @@ async fn test_retry_sq_full_current_thread() -> Result<()> {
         "future timed out — request was dropped without error on SQ-full push failure"
     );
 
+    Ok(())
+}
+
+/// A thread that exits with a read still in flight on its ring waits for that read before
+/// freeing its request, instead of freeing a buffer the kernel may still write.
+#[test]
+fn test_thread_exit_waits_for_reads_in_flight() -> Result<()> {
+    skip_if_no_thread_local_uring!();
+    // A read from an empty pipe stays in flight until the test writes to the pipe.
+    let (pipe_reader, mut pipe_writer) = std::io::pipe()?;
+    let request = Arc::new(IoRequest {
+        file: Arc::new(File::from(OwnedFd::from(pipe_reader))),
+        offset: 0,
+        length: 4,
+        thread_id: std::thread::current().id(),
+        state: Mutex::new(RequestState {
+            completed: false,
+            waker: None,
+            err: None,
+            buffer: BytesMut::zeroed(4),
+            bytes_read: 0,
+        }),
+    });
+
+    // `push_request` only queues the read, so the exiting thread's ring submits it on the way out.
+    let queued = Arc::clone(&request);
+    let exiting = std::thread::spawn(move || push_request(queued).unwrap());
+    // Give the thread time to submit the read before the data arrives.
+    std::thread::sleep(Duration::from_millis(50));
+    pipe_writer.write_all(b"data")?;
+    exiting.join().unwrap();
+
+    assert_eq!(Arc::strong_count(&request), 1);
+    assert_eq!(request.state.lock().unwrap().buffer.as_ref(), b"data");
+    Ok(())
+}
+
+/// A read that the current-thread reader has queued, but not yet submitted, must still read its
+/// own file after the reader and the cached handle are dropped and another file is opened.
+#[tokio::test(flavor = "current_thread")]
+async fn test_queued_read_keeps_its_file_open() -> Result<()> {
+    skip_if_no_thread_local_uring!();
+    // `create_test_file` writes a different pattern, so bytes read from any other test file
+    // cannot match.
+    let expected_data = vec![0x5A; 4096];
+    let mut file = NamedTempFile::new()?;
+    file.write_all(&expected_data)?;
+    let uri = format!("file+uring://{}", file.path().to_str().unwrap());
+    let (_, path) = ObjectStore::from_uri(&uri).await?;
+
+    let reader =
+        UringCurrentThreadReader::open(&path, 4096, None, Arc::new(IOTracker::default())).await?;
+    let cache_key = CacheKey::new(&path, reader.block_size());
+    let cached_file = Arc::downgrade(&HANDLE_CACHE.get(&cache_key).await.unwrap().handle.file);
+    // The read is queued here and submitted only when the future is first polled.
+    let read = reader.get_range(0..4096);
+    drop(reader);
+    HANDLE_CACHE.invalidate(&cache_key).await;
+    HANDLE_CACHE.run_pending_tasks().await;
+    assert!(
+        cached_file.strong_count() == 1,
+        "only the queued request must keep the file open"
+    );
+    // Had the file been closed, this would likely take over its descriptor number.
+    let (_other_file, _) = create_test_file(4096)?;
+
+    let data = read.await.unwrap();
+    assert_eq!(data.as_ref(), expected_data.as_slice());
     Ok(())
 }
 
