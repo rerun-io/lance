@@ -57,6 +57,10 @@ use crate::{
 };
 use crate::{scalar::IndexReader, scalar::expression::ScalarQueryParser};
 
+mod build;
+
+use build::SortedRuns;
+
 pub const BITMAP_LOOKUP_NAME: &str = "bitmap_page_lookup.lance";
 pub const INDEX_STATS_METADATA_KEY: &str = "lance:index_stats";
 const BITMAP_PART_LOOKUP_PREFIX: &str = "part_";
@@ -1845,8 +1849,28 @@ impl BitmapIndexPlugin {
                     .await?;
             }
         } else {
-            Self::emit_sorted_runs(&mut data_source, &mut old, &mut emitted_null, &mut writer)
-                .await?;
+            // A run is flushed when the next one arrives, so its key is
+            // checked against the next and then moved, never cloned.
+            let mut runs = SortedRuns::new(data_source);
+            let mut pending: Option<(ScalarValue, RowAddrTreeMap)> = None;
+            while let Some((key, bitmap)) = runs.next_run().await? {
+                if let Some((previous, mut previous_bitmap)) = pending.take() {
+                    check_run_order(&previous, &key, emitted_null)?;
+                    Self::finish_run(
+                        previous,
+                        &mut previous_bitmap,
+                        &mut old,
+                        &mut emitted_null,
+                        &mut writer,
+                    )
+                    .await?;
+                }
+                pending = Some((key, bitmap));
+            }
+            if let Some((key, mut bitmap)) = pending {
+                Self::finish_run(key, &mut bitmap, &mut old, &mut emitted_null, &mut writer)
+                    .await?;
+            }
         }
 
         // Emit any remaining old-only entries.
@@ -1862,54 +1886,6 @@ impl BitmapIndexPlugin {
         }
 
         writer.finish().await
-    }
-
-    /// Emit the runs of value-sorted new data, merging each with `old`.
-    async fn emit_sorted_runs(
-        data_source: &mut SendableRecordBatchStream,
-        old: &mut OldSegments<'_>,
-        emitted_null: &mut bool,
-        writer: &mut BitmapBatchWriter,
-    ) -> Result<()> {
-        let mut current_key: Option<ScalarValue> = None;
-        let mut current_bitmap = RowAddrTreeMap::default();
-
-        while let Some(batch) = data_source.try_next().await? {
-            let values = batch.column_by_name(VALUE_COLUMN_NAME).expect_ok()?;
-            let row_ids = batch.column_by_name(ROW_ID).expect_ok()?;
-            debug_assert_eq!(row_ids.data_type(), &DataType::UInt64);
-            let row_id_column = row_ids.as_any().downcast_ref::<UInt64Array>().unwrap();
-
-            for i in 0..values.len() {
-                let row_id = row_id_column.value(i);
-                let key = ScalarValue::try_from_array(values.as_ref(), i)?;
-
-                match &current_key {
-                    Some(cur) if *cur == key => {
-                        current_bitmap.insert(row_id);
-                    }
-                    _ => {
-                        // Value changed — flush the previous run.
-                        if let Some(prev_key) = current_key.take() {
-                            check_run_order(&prev_key, &key, *emitted_null)?;
-                            let mut prev_bitmap = std::mem::take(&mut current_bitmap);
-                            Self::finish_run(prev_key, &mut prev_bitmap, old, emitted_null, writer)
-                                .await?;
-                        }
-                        current_key = Some(key);
-                        current_bitmap = RowAddrTreeMap::default();
-                        current_bitmap.insert(row_id);
-                    }
-                }
-            }
-        }
-
-        // Flush the last accumulated run from new data.
-        if let Some(last_key) = current_key.take() {
-            let mut last_bitmap = std::mem::take(&mut current_bitmap);
-            Self::finish_run(last_key, &mut last_bitmap, old, emitted_null, writer).await?;
-        }
-        Ok(())
     }
 
     /// Flush a completed value-run from the new data stream, emitting any
@@ -2232,7 +2208,10 @@ mod tests {
     use super::*;
     use crate::metrics::{LocalMetricsCollector, NoOpMetricsCollector};
     use crate::scalar::lance_format::LanceIndexStore;
-    use arrow_array::{BooleanArray, RecordBatch, StringArray, UInt64Array, record_batch};
+    use arrow_array::{
+        ArrayRef, BooleanArray, FixedSizeBinaryArray, Float64Array, Int64Array, RecordBatch,
+        StringArray, UInt64Array, record_batch,
+    };
     use arrow_schema::{DataType, Field, Schema};
 
     /// Sort a (value, row_id) RecordBatch by the value column so that unit tests
@@ -2751,6 +2730,141 @@ mod tests {
                 "update, key {key:?}"
             );
         }
+    }
+
+    /// Drain `stream` through the typed run reader.
+    async fn collect_sorted_runs(
+        stream: SendableRecordBatchStream,
+    ) -> Vec<(ScalarValue, RowAddrTreeMap)> {
+        let mut runs = build::SortedRuns::new(stream);
+        let mut out = Vec::new();
+        while let Some(run) = runs.next_run().await.unwrap() {
+            out.push(run);
+        }
+        out
+    }
+
+    /// Runs are cut per batch through the typed array and continue across
+    /// batch boundaries: a key split over three batches is one run, a batch
+    /// of several keys is resumed run by run, the nulls (sorted first) are
+    /// one run, and row ids that arrive out of address order within a run
+    /// are all kept.
+    #[rstest]
+    #[case::utf8(DataType::Utf8)]
+    #[case::int64(DataType::Int64)]
+    #[case::fixed_size_binary(DataType::FixedSizeBinary(2))]
+    #[tokio::test]
+    async fn test_bitmap_sorted_runs_span_batches(#[case] data_type: DataType) {
+        // Key numbers in value order; `None` is null.
+        let batches: Vec<Vec<(Option<u8>, u64)>> = vec![
+            vec![
+                (None, addr(0, 5)),
+                (None, addr(0, 1)),
+                (Some(0), addr(0, 2)),
+            ],
+            vec![(Some(1), addr(0, 9))],
+            vec![(Some(1), addr(0, 3))],
+            vec![
+                (Some(1), addr(0, 4)),
+                (Some(2), addr(1, 0)),
+                (Some(3), addr(0, 8)),
+            ],
+            vec![],
+            vec![(Some(3), addr(0, 0)), (Some(3), addr(0, 6))],
+        ];
+        let schema = value_row_id_schema(data_type.clone());
+        let values = |rows: &[(Option<u8>, u64)]| -> ArrayRef {
+            let keys = rows.iter().map(|(k, _)| *k);
+            match data_type {
+                DataType::Utf8 => Arc::new(StringArray::from(
+                    keys.map(|k| k.map(|k| format!("k{k}"))).collect::<Vec<_>>(),
+                )),
+                DataType::Int64 => Arc::new(Int64Array::from(
+                    keys.map(|k| k.map(i64::from)).collect::<Vec<_>>(),
+                )),
+                _ => Arc::new(
+                    FixedSizeBinaryArray::try_from_sparse_iter_with_size(
+                        keys.map(|k| k.map(|k| [b'k', b'0' + k])),
+                        2,
+                    )
+                    .unwrap(),
+                ),
+            }
+        };
+        let key = |k: Option<u8>| match data_type {
+            DataType::Utf8 => ScalarValue::Utf8(k.map(|k| format!("k{k}"))),
+            DataType::Int64 => ScalarValue::Int64(k.map(i64::from)),
+            _ => ScalarValue::FixedSizeBinary(2, k.map(|k| vec![b'k', b'0' + k])),
+        };
+        let batches = batches
+            .iter()
+            .map(|rows| {
+                RecordBatch::try_new(
+                    schema.clone(),
+                    vec![
+                        values(rows),
+                        Arc::new(UInt64Array::from(
+                            rows.iter().map(|(_, a)| *a).collect::<Vec<_>>(),
+                        )),
+                    ],
+                )
+                .unwrap()
+            })
+            .collect::<Vec<_>>();
+        let stream: SendableRecordBatchStream = Box::pin(RecordBatchStreamAdapter::new(
+            schema.clone(),
+            stream::iter(batches.into_iter().map(Ok)),
+        ));
+        let runs = collect_sorted_runs(stream).await;
+        let expected = [
+            (None, vec![addr(0, 1), addr(0, 5)]),
+            (Some(0), vec![addr(0, 2)]),
+            (Some(1), vec![addr(0, 3), addr(0, 4), addr(0, 9)]),
+            (Some(2), vec![addr(1, 0)]),
+            (Some(3), vec![addr(0, 0), addr(0, 6), addr(0, 8)]),
+        ];
+        assert_eq!(runs.len(), expected.len(), "{data_type}: {runs:?}");
+        for ((got_key, got_rows), (k, rows)) in runs.iter().zip(expected) {
+            assert_eq!(*got_key, key(k), "{data_type}");
+            assert_eq!(
+                *got_rows,
+                RowAddrTreeMap::from_iter(rows),
+                "{data_type} key {k:?}"
+            );
+        }
+    }
+
+    /// Float keys are cut by their bits, as the index orders them: `-0.0`
+    /// and `0.0` stay two runs, as do a NaN and a NaN of another sign.
+    #[tokio::test]
+    async fn test_bitmap_sorted_runs_keep_float_keys_apart() {
+        let schema = value_row_id_schema(DataType::Float64);
+        // Sorted by total_cmp: -NaN, -0.0, 0.0, NaN.
+        let values = [-f64::NAN, -0.0, 0.0, f64::NAN];
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Float64Array::from(values.to_vec())),
+                Arc::new(UInt64Array::from(
+                    (0..4).map(|i| addr(0, i)).collect::<Vec<_>>(),
+                )),
+            ],
+        )
+        .unwrap();
+        let stream: SendableRecordBatchStream = Box::pin(RecordBatchStreamAdapter::new(
+            schema,
+            stream::once(async move { Ok(batch) }),
+        ));
+        let runs = collect_sorted_runs(stream).await;
+        let keys = runs
+            .iter()
+            .map(|(key, _)| match key {
+                ScalarValue::Float64(Some(v)) => v.to_bits(),
+                other => panic!("unexpected key {other:?}"),
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(keys, values.iter().map(|v| v.to_bits()).collect::<Vec<_>>());
+        assert!(runs.iter().all(|(_, rows)| rows.len() == Some(1)));
     }
 
     /// Does `filter` keep `row_addr`? Mirrors
