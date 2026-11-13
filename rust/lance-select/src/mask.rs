@@ -543,6 +543,59 @@ impl RowAddrTreeMap {
             .insert(fragment, RowAddrSelection::Partial(bitmap));
     }
 
+    /// Insert a run of rows that is expected to be ascending.
+    ///
+    /// Rows are grouped by fragment, and each group that is strictly
+    /// ascending and above everything already in that fragment's set is
+    /// appended in one go, which is much cheaper than [`Self::insert`] per
+    /// row: roaring finds the last container once instead of searching per
+    /// value and only checks the container's representation at the end.
+    /// Any row that breaks the order (or a fragment that reappears later in
+    /// `rows`) falls back to [`Self::insert`], so the result is the same set
+    /// whatever the order, just slower.
+    ///
+    /// Returns how many rows were not already in the set.
+    ///
+    /// ```rust
+    /// use lance_select::{RowAddrTreeMap, RowSetOps};
+    ///
+    /// let mut set = RowAddrTreeMap::new();
+    /// assert_eq!(set.insert_sorted(&[1, 2, 3, 5]), 4);
+    /// assert_eq!(set.insert_sorted(&[4, 5, 6]), 2);
+    /// assert_eq!(set.len(), Some(6));
+    /// ```
+    pub fn insert_sorted(&mut self, rows: &[u64]) -> u64 {
+        let mut inserted = 0;
+        for group in rows.chunk_by(|a, b| (a >> 32) == (b >> 32)) {
+            let fragment = (group[0] >> 32) as u32;
+            let offsets = group.iter().map(|row| *row as u32);
+            let set = match self.inner.get_mut(&fragment) {
+                Some(RowAddrSelection::Full) => continue,
+                Some(RowAddrSelection::Partial(set)) => set,
+                None => {
+                    self.inner
+                        .insert(fragment, RowAddrSelection::Partial(RoaringBitmap::new()));
+                    match self.inner.get_mut(&fragment) {
+                        Some(RowAddrSelection::Partial(set)) => set,
+                        _ => unreachable!("fragment {fragment} was just inserted as partial"),
+                    }
+                }
+            };
+            match set.append(offsets) {
+                Ok(appended) => inserted += appended,
+                Err(err) => {
+                    inserted += err.valid_until();
+                    for row in &group[err.valid_until() as usize..] {
+                        if set.insert(*row as u32) {
+                            inserted += 1;
+                        }
+                    }
+                }
+            }
+        }
+        inserted
+    }
+
     /// Add a whole fragment to the set
     pub fn insert_fragment(&mut self, fragment_id: u32) {
         self.inner.insert(fragment_id, RowAddrSelection::Full);
@@ -1201,6 +1254,43 @@ mod tests {
 
     fn selected_in_range(mask: &RowAddrMask, range: std::ops::Range<u64>) -> Vec<u64> {
         range.filter(|val| mask.selected(*val)).collect()
+    }
+
+    /// `insert_sorted` yields the same set as per-row inserts whatever the
+    /// order of its input: an ascending run takes the append path, a run that
+    /// goes backwards, repeats, or revisits a fragment falls back to inserts.
+    #[test]
+    fn test_insert_sorted_matches_insert() {
+        let addr = |frag: u32, off: u32| RowAddress::new_from_parts(frag, off).into();
+        let runs: [Vec<u64>; 4] = [
+            // ascending across two fragments
+            vec![addr(0, 1), addr(0, 2), addr(0, 7), addr(1, 0), addr(1, 3)],
+            // below the current maximum of fragment 0, and a duplicate
+            vec![addr(0, 5), addr(0, 5), addr(1, 1)],
+            // fragment 0 revisited after fragment 2, with a descending pair
+            vec![addr(2, 9), addr(2, 8), addr(0, 9)],
+            vec![],
+        ];
+        let mut sorted = RowAddrTreeMap::new();
+        let mut expected = RowAddrTreeMap::new();
+        for run in &runs {
+            let inserted = sorted.insert_sorted(run);
+            let mut inserted_one_by_one = 0;
+            for row in run {
+                if expected.insert(*row) {
+                    inserted_one_by_one += 1;
+                }
+            }
+            assert_eq!(inserted, inserted_one_by_one, "run {run:?}");
+            assert_eq!(sorted, expected, "run {run:?}");
+        }
+        assert_eq!(sorted.len(), Some(10));
+
+        // A full fragment absorbs its rows without changing.
+        let mut with_full = RowAddrTreeMap::new();
+        with_full.insert_fragment(3);
+        assert_eq!(with_full.insert_sorted(&[addr(3, 0), addr(3, 1)]), 0);
+        assert!(matches!(with_full.get(&3), Some(RowAddrSelection::Full)));
     }
 
     #[test]
