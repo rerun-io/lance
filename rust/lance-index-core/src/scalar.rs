@@ -438,7 +438,8 @@ pub struct CreatedIndex {
 /// The ordering that training data must satisfy
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TrainingOrdering {
-    /// The input will arrive sorted by the value column in ascending order
+    /// The input will arrive sorted by the value column in ascending order,
+    /// nulls first
     Values,
     /// The input will arrive sorted by the address column in ascending order
     Addresses,

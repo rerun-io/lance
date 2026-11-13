@@ -747,7 +747,7 @@ impl BasicTrainer for JsonIndexPlugin {
         // what asked the scanner for unordered input above) and would never take this branch.
         let converted_stream =
             if request.target_request.criteria().ordering == TrainingOrdering::Values {
-                sort_stream_by_value(converted_stream)?
+                sort_stream_by_value(converted_stream, None)?
             } else {
                 converted_stream
             };

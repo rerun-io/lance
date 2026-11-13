@@ -32,10 +32,15 @@ pub const VALUE_COLUMN_NAME: &str = "value";
 ///
 /// For a trainer whose input the scanner could not sort (the JSON index sorts
 /// on the value extracted at `path`, not on the raw column) or chose not to
-/// (the bitmap index sorts only the part of its input it does not group in
-/// memory), this is the only sort on the training path.
+/// (the bitmap index reads its input unsorted and sorts a replay of it only
+/// when it has too many keys to hold a row set each), this is the only sort
+/// on the training path.
+///
+/// `mem_pool_bytes` sizes the DataFusion pool the sort runs in; `None` is the
+/// Lance default shared by every plan.
 pub(crate) fn sort_stream_by_value(
     data: SendableRecordBatchStream,
+    mem_pool_bytes: Option<u64>,
 ) -> Result<SendableRecordBatchStream> {
     let input = Arc::new(OneShotExec::new(data));
     let value_idx = input.schema().index_of(VALUE_COLUMN_NAME)?;
@@ -51,6 +56,7 @@ pub(crate) fn sort_stream_by_value(
         plan,
         LanceExecutionOptions {
             use_spilling: true,
+            mem_pool_size: mem_pool_bytes,
             ..Default::default()
         },
     )
