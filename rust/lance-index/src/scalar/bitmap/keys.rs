@@ -44,6 +44,9 @@ use crate::scalar::btree::OrderableScalarValue;
 /// non-null ids start at 1.
 pub(super) const NULL_ID: u32 = 0;
 
+/// What [`KeyTable::lookup_ids`] reports for a value the table has not seen.
+pub(super) const UNKNOWN_ID: u32 = u32::MAX;
+
 /// A multiplicative hasher for integer and byte-string keys; the FxHash
 /// recipe, written here so no crate is added for it.
 #[derive(Default)]
@@ -164,6 +167,10 @@ trait TypedKeys: Send {
     /// seen for the first time.
     fn assign_ids(&mut self, values: &dyn Array, ids: &mut Vec<u32>) -> Result<()>;
 
+    /// Append one id per row of `values` to `ids`, [`UNKNOWN_ID`] for a value
+    /// the table has not seen.
+    fn lookup_ids(&self, values: &dyn Array, ids: &mut Vec<u32>) -> Result<()>;
+
     /// Number of distinct non-null keys assigned so far.
     fn num_keys(&self) -> usize;
 
@@ -171,8 +178,9 @@ trait TypedKeys: Send {
     fn keys(&self) -> Result<ArrayRef>;
 
     /// Whether the value type fixes the ids up front (Boolean, 8-bit
-    /// integers), so `num_keys` is the whole domain before any value is
-    /// seen. A table that grows with the values it sees answers `false`.
+    /// integers), so `num_keys` is the whole domain before any value is seen
+    /// and `lookup_ids` never reports [`UNKNOWN_ID`]. A table that grows with
+    /// the values it sees answers `false`.
     fn has_fixed_domain(&self) -> bool {
         false
     }
@@ -202,6 +210,12 @@ impl TypedKeys for BooleanKeys {
         Ok(())
     }
 
+    fn lookup_ids(&self, values: &dyn Array, ids: &mut Vec<u32>) -> Result<()> {
+        // Every value has an id, so a lookup is an assignment.
+        let mut keys = Self;
+        keys.assign_ids(values, ids)
+    }
+
     fn num_keys(&self) -> usize {
         2
     }
@@ -224,6 +238,10 @@ struct SmallIntKeys {
 
 impl TypedKeys for SmallIntKeys {
     fn assign_ids(&mut self, values: &dyn Array, ids: &mut Vec<u32>) -> Result<()> {
+        self.lookup_ids(values, ids)
+    }
+
+    fn lookup_ids(&self, values: &dyn Array, ids: &mut Vec<u32>) -> Result<()> {
         // Int8 keys by their byte pattern, so -1 is id 256 and -128 id 129.
         if let Some(values) = values.as_primitive_opt::<Int8Type>() {
             ids.extend(
@@ -300,6 +318,23 @@ where
         Ok(())
     }
 
+    fn lookup_ids(&self, values: &dyn Array, ids: &mut Vec<u32>) -> Result<()> {
+        let values = values
+            .as_primitive_opt::<T>()
+            .ok_or_else(|| type_mismatch(&self.data_type, values))?;
+        ids.extend(values.iter().map(|value| {
+            match value {
+                None => NULL_ID,
+                Some(value) => self
+                    .map
+                    .get(&value.key_bits())
+                    .copied()
+                    .unwrap_or(UNKNOWN_ID),
+            }
+        }));
+        Ok(())
+    }
+
     fn num_keys(&self) -> usize {
         self.values.len()
     }
@@ -351,6 +386,13 @@ impl<O: OffsetSizeTrait> BytesKeys<O> {
             ids.push(id);
         }
     }
+
+    fn lookup_bytes<'a>(&self, rows: impl Iterator<Item = Option<&'a [u8]>>, ids: &mut Vec<u32>) {
+        ids.extend(rows.map(|value| match value {
+            None => NULL_ID,
+            Some(value) => self.map.get(value).copied().unwrap_or(UNKNOWN_ID),
+        }));
+    }
 }
 
 /// The rows of a string or binary array of offset width `O`, or of a
@@ -384,6 +426,13 @@ impl<O: OffsetSizeTrait> TypedKeys for BytesKeys<O> {
         ids.reserve(values.len());
         let rows = byte_rows::<O>(&self.data_type, values)?;
         self.assign_bytes(rows, ids);
+        Ok(())
+    }
+
+    fn lookup_ids(&self, values: &dyn Array, ids: &mut Vec<u32>) -> Result<()> {
+        ids.reserve(values.len());
+        let rows = byte_rows::<O>(&self.data_type, values)?;
+        self.lookup_bytes(rows, ids);
         Ok(())
     }
 
@@ -447,6 +496,19 @@ impl TypedKeys for ScalarKeys {
             self.values.push(value.clone());
             self.map.insert(value, id);
             ids.push(id);
+        }
+        Ok(())
+    }
+
+    fn lookup_ids(&self, values: &dyn Array, ids: &mut Vec<u32>) -> Result<()> {
+        ids.reserve(values.len());
+        for i in 0..values.len() {
+            if values.is_null(i) {
+                ids.push(NULL_ID);
+                continue;
+            }
+            let value = ScalarValue::try_from_array(values, i)?;
+            ids.push(self.map.get(&value).copied().unwrap_or(UNKNOWN_ID));
         }
         Ok(())
     }
@@ -549,6 +611,12 @@ impl KeyTable {
         self.keys.assign_ids(values, ids)
     }
 
+    /// Append one id per row of `values` to `ids` without assigning any:
+    /// [`UNKNOWN_ID`] marks a value the table has not seen.
+    pub(super) fn lookup_ids(&self, values: &dyn Array, ids: &mut Vec<u32>) -> Result<()> {
+        self.keys.lookup_ids(values, ids)
+    }
+
     /// See [`TypedKeys::has_fixed_domain`]; when true, [`Self::num_ids`] is
     /// the whole domain from the start.
     pub(super) fn has_fixed_domain(&self) -> bool {
@@ -560,7 +628,8 @@ impl KeyTable {
         self.keys.num_keys() + 1
     }
 
-    /// The keys in index order and the id remap.
+    /// The keys in index order and the id remap. The table stays usable for
+    /// lookups, which a later pass over the input needs.
     pub(super) fn sorted_keys(&self) -> Result<SortedKeys> {
         let keys = self.keys.keys()?;
         let null_key = ScalarValue::try_from_array(new_null_array(&self.data_type, 1).as_ref(), 0)?;
@@ -840,6 +909,48 @@ mod tests {
         assert_eq!(sorted.keys.len(), expected_keys);
         assert!(sorted.keys[0].is_null());
         assert_eq!(sorted.remap.len(), expected_keys);
+    }
+
+    /// `lookup_ids` on every table kind: known values keep their ids, unseen
+    /// ones are `UNKNOWN_ID`, and the table does not grow.
+    #[rstest]
+    #[case::utf8(
+        Arc::new(StringArray::from(vec![Some("a"), Some("b")])) as ArrayRef,
+        Arc::new(StringArray::from(vec![Some("b"), None, Some("zzz"), Some("a")])) as ArrayRef,
+        vec![2, NULL_ID, UNKNOWN_ID, 1]
+    )]
+    #[case::int64(
+        Arc::new(Int64Array::from(vec![Some(5), Some(7)])) as ArrayRef,
+        Arc::new(Int64Array::from(vec![Some(7), None, Some(9), Some(5)])) as ArrayRef,
+        vec![2, NULL_ID, UNKNOWN_ID, 1]
+    )]
+    #[case::fixed_size_binary(
+        byte_array(&DataType::FixedSizeBinary(2), &[Some("aa"), Some("bb")]),
+        byte_array(&DataType::FixedSizeBinary(2), &[Some("bb"), None, Some("zz"), Some("aa")]),
+        vec![2, NULL_ID, UNKNOWN_ID, 1]
+    )]
+    #[case::decimal(
+        Arc::new(Decimal128Array::from(vec![Some(5), Some(7)]).with_precision_and_scale(10, 2).unwrap()) as ArrayRef,
+        Arc::new(Decimal128Array::from(vec![Some(7), None, Some(9), Some(5)]).with_precision_and_scale(10, 2).unwrap()) as ArrayRef,
+        vec![2, NULL_ID, UNKNOWN_ID, 1]
+    )]
+    #[case::boolean(
+        Arc::new(BooleanArray::from(vec![Some(true)])) as ArrayRef,
+        Arc::new(BooleanArray::from(vec![Some(false), None, Some(true)])) as ArrayRef,
+        vec![1, NULL_ID, 2]
+    )]
+    fn test_lookup_does_not_assign(
+        #[case] seen: ArrayRef,
+        #[case] probe: ArrayRef,
+        #[case] expected: Vec<u32>,
+    ) {
+        let mut table = KeyTable::new(seen.data_type());
+        ids_of(&mut table, seen.as_ref());
+        let num_ids = table.num_ids();
+        let mut ids = Vec::new();
+        table.lookup_ids(probe.as_ref(), &mut ids).unwrap();
+        assert_eq!(ids, expected);
+        assert_eq!(table.num_ids(), num_ids);
     }
 
     /// Keys come back with the column's exact data type, including the

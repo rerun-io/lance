@@ -61,7 +61,8 @@ mod keys;
 use build::plan_build;
 pub use build::{
     BitmapBuildInput, BitmapBuildOptions, BitmapBuildReport, BuildStrategy,
-    DEFAULT_MAX_DIRECT_KEYS, DEFAULT_MAX_DISTINCT_KEYS, DEFAULT_REPLAY_MEMORY_LIMIT_BYTES,
+    DEFAULT_MAX_DIRECT_KEYS, DEFAULT_MAX_DISTINCT_KEYS, DEFAULT_PARTITION_MEMORY_LIMIT_BYTES,
+    DEFAULT_REPLAY_MEMORY_LIMIT_BYTES,
 };
 
 pub const BITMAP_LOOKUP_NAME: &str = "bitmap_page_lookup.lance";
@@ -816,9 +817,8 @@ impl BitmapTrainingRequest {
 }
 
 /// A bitmap build takes its input in any order, whatever `value_type`: it
-/// holds a row set per key through one pass, and only reads the input
-/// sorted when there are too many keys for that (see [`build`]), so the
-/// scanner is not asked for a value sort up front. Boolean keys in particular
+/// counts keys in one pass and partitions rows in another (see [`build`]),
+/// so the scanner is not asked for a value sort. Boolean keys in particular
 /// never reach a sort, which matters because DataFusion merges boolean sort
 /// keys through row-format cursors that need more non-spillable memory than
 /// the data itself.
@@ -1806,7 +1806,9 @@ impl BitmapIndexPlugin {
     /// The input is turned into runs of `(key, row set)` in ascending key
     /// order by [`build::plan_build`]: one direct pass with a row set per key
     /// when the keys are few (or the type fixes a small domain), otherwise a
-    /// value-sorted read (see [`build`]). Each run is merge-joined with
+    /// counting pass followed by one or more partition passes (see
+    /// [`build`]), or a value-sorted read when there are too many keys for a
+    /// key table. Each run is merge-joined with
     /// `old_segments` by [`Self::finish_run`], so a key present on several
     /// sides is unioned, and the file is written in key order with the null
     /// entry first.
@@ -2081,9 +2083,8 @@ impl BasicTrainer for BitmapIndexPlugin {
         .await
     }
 
-    /// A reopenable source lets the build re-read the column, sorted by the
-    /// scanner, when it has to fall back, instead of replaying and sorting a
-    /// spill of the stream.
+    /// A reopenable source lets the build re-read the column for its
+    /// partition passes instead of replaying a spill of the stream.
     async fn train_index_from_source(
         &self,
         source: &dyn TrainingDataSource,
@@ -3264,8 +3265,18 @@ mod tests {
         BitmapBuildOptions {
             max_direct_keys: usize::MAX,
             replay_memory_limit_bytes: usize::MAX,
+            partition_memory_limit_bytes: usize::MAX,
             max_distinct_keys: usize::MAX,
             sort_mem_pool_bytes: None,
+        }
+    }
+
+    /// Options that count every key and partition everything in one pass,
+    /// and never fall back.
+    fn partition_all() -> BitmapBuildOptions {
+        BitmapBuildOptions {
+            max_direct_keys: 0,
+            ..direct_all()
         }
     }
 
@@ -3273,6 +3284,11 @@ mod tests {
     /// DataFusion session contexts.
     fn test_pool_bytes(test_id: u64) -> Option<u64> {
         Some(64 * 1024 * 1024 + test_id)
+    }
+
+    /// A partition pass of `rows` rows of scatter buffer.
+    fn partition_rows(rows: usize) -> usize {
+        rows * std::mem::size_of::<u64>()
     }
 
     /// Compare the index against the brute-force postings of `rows`, as written
@@ -3370,28 +3386,37 @@ mod tests {
         assert_eq!(report.strategy, BuildStrategy::Direct, "{report:?}");
         assert_eq!(report.rows, 10, "{report:?}");
         assert_eq!(report.distinct_keys, 6, "{report:?}");
+        assert_eq!(report.admitted_keys, 6, "{report:?}");
+        assert_eq!(report.scattered_rows, 0, "{report:?}");
+        assert_eq!(report.partition_passes, 0, "{report:?}");
         assert!(!report.replayed_spill, "{report:?}");
         assert_postings(&index, &SMALL_ROWS, "direct").await;
         assert!(is_null_entry_first(&index).await);
     }
 
-    /// Crossing the direct cap part-way through the input drops the row
-    /// sets and reads the whole input again sorted, so the rows before the
-    /// crossing are not lost.
+    /// Reaching the cap part-way through the input keeps the row sets built
+    /// so far and only counts the keys seen afterwards, whose rows the
+    /// partition pass scatters; nothing is reread for the admitted keys.
+    ///
+    /// With room for one row per pass, the three scattered keys take three
+    /// passes: the admitted keys' empty slots never open a pass of their own.
     #[rstest]
-    #[case::stream(false, 6)]
-    #[case::source(true, 7)]
+    #[case::stream(false, usize::MAX, 1)]
+    #[case::source(true, usize::MAX, 1)]
+    #[case::one_row_per_pass(false, partition_rows(1), 3)]
     #[tokio::test]
-    async fn test_bitmap_build_direct_cap_crossed_mid_stream(
+    async fn test_bitmap_build_cap_reached_mid_stream(
         #[case] from_source: bool,
-        #[case] test_id: u64,
+        #[case] partition_memory_limit_bytes: usize,
+        #[case] expected_passes: usize,
     ) {
-        // Two keys fit the cap; the second batch brings the third.
+        // Two non-null keys fit the cap: the first batch's null, `b` and `a`
+        // are admitted, `c` in the second batch is the first key refused.
         let batches: [&[(Option<&str>, u64)]; 3] =
             [&SMALL_ROWS[..3], &SMALL_ROWS[3..5], &SMALL_ROWS[5..]];
         let options = BitmapBuildOptions {
             max_direct_keys: 2,
-            sort_mem_pool_bytes: test_pool_bytes(test_id),
+            partition_memory_limit_bytes,
             ..direct_all()
         };
         let source = BatchesSource::new(&batches);
@@ -3401,16 +3426,204 @@ mod tests {
             BitmapBuildInput::Stream(unsorted_value_row_id_stream(&batches))
         };
         let (_dir, index, report) = build_with_options(input, Vec::new(), &options).await;
-        assert_eq!(report.strategy, BuildStrategy::Sorted, "{report:?}");
+        assert_eq!(report.strategy, BuildStrategy::Partitioned, "{report:?}");
+        assert_eq!(report.rows, 10, "{report:?}");
+        assert_eq!(report.distinct_keys, 6, "{report:?}");
+        assert_eq!(report.admitted_keys, 3, "{report:?}");
+        assert_eq!(report.scattered_rows, 3, "{report:?}");
+        assert_eq!(report.partition_passes, expected_passes, "{report:?}");
         assert_eq!(report.replayed_spill, !from_source, "{report:?}");
-        assert_postings(&index, &SMALL_ROWS, "cap crossed").await;
+        assert_postings(&index, &SMALL_ROWS, "cap reached").await;
         assert!(is_null_entry_first(&index).await);
     }
 
-    /// A primitive column goes through the typed table, with every NaN
-    /// pattern folded into one key and signed zeros kept apart.
+    /// A single-stream build replays a spill for its partition pass; with
+    /// room for everything it is one pass with the null entry first.
+    #[tokio::test]
+    async fn test_bitmap_build_single_pass_from_stream() {
+        let (_dir, index, report) = build_with_options(
+            BitmapBuildInput::Stream(unsorted_value_row_id_stream(&[
+                &SMALL_ROWS[..4],
+                &SMALL_ROWS[4..],
+            ])),
+            Vec::new(),
+            &partition_all(),
+        )
+        .await;
+        assert_eq!(report.strategy, BuildStrategy::Partitioned, "{report:?}");
+        assert_eq!(report.rows, 10, "{report:?}");
+        assert_eq!(report.distinct_keys, 6, "{report:?}");
+        assert_eq!(report.partition_passes, 1, "{report:?}");
+        assert!(report.replayed_spill, "{report:?}");
+        assert_postings(&index, &SMALL_ROWS, "one pass").await;
+        assert!(is_null_entry_first(&index).await);
+    }
+
+    /// A reopenable source is read once per pass, never sorted, and the
+    /// partition limit decides how many passes there are: with room for two
+    /// rows per pass the keys are spread over several (a key with more rows
+    /// than the budget gets a pass of its own), each reopening the source,
+    /// and keys with rows on both sides of a batch boundary are still whole.
+    #[rstest]
+    #[case::one_pass(usize::MAX, 1)]
+    #[case::two_rows_per_pass(partition_rows(2), 4)]
+    #[case::one_row_per_pass(partition_rows(1), 5)]
+    #[tokio::test]
+    async fn test_bitmap_build_partition_passes_reopen_the_source(
+        #[case] partition_memory_limit_bytes: usize,
+        #[case] expected_passes: usize,
+    ) {
+        let source = BatchesSource::new(&[&SMALL_ROWS[..3], &SMALL_ROWS[3..7], &SMALL_ROWS[7..]]);
+        let options = BitmapBuildOptions {
+            partition_memory_limit_bytes,
+            ..partition_all()
+        };
+        let (_dir, index, report) =
+            build_with_options(BitmapBuildInput::Source(&source), Vec::new(), &options).await;
+        assert_eq!(report.strategy, BuildStrategy::Partitioned, "{report:?}");
+        assert_eq!(report.partition_passes, expected_passes, "{report:?}");
+        assert!(!report.replayed_spill, "{report:?}");
+        assert_eq!(
+            source.opens.load(std::sync::atomic::Ordering::SeqCst),
+            1 + expected_passes
+        );
+        assert_eq!(
+            source
+                .sorted_opens
+                .load(std::sync::atomic::Ordering::SeqCst),
+            0
+        );
+        assert_postings(&index, &SMALL_ROWS, "partition passes").await;
+        assert!(is_null_entry_first(&index).await);
+    }
+
+    /// A single stream with tiny limits: every batch spills to disk and the
+    /// replay feeds one pass per key.
+    #[tokio::test]
+    async fn test_bitmap_build_replays_a_spilled_stream() {
+        let options = BitmapBuildOptions {
+            replay_memory_limit_bytes: 0,
+            partition_memory_limit_bytes: 0,
+            ..partition_all()
+        };
+        let (_dir, index, report) = build_with_options(
+            BitmapBuildInput::Stream(unsorted_value_row_id_stream(&[
+                &SMALL_ROWS[..3],
+                &SMALL_ROWS[3..7],
+                &SMALL_ROWS[7..],
+            ])),
+            Vec::new(),
+            &options,
+        )
+        .await;
+        assert!(report.replayed_spill, "{report:?}");
+        assert_eq!(report.partition_passes, 5, "{report:?}");
+        assert_postings(&index, &SMALL_ROWS, "spilled stream").await;
+    }
+
+    /// Keys with a large share of a pass' budget (and at least 4096 rows)
+    /// are appended directly, the rest scattered, and every kind comes out
+    /// whole across batches and passes. With a 160K-row budget only `hot`
+    /// (10K rows) is direct and everything fits one pass; with a 4K budget
+    /// `b` (4K) and `rare` (1K) need two. The nulls (5K) are admitted in
+    /// the first pass either way and never scattered.
+    #[rstest]
+    #[case::one_pass(160_000, 1, 1)]
+    #[case::two_passes(4_096, 1, 2)]
+    #[tokio::test]
+    async fn test_bitmap_build_direct_keys(
+        #[case] budget_rows: usize,
+        #[case] expected_direct: usize,
+        #[case] expected_passes: usize,
+    ) {
+        let mut rows = Vec::new();
+        for i in 0..20_000u32 {
+            let value = match i % 10 {
+                0..=4 => Some("hot"),
+                5 | 6 => Some("b"),
+                7..=9 if i % 20 == 7 => Some("rare"),
+                _ => None,
+            };
+            rows.push((value, addr(i / 8192, i % 8192)));
+        }
+        let batches = rows.chunks(3000).collect::<Vec<_>>();
+        let options = BitmapBuildOptions {
+            partition_memory_limit_bytes: partition_rows(budget_rows),
+            ..partition_all()
+        };
+        let (_dir, index, report) = build_with_options(
+            BitmapBuildInput::Stream(unsorted_value_row_id_stream(&batches)),
+            Vec::new(),
+            &options,
+        )
+        .await;
+        assert_eq!(report.direct_keys, expected_direct, "{report:?}");
+        assert_eq!(report.partition_passes, expected_passes, "{report:?}");
+        assert_postings(&index, &rows, "direct keys").await;
+        assert!(is_null_entry_first(&index).await);
+    }
+
+    /// A source that yields different rows on its second open is reported,
+    /// not silently misfiled: a new key, extra rows for a known key, and rows
+    /// for a key that had none.
+    #[rstest]
+    #[case::unknown_key(&[(Some("zzz"), 0)], "unknown key")]
+    #[case::more_rows(&[(Some("a"), 0), (Some("a"), 1), (Some("a"), 2)], "more rows")]
+    #[tokio::test]
+    async fn test_bitmap_build_rejects_input_that_changes_between_passes(
+        #[case] second_open: &[(Option<&str>, u64)],
+        #[case] expected: &str,
+    ) {
+        struct ChangingSource {
+            first: Vec<RecordBatch>,
+            second: Vec<RecordBatch>,
+            opens: std::sync::atomic::AtomicUsize,
+        }
+        #[async_trait]
+        impl crate::scalar::registry::TrainingDataSource for ChangingSource {
+            async fn open(
+                &self,
+                _criteria: &TrainingCriteria,
+            ) -> Result<SendableRecordBatchStream> {
+                let open = self.opens.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let batches = if open == 0 {
+                    self.first.clone()
+                } else {
+                    self.second.clone()
+                };
+                Ok(Box::pin(RecordBatchStreamAdapter::new(
+                    value_row_id_schema(DataType::Utf8),
+                    stream::iter(batches.into_iter().map(Ok)),
+                )))
+            }
+        }
+        let source = ChangingSource {
+            first: unsorted_batches(&[&[(Some("a"), 0), (Some("b"), 1)]]),
+            second: unsorted_batches(&[second_open]),
+            opens: Default::default(),
+        };
+        let tmpdir = TempObjDir::default();
+        let store = LanceIndexStore::new(
+            Arc::new(ObjectStore::local()),
+            tmpdir.clone(),
+            Arc::new(LanceCache::no_cache()),
+        );
+        let err = BitmapIndexPlugin::train_bitmap_index_with_options(
+            BitmapBuildInput::Source(&source),
+            &store,
+            &partition_all(),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, Error::Internal { .. }), "{err:?}");
+        assert!(err.to_string().contains(expected), "{err}");
+    }
+
+    /// A primitive column goes through the typed table on either path, with
+    /// every NaN pattern folded into one key and signed zeros kept apart.
     #[rstest]
     #[case::direct(direct_all(), BuildStrategy::Direct)]
+    #[case::partitioned(partition_all(), BuildStrategy::Partitioned)]
     #[tokio::test]
     async fn test_bitmap_build_float_keys_through_either_path(
         #[case] options: BitmapBuildOptions,
@@ -3500,6 +3713,7 @@ mod tests {
         };
         let (_dir, index, report) = build_with_options(input, Vec::new(), &options).await;
         assert_eq!(report.strategy, BuildStrategy::Sorted, "{report:?}");
+        assert_eq!(report.partition_passes, 0, "{report:?}");
         assert_eq!(report.replayed_spill, !from_source, "{report:?}");
         if from_source {
             assert_eq!(
@@ -3518,6 +3732,7 @@ mod tests {
     /// once, nulls first.
     #[rstest]
     #[case::direct(usize::MAX, usize::MAX, BuildStrategy::Direct)]
+    #[case::partitioned(0, usize::MAX, BuildStrategy::Partitioned)]
     #[case::sorted(0, 2, BuildStrategy::Sorted)]
     #[tokio::test]
     async fn test_bitmap_build_merges_a_stored_segment(
@@ -3549,6 +3764,7 @@ mod tests {
         ];
         let options = BitmapBuildOptions {
             max_direct_keys,
+            partition_memory_limit_bytes: partition_rows(2),
             max_distinct_keys,
             sort_mem_pool_bytes: test_pool_bytes(3),
             ..direct_all()
@@ -3641,6 +3857,12 @@ mod tests {
             let options = BitmapBuildOptions {
                 max_direct_keys: [0, 2, usize::MAX][rng.random_range(0..3)],
                 replay_memory_limit_bytes: [0, usize::MAX][rng.random_range(0..2)],
+                partition_memory_limit_bytes: [
+                    0,
+                    partition_rows(3),
+                    partition_rows(50),
+                    usize::MAX,
+                ][rng.random_range(0..4)],
                 max_distinct_keys: if rng.random_bool(0.2) {
                     rng.random_range(1..=3)
                 } else {
@@ -3732,6 +3954,7 @@ mod tests {
         let options = BitmapBuildOptions {
             max_direct_keys: 0,
             replay_memory_limit_bytes: 0,
+            partition_memory_limit_bytes: 0,
             max_distinct_keys: 1,
             ..direct_all()
         };
@@ -3742,6 +3965,7 @@ mod tests {
         // The null run plus two (Boolean) or three (ints) keys.
         let expected_keys = if data_type == DataType::Boolean { 3 } else { 4 };
         assert_eq!(report.distinct_keys, expected_keys, "{report:?}");
+        assert_eq!(report.partition_passes, 0, "{report:?}");
         assert!(!report.replayed_spill, "{report:?}");
         assert!(is_null_entry_first(&index).await);
 
@@ -3791,11 +4015,12 @@ mod tests {
         assert_eq!(index.index_map.len(), raws.len());
     }
 
-    /// A fixed-width binary column goes through the byte-slice key table: a
-    /// fresh build and an `update()` of it, with nulls and a key repeated
-    /// across batches, searched back by value and for null.
+    /// A fixed-width binary column goes through the byte-slice key table on
+    /// either path: a fresh build and an `update()` of it, with nulls and a
+    /// key repeated across batches, searched back by value and for null.
     #[rstest]
     #[case::direct(direct_all(), BuildStrategy::Direct)]
+    #[case::partitioned(partition_all(), BuildStrategy::Partitioned)]
     #[tokio::test]
     async fn test_bitmap_build_fixed_size_binary_keys(
         #[case] options: BitmapBuildOptions,

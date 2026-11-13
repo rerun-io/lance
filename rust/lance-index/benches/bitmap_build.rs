@@ -17,13 +17,16 @@
 //! cargo bench -p lance-index --bench bitmap_build -- \
 //!     [--rows 1000000,10000000] \
 //!     [--dist bool_nulls,uniform_low,zipf,uniform_high,utf8_200,utf8_200_skew,fsb_50k,fsb_50k_skew] \
-//!     [--variant stream,source,sorted] [--pool-bytes 536870912]
+//!     [--variant stream,source,stream_passes,source_passes,partitioned,sorted] \
+//!     [--pool-bytes 536870912]
 //! ```
 //!
 //! Variants are [`BitmapBuildOptions`] presets over an input the build reads
 //! once (`stream`: a reread replays a spill) or can reopen (`source`: the
-//! generator runs again); `sorted` forces the fallback, which is the
-//! value-sorted build the direct pass replaces.
+//! generator runs again). `*_passes` caps a partition pass at 64 MiB of row
+//! ids, so a 10M-row input takes two passes; `partitioned` turns the direct
+//! pass off so every input is counted and partitioned; `sorted` forces the
+//! fallback, which is the value-sorted build the partitioning replaces.
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::Arc;
@@ -42,6 +45,7 @@ use lance_core::cache::LanceCache;
 use lance_datafusion::exec::{LanceExecutionOptions, OneShotExec, execute_plan};
 use lance_index::scalar::bitmap::{
     BitmapBuildInput, BitmapBuildOptions, BitmapBuildReport, BitmapIndexPlugin,
+    DEFAULT_PARTITION_MEMORY_LIMIT_BYTES,
 };
 use lance_index::scalar::lance_format::LanceIndexStore;
 use lance_index::scalar::registry::{TrainingCriteria, TrainingDataSource, TrainingOrdering};
@@ -245,22 +249,35 @@ impl Distribution {
 enum Variant {
     Stream,
     Source,
+    StreamPasses,
+    SourcePasses,
+    Partitioned,
     Sorted,
 }
 
 impl Variant {
-    const ALL: [Self; 3] = [Self::Stream, Self::Source, Self::Sorted];
+    const ALL: [Self; 6] = [
+        Self::Stream,
+        Self::Source,
+        Self::StreamPasses,
+        Self::SourcePasses,
+        Self::Partitioned,
+        Self::Sorted,
+    ];
 
     fn name(self) -> &'static str {
         match self {
             Self::Stream => "stream",
             Self::Source => "source",
+            Self::StreamPasses => "stream_passes",
+            Self::SourcePasses => "source_passes",
+            Self::Partitioned => "partitioned",
             Self::Sorted => "sorted",
         }
     }
 
     fn is_source(self) -> bool {
-        matches!(self, Self::Source)
+        matches!(self, Self::Source | Self::SourcePasses | Self::Partitioned)
     }
 
     fn options(self, pool_bytes: Option<u64>) -> BitmapBuildOptions {
@@ -270,8 +287,17 @@ impl Variant {
         };
         match self {
             Self::Stream | Self::Source => base,
+            Self::StreamPasses | Self::SourcePasses => BitmapBuildOptions {
+                partition_memory_limit_bytes: DEFAULT_PARTITION_MEMORY_LIMIT_BYTES / 8,
+                ..base
+            },
+            Self::Partitioned => BitmapBuildOptions {
+                max_direct_keys: 0,
+                ..base
+            },
             Self::Sorted => BitmapBuildOptions {
                 max_direct_keys: 0,
+                max_distinct_keys: 1,
                 ..base
             },
         }
@@ -441,11 +467,16 @@ fn main() {
                 let peak = PEAK_BYTES.load(Ordering::Relaxed) - live_before;
                 let report = match outcome {
                     Ok(report) => format!(
-                        "{:?} keys={} spill={} first_pass_s={:.2}",
+                        "{:?} keys={} admitted={} scattered={} passes={} direct={} spill={} first_pass_s={:.2} partition_s={:.2}",
                         report.strategy,
                         report.distinct_keys,
+                        report.admitted_keys,
+                        report.scattered_rows,
+                        report.partition_passes,
+                        report.direct_keys,
                         report.replayed_spill,
-                        report.first_pass_time.as_secs_f64()
+                        report.first_pass_time.as_secs_f64(),
+                        report.partition_time.as_secs_f64()
                     ),
                     Err(err) => format!("FAILED: {}", err.to_string().lines().next().unwrap_or("")),
                 };

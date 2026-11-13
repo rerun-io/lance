@@ -246,11 +246,16 @@ async fn main() {
                         .await
                         .unwrap();
                         format!(
-                            "{:?} keys={} spill={} first_pass_s={:.2}",
+                            "{:?} keys={} admitted={} scattered={} passes={} direct={} spill={} first_pass_s={:.2} partition_s={:.2}",
                             report.strategy,
                             report.distinct_keys,
+                            report.admitted_keys,
+                            report.scattered_rows,
+                            report.partition_passes,
+                            report.direct_keys,
                             report.replayed_spill,
-                            report.first_pass_time.as_secs_f64()
+                            report.first_pass_time.as_secs_f64(),
+                            report.partition_time.as_secs_f64()
                         )
                     }
                     "index" => {
