@@ -4,10 +4,10 @@
 // The printed table is this binary's result.
 #![allow(clippy::print_stdout)]
 
-//! Measures building a bitmap index from synthetic streams: wall time and
-//! the peak heap allocated during the build (through a counting global
+//! Measures building a bitmap index from unsorted synthetic streams: wall
+//! time, the peak heap allocated during the build (through a counting global
 //! allocator, so it includes the sorter, the writer and Arrow batches, not
-//! just the builder's state).
+//! just the builder's state), and what the builder reports it did.
 //!
 //! It is a plain binary rather than a Criterion group because each build is
 //! run once: at 10M rows a build takes seconds, and the figure of interest is
@@ -17,12 +17,13 @@
 //! cargo bench -p lance-index --bench bitmap_build -- \
 //!     [--rows 1000000,10000000] \
 //!     [--dist bool_nulls,uniform_low,zipf,uniform_high,utf8_200,utf8_200_skew,fsb_50k,fsb_50k_skew] \
-//!     [--pool-bytes 536870912]
+//!     [--variant stream,source,sorted] [--pool-bytes 536870912]
 //! ```
 //!
-//! Boolean input is fed unordered, which the build groups; every other type
-//! is value-sorted first through the same spilling DataFusion sort the
-//! scanner applies for the trainer, with `--pool-bytes` sizing its pool.
+//! Variants are [`BitmapBuildOptions`] presets over an input the build reads
+//! once (`stream`: a reread replays a spill) or can reopen (`source`: the
+//! generator runs again); `sorted` forces the fallback, which is the
+//! value-sorted build the direct pass replaces.
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::Arc;
@@ -39,8 +40,11 @@ use datafusion_physical_expr::{PhysicalSortExpr, expressions::Column};
 use futures::stream;
 use lance_core::cache::LanceCache;
 use lance_datafusion::exec::{LanceExecutionOptions, OneShotExec, execute_plan};
-use lance_index::scalar::bitmap::BitmapIndexPlugin;
+use lance_index::scalar::bitmap::{
+    BitmapBuildInput, BitmapBuildOptions, BitmapBuildReport, BitmapIndexPlugin,
+};
 use lance_index::scalar::lance_format::LanceIndexStore;
+use lance_index::scalar::registry::{TrainingCriteria, TrainingDataSource, TrainingOrdering};
 use lance_io::object_store::ObjectStore;
 use object_store::path::Path;
 use rand::{Rng, SeedableRng, rngs::SmallRng};
@@ -237,33 +241,91 @@ impl Distribution {
     }
 }
 
-fn sort_stream_by_value(
-    data: SendableRecordBatchStream,
-    mem_pool_bytes: Option<u64>,
-) -> lance_core::Result<SendableRecordBatchStream> {
-    let input = Arc::new(OneShotExec::new(data));
-    let value_idx = input.schema().index_of("value")?;
-    let sort_expr = PhysicalSortExpr {
-        expr: Arc::new(Column::new("value", value_idx)),
-        options: SortOptions {
-            descending: false,
-            nulls_first: true,
-        },
-    };
-    let plan = Arc::new(SortExec::new([sort_expr].into(), input));
-    execute_plan(
-        plan,
-        LanceExecutionOptions {
-            use_spilling: true,
-            mem_pool_size: mem_pool_bytes,
-            ..Default::default()
-        },
-    )
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Variant {
+    Stream,
+    Source,
+    Sorted,
+}
+
+impl Variant {
+    const ALL: [Self; 3] = [Self::Stream, Self::Source, Self::Sorted];
+
+    fn name(self) -> &'static str {
+        match self {
+            Self::Stream => "stream",
+            Self::Source => "source",
+            Self::Sorted => "sorted",
+        }
+    }
+
+    fn is_source(self) -> bool {
+        matches!(self, Self::Source)
+    }
+
+    fn options(self, pool_bytes: Option<u64>) -> BitmapBuildOptions {
+        let base = BitmapBuildOptions {
+            sort_mem_pool_bytes: pool_bytes,
+            ..BitmapBuildOptions::default()
+        };
+        match self {
+            Self::Stream | Self::Source => base,
+            Self::Sorted => BitmapBuildOptions {
+                max_direct_keys: 0,
+                ..base
+            },
+        }
+    }
+}
+
+/// The generator as a reopenable source: every open runs it again from the
+/// same seeds, in the same order. A value-sorted open (what the sorted
+/// fallback asks a source for) runs the generated stream through the same
+/// spilling DataFusion sort the scanner would use.
+struct GeneratedSource {
+    dist: Distribution,
+    rows: u64,
+    pool_bytes: Option<u64>,
+}
+
+#[async_trait::async_trait]
+impl TrainingDataSource for GeneratedSource {
+    async fn open(
+        &self,
+        criteria: &TrainingCriteria,
+    ) -> lance_core::Result<SendableRecordBatchStream> {
+        let stream = self.dist.stream(self.rows);
+        match criteria.ordering {
+            TrainingOrdering::None => Ok(stream),
+            TrainingOrdering::Values => {
+                let input = Arc::new(OneShotExec::new(stream));
+                let value_idx = input.schema().index_of("value")?;
+                let sort_expr = PhysicalSortExpr {
+                    expr: Arc::new(Column::new("value", value_idx)),
+                    options: SortOptions {
+                        descending: false,
+                        nulls_first: true,
+                    },
+                };
+                let plan = Arc::new(SortExec::new([sort_expr].into(), input));
+                execute_plan(
+                    plan,
+                    LanceExecutionOptions {
+                        use_spilling: true,
+                        mem_pool_size: self.pool_bytes,
+                        ..Default::default()
+                    },
+                )
+            }
+            TrainingOrdering::Addresses => Ok(stream),
+        }
+    }
 }
 
 struct Args {
     rows: Vec<u64>,
     dists: Vec<Distribution>,
+    variants: Vec<Variant>,
     pool_bytes: Option<u64>,
 }
 
@@ -271,6 +333,7 @@ fn parse_args() -> Args {
     let mut args = Args {
         rows: vec![1_000_000, 10_000_000],
         dists: Distribution::ALL.to_vec(),
+        variants: Variant::ALL.to_vec(),
         pool_bytes: None,
     };
     let mut it = std::env::args().skip(1);
@@ -297,6 +360,19 @@ fn parse_args() -> Args {
                     })
                     .collect();
             }
+            "--variant" => {
+                args.variants = it
+                    .next()
+                    .expect("--variant takes a list")
+                    .split(',')
+                    .map(|name| {
+                        *Variant::ALL
+                            .iter()
+                            .find(|v| v.name() == name)
+                            .unwrap_or_else(|| panic!("unknown variant {name}"))
+                    })
+                    .collect();
+            }
             "--pool-bytes" => {
                 args.pool_bytes = Some(
                     it.next()
@@ -312,22 +388,31 @@ fn parse_args() -> Args {
     args
 }
 
-async fn build(dist: Distribution, rows: u64, pool_bytes: Option<u64>) -> lance_core::Result<()> {
+async fn build(
+    dist: Distribution,
+    rows: u64,
+    variant: Variant,
+    options: &BitmapBuildOptions,
+) -> lance_core::Result<BitmapBuildReport> {
     let tempdir = tempfile::tempdir().unwrap();
     let store = LanceIndexStore::new(
         Arc::new(ObjectStore::local()),
         Path::from_filesystem_path(tempdir.path()).unwrap(),
         Arc::new(LanceCache::no_cache()),
     );
-    // Boolean is grouped from unordered input; every other type is
-    // value-sorted first, as the scanner sorts it for the trainer.
-    let input = if dist.value_type() == DataType::Boolean {
-        dist.stream(rows)
-    } else {
-        sort_stream_by_value(dist.stream(rows), pool_bytes)?
+    let source = GeneratedSource {
+        dist,
+        rows,
+        pool_bytes: options.sort_mem_pool_bytes,
     };
-    BitmapIndexPlugin::train_bitmap_index(input, &store).await?;
-    Ok(())
+    let input = if variant.is_source() {
+        BitmapBuildInput::Source(&source)
+    } else {
+        BitmapBuildInput::Stream(dist.stream(rows))
+    };
+    let (_, report) =
+        BitmapIndexPlugin::train_bitmap_index_with_options(input, &store, options).await?;
+    Ok(report)
 }
 
 fn mib(bytes: usize) -> f64 {
@@ -347,24 +432,33 @@ fn main() {
     );
     for &rows in &args.rows {
         for &dist in &args.dists {
-            let live_before = reset_peak();
-            let start = Instant::now();
-            let outcome = runtime.block_on(build(dist, rows, args.pool_bytes));
-            let wall = start.elapsed().as_secs_f64();
-            let peak = PEAK_BYTES.load(Ordering::Relaxed) - live_before;
-            let report = match outcome {
-                Ok(()) => "ok".to_string(),
-                Err(err) => format!("FAILED: {}", err.to_string().lines().next().unwrap_or("")),
-            };
-            println!(
-                "{:<13} {:>10} {:<13} {:>7.2} {:>9.1}  {}",
-                dist.name(),
-                rows,
-                "sorted",
-                wall,
-                mib(peak),
-                report
-            );
+            for &variant in &args.variants {
+                let options = variant.options(args.pool_bytes);
+                let live_before = reset_peak();
+                let start = Instant::now();
+                let outcome = runtime.block_on(build(dist, rows, variant, &options));
+                let wall = start.elapsed().as_secs_f64();
+                let peak = PEAK_BYTES.load(Ordering::Relaxed) - live_before;
+                let report = match outcome {
+                    Ok(report) => format!(
+                        "{:?} keys={} spill={} first_pass_s={:.2}",
+                        report.strategy,
+                        report.distinct_keys,
+                        report.replayed_spill,
+                        report.first_pass_time.as_secs_f64()
+                    ),
+                    Err(err) => format!("FAILED: {}", err.to_string().lines().next().unwrap_or("")),
+                };
+                println!(
+                    "{:<13} {:>10} {:<13} {:>7.2} {:>9.1}  {}",
+                    dist.name(),
+                    rows,
+                    variant.name(),
+                    wall,
+                    mib(peak),
+                    report
+                );
+            }
         }
     }
 }

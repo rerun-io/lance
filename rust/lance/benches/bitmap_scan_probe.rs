@@ -33,7 +33,7 @@ use lance::dataset::{Dataset, WriteMode, WriteParams};
 use lance::index::DatasetIndexExt;
 use lance_core::cache::LanceCache;
 use lance_index::IndexType;
-use lance_index::scalar::bitmap::BitmapIndexPlugin;
+use lance_index::scalar::bitmap::{BitmapBuildInput, BitmapBuildOptions, BitmapIndexPlugin};
 use lance_index::scalar::lance_format::LanceIndexStore;
 use lance_index::scalar::{BuiltinIndexType, ScalarIndexParams};
 use lance_io::object_store::ObjectStore;
@@ -237,13 +237,21 @@ async fn main() {
                             Path::from_filesystem_path(tempdir.path()).unwrap(),
                             Arc::new(LanceCache::no_cache()),
                         );
-                        // Boolean is grouped from unordered input; every other
-                        // type gets the scanner's value sort.
-                        let stream = training_stream(&dataset, col, col != "b").await;
-                        BitmapIndexPlugin::train_bitmap_index(stream, &store)
-                            .await
-                            .unwrap();
-                        "sorted scan + run loop".to_string()
+                        let stream = training_stream(&dataset, col, false).await;
+                        let (_, report) = BitmapIndexPlugin::train_bitmap_index_with_options(
+                            BitmapBuildInput::Stream(stream),
+                            &store,
+                            &BitmapBuildOptions::default(),
+                        )
+                        .await
+                        .unwrap();
+                        format!(
+                            "{:?} keys={} spill={} first_pass_s={:.2}",
+                            report.strategy,
+                            report.distinct_keys,
+                            report.replayed_spill,
+                            report.first_pass_time.as_secs_f64()
+                        )
                     }
                     "index" => {
                         let params = ScalarIndexParams::for_builtin(BuiltinIndexType::Bitmap);
