@@ -8,24 +8,22 @@ use std::{
 };
 
 use arrow_array::{Array, LargeBinaryArray, RecordBatch, StructArray, UInt8Array};
-use arrow_schema::{DataType, Field, Field as ArrowField, Schema, SortOptions};
+use arrow_schema::{DataType, Field, Field as ArrowField, Schema};
 use async_trait::async_trait;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::{
     execution::SendableRecordBatchStream,
-    physical_plan::{ExecutionPlan, projection::ProjectionExec, sorts::sort::SortExec},
+    physical_plan::{ExecutionPlan, projection::ProjectionExec},
 };
 use datafusion_common::{ScalarValue, config::ConfigOptions};
 use datafusion_expr::{Expr, Operator, ScalarUDF};
 use datafusion_physical_expr::{
-    PhysicalExpr, PhysicalSortExpr, ScalarFunctionExpr,
+    PhysicalExpr, ScalarFunctionExpr,
     expressions::{Column, Literal},
 };
 use futures::StreamExt;
 use lance_core::deepsize::DeepSizeOf;
-use lance_datafusion::exec::{
-    LanceExecutionOptions, OneShotExec, execute_plan, get_session_context,
-};
+use lance_datafusion::exec::{LanceExecutionOptions, OneShotExec, get_session_context};
 use lance_datafusion::udf::json::JsonbType;
 use prost::Message;
 use roaring::RoaringBitmap;
@@ -43,7 +41,7 @@ use crate::{
         expression::{IndexedExpression, ScalarIndexExpr, ScalarIndexSearch, ScalarQueryParser},
         registry::{
             BasicTrainer, ScalarIndexPlugin, TrainingCriteria, TrainingOrdering, TrainingRequest,
-            VALUE_COLUMN_NAME,
+            VALUE_COLUMN_NAME, sort_stream_by_value,
         },
     },
 };
@@ -684,35 +682,6 @@ impl JsonIndexPlugin {
             futures::stream::iter(converted_batches.into_iter().map(Ok)),
         )))
     }
-
-    /// Sort a `(value, row_id)` stream ascending by value.
-    ///
-    /// Target index types that require `TrainingOrdering::Values` (e.g. btree, whose
-    /// per-page min/max stats are taken from the first/last row of each page) need this
-    /// as the only sort in the JSON training path: `JsonTrainingRequest` requests
-    /// unordered input from the scanner, since the scanner can only sort on the raw
-    /// JSON column, not on the value at `path`.
-    async fn sort_stream_by_value(
-        data: SendableRecordBatchStream,
-    ) -> Result<SendableRecordBatchStream> {
-        let input = Arc::new(OneShotExec::new(data));
-        let value_idx = input.schema().index_of(VALUE_COLUMN_NAME)?;
-        let sort_expr = PhysicalSortExpr {
-            expr: Arc::new(Column::new(VALUE_COLUMN_NAME, value_idx)),
-            options: SortOptions {
-                descending: false,
-                nulls_first: true,
-            },
-        };
-        let plan = Arc::new(SortExec::new([sort_expr].into(), input));
-        execute_plan(
-            plan,
-            LanceExecutionOptions {
-                use_spilling: true,
-                ..Default::default()
-            },
-        )
-    }
 }
 
 #[async_trait]
@@ -778,7 +747,7 @@ impl BasicTrainer for JsonIndexPlugin {
         // what asked the scanner for unordered input above) and would never take this branch.
         let converted_stream =
             if request.target_request.criteria().ordering == TrainingOrdering::Values {
-                Self::sort_stream_by_value(converted_stream).await?
+                sort_stream_by_value(converted_stream, None)?
             } else {
                 converted_stream
             };

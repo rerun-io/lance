@@ -4,15 +4,18 @@
 use std::borrow::Cow;
 use std::sync::Arc;
 
-use arrow_schema::{DataType, Field};
+use arrow_schema::{DataType, Field, SortOptions};
 use async_trait::async_trait;
 use datafusion::execution::SendableRecordBatchStream;
+use datafusion::physical_plan::{ExecutionPlan, sorts::sort::SortExec};
+use datafusion_physical_expr::{PhysicalSortExpr, expressions::Column};
 use futures::future::BoxFuture;
 use lance_core::{
     Result,
     cache::{CacheKey, CacheKeySchema, KeyBuilder, LanceCache, UnsizedCacheKey},
     deepsize::DeepSizeOf,
 };
+use lance_datafusion::exec::{LanceExecutionOptions, OneShotExec, execute_plan};
 
 use crate::progress::IndexBuildProgress;
 use crate::registry::IndexPluginRegistry;
@@ -22,6 +25,42 @@ use crate::scalar::{CreatedIndex, IndexStore, ScalarIndex, expression::ScalarQue
 pub use crate::scalar::{TrainingCriteria, TrainingOrdering};
 
 pub const VALUE_COLUMN_NAME: &str = "value";
+
+/// Sort a `(value, row_id)` stream ascending by value, nulls first: the order
+/// [`TrainingOrdering::Values`] asks the scanner for, produced in-process by a
+/// spilling DataFusion sort over `data`.
+///
+/// For a trainer whose input the scanner could not sort (the JSON index sorts
+/// on the value extracted at `path`, not on the raw column) or chose not to
+/// (the bitmap index reads its input unsorted and sorts a replay of it only
+/// when it has too many keys to hold a row set each), this is the only sort
+/// on the training path.
+///
+/// `mem_pool_bytes` sizes the DataFusion pool the sort runs in; `None` is the
+/// Lance default shared by every plan.
+pub(crate) fn sort_stream_by_value(
+    data: SendableRecordBatchStream,
+    mem_pool_bytes: Option<u64>,
+) -> Result<SendableRecordBatchStream> {
+    let input = Arc::new(OneShotExec::new(data));
+    let value_idx = input.schema().index_of(VALUE_COLUMN_NAME)?;
+    let sort_expr = PhysicalSortExpr {
+        expr: Arc::new(Column::new(VALUE_COLUMN_NAME, value_idx)),
+        options: SortOptions {
+            descending: false,
+            nulls_first: true,
+        },
+    };
+    let plan = Arc::new(SortExec::new([sort_expr].into(), input));
+    execute_plan(
+        plan,
+        LanceExecutionOptions {
+            use_spilling: true,
+            mem_pool_size: mem_pool_bytes,
+            ..Default::default()
+        },
+    )
+}
 
 /// A trait object for plugin-specific training parameters and data requirements.
 ///
@@ -55,13 +94,29 @@ impl TrainingRequest for DefaultTrainingRequest {
     }
 }
 
+/// Training data that can be scanned more than once.
+///
+/// A [`BasicTrainer`] that may read its input more than once (the bitmap
+/// index reads it unsorted first and needs it again, sorted or in further
+/// passes, only when that first pass cannot finish the build) asks the
+/// source for a fresh stream per read rather than buffering the first. Each
+/// `open` may ask for a different ordering; an implementation backed by a
+/// dataset scan honors it the way it honors a training request's criteria.
+#[async_trait]
+pub trait TrainingDataSource: Send + Sync {
+    /// Open a new stream over the training data, prepared to `criteria`.
+    async fn open(&self, criteria: &TrainingCriteria) -> Result<SendableRecordBatchStream>;
+}
+
 /// Implemented by indexes that can train on a stream of column data.
 ///
 /// The training process has two stages. In the first stage, the caller provides
 /// index parameters and receives a [`TrainingRequest`] that describes what criteria
 /// the training data must satisfy (e.g. sort order, row-ID availability). In the
 /// second stage, the caller prepares the data accordingly and calls
-/// [`train_index`](Self::train_index).
+/// [`train_index`](Self::train_index), or hands over a [`TrainingDataSource`]
+/// through [`train_index_from_source`](Self::train_index_from_source) when it
+/// can prepare the data more than once.
 ///
 /// Any scalar index plugin that builds from a column data stream should implement
 /// this trait.
@@ -81,6 +136,12 @@ pub trait BasicTrainer: Send + Sync {
     /// [`new_training_request`](Self::new_training_request). It is the caller's
     /// responsibility to ensure this.
     ///
+    /// This must stay a complete build on its own: callers that only have a
+    /// one-shot stream (a preprocessed stream, an index append, a wrapping
+    /// plugin such as the JSON index) use it, and
+    /// [`train_index_from_source`](Self::train_index_from_source) is only
+    /// a way for a trainer to do better when the data can be read again.
+    ///
     /// Returns index details describing the index. These details may be useful for
     /// planning and must be provided when loading the index. It is the caller's
     /// responsibility to store them.
@@ -92,6 +153,29 @@ pub trait BasicTrainer: Send + Sync {
         fragment_ids: Option<Vec<u32>>,
         progress: Arc<dyn IndexBuildProgress>,
     ) -> Result<CreatedIndex>;
+
+    /// Train a new index from a source that can be scanned more than once.
+    ///
+    /// By default this opens the source once, to the request's criteria, and
+    /// trains from that stream exactly as [`train_index`](Self::train_index)
+    /// would. A trainer that builds in several passes overrides it to open the
+    /// source per pass.
+    ///
+    /// `fragment_ids` means what it means in `train_index`: the identity of a
+    /// distributed shard build. It does not restrict what `source` yields;
+    /// the source's scope is fixed by whoever created it.
+    async fn train_index_from_source(
+        &self,
+        source: &dyn TrainingDataSource,
+        index_store: &dyn IndexStore,
+        request: Box<dyn TrainingRequest>,
+        fragment_ids: Option<Vec<u32>>,
+        progress: Arc<dyn IndexBuildProgress>,
+    ) -> Result<CreatedIndex> {
+        let data = source.open(request.criteria()).await?;
+        self.train_index(data, index_store, request, fragment_ids, progress)
+            .await
+    }
 }
 
 /// A trait for scalar index plugins

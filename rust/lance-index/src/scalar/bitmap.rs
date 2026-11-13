@@ -12,8 +12,6 @@ use std::{
 };
 
 use arrow::array::BinaryBuilder;
-use arrow_array::cast::AsArray;
-use arrow_array::types::UInt64Type;
 use arrow_array::{Array, BinaryArray, RecordBatch, UInt64Array, new_null_array};
 use arrow_schema::{DataType, Field, Schema};
 use async_trait::async_trait;
@@ -36,7 +34,7 @@ use lance_select::{NullableRowAddrSet, RowAddrTreeMap, RowSetOps};
 use object_store::path::Path;
 use roaring::RoaringBitmap;
 use serde::{Deserialize, Serialize};
-use tracing::{instrument, warn};
+use tracing::{debug, instrument, warn};
 
 use super::{AnyQuery, IndexFile, IndexStore, ScalarIndex};
 use super::{
@@ -50,16 +48,21 @@ use crate::{
         CreatedIndex, RowIdRemapper, UpdateCriteria,
         expression::SargableQueryParser,
         registry::{
-            BasicTrainer, ScalarIndexLoad, ScalarIndexPlugin, TrainingCriteria, TrainingOrdering,
-            TrainingRequest, VALUE_COLUMN_NAME, single_flight_open,
+            BasicTrainer, ScalarIndexLoad, ScalarIndexPlugin, TrainingCriteria, TrainingDataSource,
+            TrainingOrdering, TrainingRequest, VALUE_COLUMN_NAME, single_flight_open,
         },
     },
 };
 use crate::{scalar::IndexReader, scalar::expression::ScalarQueryParser};
 
 mod build;
+mod keys;
 
-use build::SortedRuns;
+use build::plan_build;
+pub use build::{
+    BitmapBuildInput, BitmapBuildOptions, BitmapBuildReport, BuildStrategy,
+    DEFAULT_MAX_DIRECT_KEYS, DEFAULT_MAX_DISTINCT_KEYS, DEFAULT_REPLAY_MEMORY_LIMIT_BYTES,
+};
 
 pub const BITMAP_LOOKUP_NAME: &str = "bitmap_page_lookup.lance";
 pub const INDEX_STATS_METADATA_KEY: &str = "lance:index_stats";
@@ -642,11 +645,12 @@ impl BitmapIndex {
             })
             .collect();
 
-        let file = BitmapIndexPlugin::streaming_build_and_write(
-            new_data,
+        let (file, _) = BitmapIndexPlugin::streaming_build_and_write(
+            BitmapBuildInput::Stream(new_data),
             old_segments,
             dest_store,
             BITMAP_LOOKUP_NAME,
+            &BitmapBuildOptions::default(),
         )
         .await?;
 
@@ -811,16 +815,15 @@ impl BitmapTrainingRequest {
     }
 }
 
-/// Boolean input is grouped in memory instead of sorted: DataFusion merges
-/// boolean sort keys through row-format cursors that need more non-spillable
-/// memory than the data itself, so a large boolean sort cannot spill.
-fn bitmap_training_criteria(value_type: &DataType) -> TrainingCriteria {
-    let ordering = if value_type == &DataType::Boolean {
-        TrainingOrdering::None
-    } else {
-        TrainingOrdering::Values
-    };
-    TrainingCriteria::new(ordering).with_row_id()
+/// A bitmap build takes its input in any order, whatever `value_type`: it
+/// holds a row set per key through one pass, and only reads the input
+/// sorted when there are too many keys for that (see [`build`]), so the
+/// scanner is not asked for a value sort up front. Boolean keys in particular
+/// never reach a sort, which matters because DataFusion merges boolean sort
+/// keys through row-format cursors that need more non-spillable memory than
+/// the data itself.
+fn bitmap_training_criteria(_value_type: &DataType) -> TrainingCriteria {
+    TrainingCriteria::new(TrainingOrdering::None).with_row_id()
 }
 
 impl TrainingRequest for BitmapTrainingRequest {
@@ -1105,14 +1108,15 @@ impl ScalarIndex for BitmapIndex {
         dest_store: &dyn IndexStore,
         old_data_filter: Option<super::OldIndexDataFilter>,
     ) -> Result<CreatedIndex> {
-        let file = BitmapIndexPlugin::streaming_build_and_write(
-            new_data,
+        let (file, _) = BitmapIndexPlugin::streaming_build_and_write(
+            BitmapBuildInput::Stream(new_data),
             vec![OldSegment {
                 index: self,
                 filter: old_data_filter.as_ref(),
             }],
             dest_store,
             BITMAP_LOOKUP_NAME,
+            &BitmapBuildOptions::default(),
         )
         .await?;
 
@@ -1131,43 +1135,6 @@ impl ScalarIndex for BitmapIndex {
     fn derive_index_params(&self) -> Result<ScalarIndexParams> {
         Ok(ScalarIndexParams::for_builtin(BuiltinIndexType::Bitmap))
     }
-}
-
-/// Drains `data_source` into one row set per boolean key, in index order
-/// (null, false, true); input order does not matter.
-async fn group_boolean_runs(
-    data_source: &mut SendableRecordBatchStream,
-) -> Result<Vec<(ScalarValue, RowAddrTreeMap)>> {
-    let mut groups: [RowAddrTreeMap; 3] = Default::default();
-    while let Some(batch) = data_source.try_next().await? {
-        let values = batch.column_by_name(VALUE_COLUMN_NAME).expect_ok()?;
-        let values = values.as_boolean_opt().ok_or_else(|| {
-            Error::internal(format!(
-                "bitmap index: expected boolean values, got {}",
-                values.data_type()
-            ))
-        })?;
-        let row_ids = batch.column_by_name(ROW_ID).expect_ok()?;
-        let row_ids = row_ids.as_primitive::<UInt64Type>();
-        for (value, row_id) in values.iter().zip(row_ids.values()) {
-            let slot = match value {
-                None => 0,
-                Some(false) => 1,
-                Some(true) => 2,
-            };
-            groups[slot].insert(*row_id);
-        }
-    }
-    let keys = [
-        ScalarValue::Boolean(None),
-        ScalarValue::Boolean(Some(false)),
-        ScalarValue::Boolean(Some(true)),
-    ];
-    Ok(keys
-        .into_iter()
-        .zip(groups)
-        .filter(|(_, bitmap)| !bitmap.is_empty())
-        .collect())
 }
 
 /// Enforce the ordering a bitmap build requires, once per value change.
@@ -1783,15 +1750,34 @@ impl BitmapIndexPlugin {
         Ok((state, value_type))
     }
 
+    /// Build a bitmap index from a `(value, row_id)` stream in any order, with
+    /// the default [`BitmapBuildOptions`].
     pub async fn train_bitmap_index(
         data: SendableRecordBatchStream,
         index_store: &dyn IndexStore,
     ) -> Result<IndexFile> {
-        Self::streaming_build_and_write(data, Vec::new(), index_store, BITMAP_LOOKUP_NAME).await
+        let (file, _) = Self::train_bitmap_index_with_options(
+            BitmapBuildInput::Stream(data),
+            index_store,
+            &BitmapBuildOptions::default(),
+        )
+        .await?;
+        Ok(file)
+    }
+
+    /// [`Self::train_bitmap_index`] over a stream or a reopenable source,
+    /// with explicit options, reporting how the build went.
+    pub async fn train_bitmap_index_with_options(
+        input: BitmapBuildInput<'_>,
+        index_store: &dyn IndexStore,
+        options: &BitmapBuildOptions,
+    ) -> Result<(IndexFile, BitmapBuildReport)> {
+        Self::streaming_build_and_write(input, Vec::new(), index_store, BITMAP_LOOKUP_NAME, options)
+            .await
     }
 
     async fn train_bitmap_shard(
-        data: SendableRecordBatchStream,
+        input: BitmapBuildInput<'_>,
         index_store: &dyn IndexStore,
         fragment_ids: &[u32],
         shard_id: Option<u32>,
@@ -1802,75 +1788,87 @@ impl BitmapIndexPlugin {
         progress
             .stage_start("build_bitmap_shard", None, "rows")
             .await?;
-        let file =
-            Self::streaming_build_and_write(data, Vec::new(), index_store, &file_name).await?;
+        let (file, _) = Self::streaming_build_and_write(
+            input,
+            Vec::new(),
+            index_store,
+            &file_name,
+            &BitmapBuildOptions::default(),
+        )
+        .await?;
         progress.stage_complete("build_bitmap_shard").await?;
         Ok(file)
     }
 
-    /// Builds and writes a bitmap index in a streaming fashion from value-sorted
-    /// input. Boolean input may be unordered: it is grouped into at most three
-    /// row sets, all resident at once, before anything is written.
+    /// Builds and writes a bitmap index from `(value, row_id)` input in any
+    /// order, merged with `old_segments`.
     ///
-    /// `old_segments` are merged with the new data via a k-way sorted merge-join
-    /// (each segment's index_map is a BTreeMap, already sorted by value), so the
-    /// input side holds one row set per segment for the key being unioned, plus
-    /// that union, rather than all of them at once.
+    /// The input is turned into runs of `(key, row set)` in ascending key
+    /// order by [`build::plan_build`]: one direct pass with a row set per key
+    /// when the keys are few (or the type fixes a small domain), otherwise a
+    /// value-sorted read (see [`build`]). Each run is merge-joined with
+    /// `old_segments` by [`Self::finish_run`], so a key present on several
+    /// sides is unioned, and the file is written in key order with the null
+    /// entry first.
     ///
-    /// That bounds what is read, not what is written: [`BitmapBatchWriter`] keeps
-    /// every serialized row set until it flushes, so the whole output index is
-    /// resident for any index below `MAX_BITMAP_ARRAY_LENGTH`. See its `Memory`
-    /// section. Each segment's `index_map` also stays resident for the merge,
-    /// which dominates on a high-cardinality column.
+    /// The merge holds one row set per segment for the key being unioned,
+    /// plus that union, rather than all of them at once. That bounds what is
+    /// read, not what is written: [`BitmapBatchWriter`] keeps every serialized
+    /// row set until it flushes, so the whole output index is resident for any
+    /// index below `MAX_BITMAP_ARRAY_LENGTH`. See its `Memory` section. Each
+    /// segment's `index_map` also stays resident for the merge, which
+    /// dominates on a high-cardinality column.
     async fn streaming_build_and_write(
-        mut data_source: SendableRecordBatchStream,
+        input: BitmapBuildInput<'_>,
         old_segments: Vec<OldSegment<'_>>,
         index_store: &dyn IndexStore,
         output_file_name: &str,
-    ) -> Result<IndexFile> {
-        let schema = data_source.schema();
-        let value_type = schema
-            .field(schema.index_of(VALUE_COLUMN_NAME)?)
-            .data_type()
-            .clone();
-
+        options: &BitmapBuildOptions,
+    ) -> Result<(IndexFile, BitmapBuildReport)> {
+        let mut runs = plan_build(input, options).await?;
+        let value_type = runs.value_type().clone();
         let mut writer =
             new_bitmap_batch_writer(index_store, output_file_name, &value_type).await?;
-
         let mut old = OldSegments::new(old_segments);
-
-        // Track whether we emitted a null bitmap (old index stores nulls
-        // separately in null_map, not in index_map).
+        // Whether a null entry has been written (old segments keep nulls apart
+        // from their keyed postings, so there is exactly one to write).
         let mut emitted_null = false;
 
-        if value_type == DataType::Boolean {
-            for (key, mut bitmap) in group_boolean_runs(&mut data_source).await? {
-                Self::finish_run(key, &mut bitmap, &mut old, &mut emitted_null, &mut writer)
-                    .await?;
+        // Keep the null entry at the head of the file, where a value sort
+        // would have put it: `merge_shards` pops each shard's entries in key
+        // order and relies on every shard's null entry coming first. The runs
+        // start with the null run when the input has nulls, and that run
+        // merges the old nulls itself; otherwise write them before any key.
+        let mut next = runs.next_run().await?;
+        if !next.as_ref().is_some_and(|(key, _)| key.is_null())
+            && let Some(null_bitmap) = old.take_null_bitmap().await?
+        {
+            let null_key = new_null_array(&value_type, 1);
+            let null_key = ScalarValue::try_from_array(null_key.as_ref(), 0)?;
+            writer.emit(null_key, &null_bitmap).await?;
+            emitted_null = true;
+        }
+
+        // A run is flushed when the next one arrives, so its key is checked
+        // against the next and then moved, never cloned.
+        let mut pending: Option<(ScalarValue, RowAddrTreeMap)> = None;
+        while let Some((key, bitmap)) = next {
+            if let Some((previous, mut previous_bitmap)) = pending.take() {
+                check_run_order(&previous, &key, emitted_null)?;
+                Self::finish_run(
+                    previous,
+                    &mut previous_bitmap,
+                    &mut old,
+                    &mut emitted_null,
+                    &mut writer,
+                )
+                .await?;
             }
-        } else {
-            // A run is flushed when the next one arrives, so its key is
-            // checked against the next and then moved, never cloned.
-            let mut runs = SortedRuns::new(data_source);
-            let mut pending: Option<(ScalarValue, RowAddrTreeMap)> = None;
-            while let Some((key, bitmap)) = runs.next_run().await? {
-                if let Some((previous, mut previous_bitmap)) = pending.take() {
-                    check_run_order(&previous, &key, emitted_null)?;
-                    Self::finish_run(
-                        previous,
-                        &mut previous_bitmap,
-                        &mut old,
-                        &mut emitted_null,
-                        &mut writer,
-                    )
-                    .await?;
-                }
-                pending = Some((key, bitmap));
-            }
-            if let Some((key, mut bitmap)) = pending {
-                Self::finish_run(key, &mut bitmap, &mut old, &mut emitted_null, &mut writer)
-                    .await?;
-            }
+            pending = Some((key, bitmap));
+            next = runs.next_run().await?;
+        }
+        if let Some((key, mut bitmap)) = pending {
+            Self::finish_run(key, &mut bitmap, &mut old, &mut emitted_null, &mut writer).await?;
         }
 
         // Emit any remaining old-only entries.
@@ -1878,19 +1876,15 @@ impl BitmapIndexPlugin {
             writer.emit(key, &bitmap).await?;
         }
 
-        // Emit old null bitmap if we didn't already merge it with new nulls.
-        if !emitted_null && let Some(null_bitmap) = old.take_null_bitmap().await? {
-            let null_key = new_null_array(&value_type, 1);
-            let null_key = ScalarValue::try_from_array(null_key.as_ref(), 0)?;
-            writer.emit(null_key, &null_bitmap).await?;
-        }
-
-        writer.finish().await
+        let report = runs.report();
+        debug!("bitmap index: build finished: {report:?}");
+        let file = writer.finish().await?;
+        Ok((file, report))
     }
 
-    /// Flush a completed value-run from the new data stream, emitting any
-    /// old-only entries that sort before it and merging the old postings if the
-    /// key exists on both sides.
+    /// Flush a completed run of the new data, emitting any old-only entries
+    /// that sort before it and merging the old postings if the key exists on
+    /// both sides.
     async fn finish_run(
         key: ScalarValue,
         bitmap: &mut RowAddrTreeMap,
@@ -1899,6 +1893,15 @@ impl BitmapIndexPlugin {
         writer: &mut BitmapBatchWriter,
     ) -> Result<()> {
         if key.is_null() {
+            // Defence in depth: `check_run_order` rejects a second null run,
+            // and the old segments' nulls are written up front only when the
+            // first run is not null, so this cannot fire for runs produced
+            // here; it keeps a producer bug from writing two null entries.
+            if *emitted_null {
+                return Err(Error::internal(
+                    "bitmap index: a null run arrived after the null entry was written".to_string(),
+                ));
+            }
             // Null values are stored separately in each old segment's null_map.
             if let Some(null_bitmap) = old.take_null_bitmap().await? {
                 *bitmap |= &null_bitmap;
@@ -2068,6 +2071,46 @@ impl BasicTrainer for BitmapIndexPlugin {
         fragment_ids: Option<Vec<u32>>,
         progress: Arc<dyn crate::progress::IndexBuildProgress>,
     ) -> Result<CreatedIndex> {
+        Self::train_from_input(
+            BitmapBuildInput::Stream(data),
+            index_store,
+            request,
+            fragment_ids,
+            progress,
+        )
+        .await
+    }
+
+    /// A reopenable source lets the build re-read the column, sorted by the
+    /// scanner, when it has to fall back, instead of replaying and sorting a
+    /// spill of the stream.
+    async fn train_index_from_source(
+        &self,
+        source: &dyn TrainingDataSource,
+        index_store: &dyn IndexStore,
+        request: Box<dyn TrainingRequest>,
+        fragment_ids: Option<Vec<u32>>,
+        progress: Arc<dyn crate::progress::IndexBuildProgress>,
+    ) -> Result<CreatedIndex> {
+        Self::train_from_input(
+            BitmapBuildInput::Source(source),
+            index_store,
+            request,
+            fragment_ids,
+            progress,
+        )
+        .await
+    }
+}
+
+impl BitmapIndexPlugin {
+    async fn train_from_input(
+        input: BitmapBuildInput<'_>,
+        index_store: &dyn IndexStore,
+        request: Box<dyn TrainingRequest>,
+        fragment_ids: Option<Vec<u32>>,
+        progress: Arc<dyn crate::progress::IndexBuildProgress>,
+    ) -> Result<CreatedIndex> {
         let request = request
             .as_any()
             .downcast_ref::<BitmapTrainingRequest>()
@@ -2079,7 +2122,7 @@ impl BasicTrainer for BitmapIndexPlugin {
             })?;
         let file = if let Some(fragment_ids) = fragment_ids.as_ref() {
             Self::train_bitmap_shard(
-                data,
+                input,
                 index_store,
                 fragment_ids,
                 request.parameters.shard_id,
@@ -2092,7 +2135,13 @@ impl BasicTrainer for BitmapIndexPlugin {
                     .to_string(),
             ));
         } else {
-            Self::train_bitmap_index(data, index_store).await?
+            let (file, _) = Self::train_bitmap_index_with_options(
+                input,
+                index_store,
+                &BitmapBuildOptions::default(),
+            )
+            .await?;
+            file
         };
         Ok(CreatedIndex {
             index_details: prost_types::Any::from_msg(&pbold::BitmapIndexDetails::default())
@@ -2592,9 +2641,9 @@ mod tests {
         assert_eq!(merged.value_type, DataType::Boolean);
     }
 
-    /// Boolean columns are trained and updated from unordered input; others stay value-sorted.
+    /// Every column type is trained and updated from unordered input.
     #[tokio::test]
-    async fn test_bitmap_boolean_training_order() {
+    async fn test_bitmap_training_order() {
         let ordering = |data_type| {
             BitmapIndexPlugin
                 .new_training_request("", &Field::new("v", data_type, true))
@@ -2603,7 +2652,7 @@ mod tests {
                 .ordering
         };
         assert_eq!(ordering(DataType::Boolean), TrainingOrdering::None);
-        assert_eq!(ordering(DataType::Utf8), TrainingOrdering::Values);
+        assert_eq!(ordering(DataType::Utf8), TrainingOrdering::None);
 
         let (_bool_dir, bool_index) =
             train_bitmap_segment_from(bool_value_row_id_stream(&[(Some(true), addr(0, 0))])).await;
@@ -2614,7 +2663,7 @@ mod tests {
         let (_utf8_dir, utf8_index) = train_bitmap_segment(&[(Some("a"), addr(0, 0))]).await;
         assert_eq!(
             utf8_index.update_criteria().data_criteria.ordering,
-            TrainingOrdering::Values
+            TrainingOrdering::None
         );
     }
 
@@ -3094,43 +3143,195 @@ mod tests {
         );
     }
 
-    /// Unsorted input must be rejected. It would reopen a run for a key already
-    /// written, and `load` keeps only the last file offset per key, so the earlier
-    /// row set would vanish silently. Nulls may lead or trail, but only once.
-    #[rstest]
-    #[case::value_reappears(vec![Some("a"), Some("b"), Some("a")], "a follows b")]
-    #[case::two_null_runs(vec![None, Some("a"), None], "more than one run of nulls")]
-    #[tokio::test]
-    async fn test_bitmap_build_rejects_unsorted_input(
-        #[case] values: Vec<Option<&str>>,
-        #[case] expected: &str,
-    ) {
+    /// Batches of `(value, row_id)` rows in exactly the order given.
+    fn unsorted_batches(batches: &[&[(Option<&str>, u64)]]) -> Vec<RecordBatch> {
         let schema = value_row_id_schema(DataType::Utf8);
-        let row_addrs = (0..values.len() as u32)
-            .map(|i| addr(0, i))
-            .collect::<Vec<_>>();
-        let batch = RecordBatch::try_new(
-            schema.clone(),
-            vec![
-                Arc::new(StringArray::from(values)),
-                Arc::new(UInt64Array::from(row_addrs)),
-            ],
-        )
-        .unwrap();
-        let unsorted: SendableRecordBatchStream = Box::pin(RecordBatchStreamAdapter::new(
-            schema,
-            stream::once(async move { Ok(batch) }),
-        ));
+        batches
+            .iter()
+            .map(|rows| {
+                RecordBatch::try_new(
+                    schema.clone(),
+                    vec![
+                        Arc::new(StringArray::from(
+                            rows.iter().map(|(value, _)| *value).collect::<Vec<_>>(),
+                        )),
+                        Arc::new(UInt64Array::from(
+                            rows.iter().map(|(_, addr)| *addr).collect::<Vec<_>>(),
+                        )),
+                    ],
+                )
+                .unwrap()
+            })
+            .collect()
+    }
 
+    /// A multi-batch `(value, row_id)` stream in exactly the order given.
+    fn unsorted_value_row_id_stream(
+        batches: &[&[(Option<&str>, u64)]],
+    ) -> SendableRecordBatchStream {
+        let schema = value_row_id_schema(DataType::Utf8);
+        Box::pin(RecordBatchStreamAdapter::new(
+            schema,
+            stream::iter(unsorted_batches(batches).into_iter().map(Ok)),
+        ))
+    }
+
+    /// In-memory training data a build can reopen: unordered as given, or
+    /// sorted by value when a pass asks for `TrainingOrdering::Values`.
+    struct BatchesSource {
+        batches: Vec<RecordBatch>,
+        opens: std::sync::atomic::AtomicUsize,
+        sorted_opens: std::sync::atomic::AtomicUsize,
+    }
+
+    impl BatchesSource {
+        fn new(batches: &[&[(Option<&str>, u64)]]) -> Self {
+            Self {
+                batches: unsorted_batches(batches),
+                opens: Default::default(),
+                sorted_opens: Default::default(),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl crate::scalar::registry::TrainingDataSource for BatchesSource {
+        async fn open(&self, criteria: &TrainingCriteria) -> Result<SendableRecordBatchStream> {
+            use std::sync::atomic::Ordering;
+            self.opens.fetch_add(1, Ordering::SeqCst);
+            let schema = value_row_id_schema(DataType::Utf8);
+            let batches = if criteria.ordering == TrainingOrdering::Values {
+                self.sorted_opens.fetch_add(1, Ordering::SeqCst);
+                let all = arrow::compute::concat_batches(&schema, &self.batches).unwrap();
+                vec![sort_batch_by_value(&all)]
+            } else {
+                self.batches.clone()
+            };
+            Ok(Box::pin(RecordBatchStreamAdapter::new(
+                schema,
+                stream::iter(batches.into_iter().map(Ok)),
+            )))
+        }
+    }
+
+    /// Build over `old_segments` with explicit options and load the result.
+    async fn build_with_options(
+        input: BitmapBuildInput<'_>,
+        old_segments: Vec<OldSegment<'_>>,
+        options: &BitmapBuildOptions,
+    ) -> (TempObjDir, Arc<BitmapIndex>, BitmapBuildReport) {
         let tmpdir = TempObjDir::default();
         let store = Arc::new(LanceIndexStore::new(
             Arc::new(ObjectStore::local()),
             tmpdir.clone(),
             Arc::new(LanceCache::no_cache()),
         ));
-        let Err(err) = BitmapIndexPlugin::train_bitmap_index(unsorted, store.as_ref()).await else {
-            panic!("expected unsorted input to be rejected");
-        };
+        let (_, report) = BitmapIndexPlugin::streaming_build_and_write(
+            input,
+            old_segments,
+            store.as_ref(),
+            BITMAP_LOOKUP_NAME,
+            options,
+        )
+        .await
+        .unwrap();
+        let index = BitmapIndex::load(store, None, &LanceCache::no_cache())
+            .await
+            .unwrap();
+        (tmpdir, index, report)
+    }
+
+    /// Whether the first entry of the written lookup file is the null entry,
+    /// which `merge_shards` relies on.
+    async fn is_null_entry_first(index: &BitmapIndex) -> bool {
+        let file = index
+            .store
+            .open_index_file(BITMAP_LOOKUP_NAME)
+            .await
+            .unwrap();
+        let batch = file.read_range(0..1, Some(&["keys"])).await.unwrap();
+        batch.column(0).is_null(0)
+    }
+
+    /// Options that hold every key's row set through the first pass and
+    /// never fall back.
+    ///
+    /// The fallback sort pool is sized per test (`test_pool_bytes`) so the
+    /// parallel tests do not share one pool: every sort takes a 40 MB
+    /// non-spillable merge reservation up front, and four of them exhaust the
+    /// 150 MB default together.
+    fn direct_all() -> BitmapBuildOptions {
+        BitmapBuildOptions {
+            max_direct_keys: usize::MAX,
+            replay_memory_limit_bytes: usize::MAX,
+            max_distinct_keys: usize::MAX,
+            sort_mem_pool_bytes: None,
+        }
+    }
+
+    /// A sort pool of its own for one test: distinct sizes map to distinct
+    /// DataFusion session contexts.
+    fn test_pool_bytes(test_id: u64) -> Option<u64> {
+        Some(64 * 1024 * 1024 + test_id)
+    }
+
+    /// Compare the index against the brute-force postings of `rows`, as written
+    /// (`index_map`/`null_map`), not as a query would resolve them.
+    async fn assert_postings(index: &BitmapIndex, rows: &[(Option<&str>, u64)], context: &str) {
+        let mut expected: HashMap<Option<&str>, RowAddrTreeMap> = HashMap::new();
+        for (value, row_addr) in rows {
+            expected.entry(*value).or_default().insert(*row_addr);
+        }
+        let non_null = expected.keys().filter(|v| v.is_some()).count();
+        assert_eq!(index.index_map.len(), non_null, "{context}: key count");
+        for (value, want) in &expected {
+            let got = match value {
+                Some(value) => {
+                    let key = OrderableScalarValue(ScalarValue::Utf8(Some(value.to_string())));
+                    (*index.load_bitmap(&key, None).await.unwrap()).clone()
+                }
+                None => (*index.null_map).clone(),
+            };
+            assert_eq!(got, *want, "{context}: row sets differ for {value:?}");
+        }
+    }
+
+    /// The builder takes its input in any order, so the scanner is not asked
+    /// to sort, and a key or null run that reappears is unioned, not rejected.
+    #[rstest]
+    #[case::value_reappears(vec![Some("a"), Some("b"), Some("a")])]
+    #[case::two_null_runs(vec![None, Some("a"), None])]
+    #[tokio::test]
+    async fn test_bitmap_build_accepts_unsorted_input(#[case] values: Vec<Option<&str>>) {
+        assert_eq!(
+            bitmap_training_criteria(&DataType::Utf8).ordering,
+            TrainingOrdering::None
+        );
+
+        let rows = values
+            .iter()
+            .enumerate()
+            .map(|(i, value)| (*value, addr(0, i as u32)))
+            .collect::<Vec<_>>();
+        let (_dir, index) = train_bitmap_segment_from(unsorted_value_row_id_stream(&[&rows])).await;
+        assert_postings(&index, &rows, "unsorted input").await;
+    }
+
+    /// The sorted fallback still guards its runs: a run that reopens means
+    /// the sort misbehaved, not the input.
+    #[rstest]
+    #[case::value_reappears(Some("b"), Some("a"), false, "a follows b")]
+    #[case::two_null_runs(Some("a"), None, true, "more than one run of nulls")]
+    #[tokio::test]
+    async fn test_bitmap_run_order_guard(
+        #[case] previous: Option<&str>,
+        #[case] next: Option<&str>,
+        #[case] null_run_closed: bool,
+        #[case] expected: &str,
+    ) {
+        let previous = ScalarValue::Utf8(previous.map(str::to_string));
+        let next = ScalarValue::Utf8(next.map(str::to_string));
+        let err = check_run_order(&previous, &next, null_run_closed).unwrap_err();
         assert!(
             matches!(err, Error::InvalidInput { .. }),
             "expected InvalidInput, got {err:?}"
@@ -3138,6 +3339,584 @@ mod tests {
         let message = err.to_string();
         assert!(message.contains("sorted by value"), "{message}");
         assert!(message.contains(expected), "{message}");
+    }
+
+    const SMALL_ROWS: [(Option<&str>, u64); 10] = [
+        (Some("b"), 0),
+        (None, 1),
+        (Some("a"), 2),
+        (Some("b"), 3),
+        (Some("c"), 4),
+        (None, 5),
+        (Some("a"), 6),
+        (Some("d"), 7),
+        (Some("b"), 8),
+        (Some("e"), 9),
+    ];
+
+    /// With few enough keys a stream is built in its one pass: a row set per
+    /// key, nothing reread, the null entry first.
+    #[tokio::test]
+    async fn test_bitmap_build_direct_from_stream() {
+        let (_dir, index, report) = build_with_options(
+            BitmapBuildInput::Stream(unsorted_value_row_id_stream(&[
+                &SMALL_ROWS[..4],
+                &SMALL_ROWS[4..],
+            ])),
+            Vec::new(),
+            &direct_all(),
+        )
+        .await;
+        assert_eq!(report.strategy, BuildStrategy::Direct, "{report:?}");
+        assert_eq!(report.rows, 10, "{report:?}");
+        assert_eq!(report.distinct_keys, 6, "{report:?}");
+        assert!(!report.replayed_spill, "{report:?}");
+        assert_postings(&index, &SMALL_ROWS, "direct").await;
+        assert!(is_null_entry_first(&index).await);
+    }
+
+    /// Crossing the direct cap part-way through the input drops the row
+    /// sets and reads the whole input again sorted, so the rows before the
+    /// crossing are not lost.
+    #[rstest]
+    #[case::stream(false, 6)]
+    #[case::source(true, 7)]
+    #[tokio::test]
+    async fn test_bitmap_build_direct_cap_crossed_mid_stream(
+        #[case] from_source: bool,
+        #[case] test_id: u64,
+    ) {
+        // Two keys fit the cap; the second batch brings the third.
+        let batches: [&[(Option<&str>, u64)]; 3] =
+            [&SMALL_ROWS[..3], &SMALL_ROWS[3..5], &SMALL_ROWS[5..]];
+        let options = BitmapBuildOptions {
+            max_direct_keys: 2,
+            sort_mem_pool_bytes: test_pool_bytes(test_id),
+            ..direct_all()
+        };
+        let source = BatchesSource::new(&batches);
+        let input = if from_source {
+            BitmapBuildInput::Source(&source)
+        } else {
+            BitmapBuildInput::Stream(unsorted_value_row_id_stream(&batches))
+        };
+        let (_dir, index, report) = build_with_options(input, Vec::new(), &options).await;
+        assert_eq!(report.strategy, BuildStrategy::Sorted, "{report:?}");
+        assert_eq!(report.replayed_spill, !from_source, "{report:?}");
+        assert_postings(&index, &SMALL_ROWS, "cap crossed").await;
+        assert!(is_null_entry_first(&index).await);
+    }
+
+    /// A primitive column goes through the typed table, with every NaN
+    /// pattern folded into one key and signed zeros kept apart.
+    #[rstest]
+    #[case::direct(direct_all(), BuildStrategy::Direct)]
+    #[tokio::test]
+    async fn test_bitmap_build_float_keys_through_either_path(
+        #[case] options: BitmapBuildOptions,
+        #[case] expected_strategy: BuildStrategy,
+    ) {
+        let schema = value_row_id_schema(DataType::Float64);
+        let values = [
+            Some(f64::from_bits(f64::NAN.to_bits() | 1)),
+            Some(1.5),
+            Some(-0.0),
+            None,
+            Some(f64::NAN),
+            Some(0.0),
+            Some(1.5),
+            Some(-f64::NAN),
+        ];
+        let batch = |range: std::ops::Range<usize>| {
+            RecordBatch::try_new(
+                schema.clone(),
+                vec![
+                    Arc::new(Float64Array::from(values[range.clone()].to_vec())),
+                    Arc::new(UInt64Array::from(
+                        range.map(|i| addr(0, i as u32)).collect::<Vec<_>>(),
+                    )),
+                ],
+            )
+            .unwrap()
+        };
+        let stream: SendableRecordBatchStream = Box::pin(RecordBatchStreamAdapter::new(
+            schema.clone(),
+            stream::iter([batch(0..3), batch(3..8)].into_iter().map(Ok)),
+        ));
+        let (_dir, index, report) =
+            build_with_options(BitmapBuildInput::Stream(stream), Vec::new(), &options).await;
+        assert_eq!(report.strategy, expected_strategy, "{report:?}");
+        assert_eq!(report.distinct_keys, 5, "{report:?}");
+        let key = |v: f64| OrderableScalarValue(ScalarValue::Float64(Some(v)));
+        let rows = |index: &BitmapIndex, k: OrderableScalarValue| {
+            let index = index.clone();
+            async move { (*index.load_bitmap(&k, None).await.unwrap()).clone() }
+        };
+        assert_eq!(
+            rows(&index, key(f64::NAN)).await,
+            RowAddrTreeMap::from_iter([addr(0, 0), addr(0, 4), addr(0, 7)])
+        );
+        assert_eq!(
+            rows(&index, key(1.5)).await,
+            RowAddrTreeMap::from_iter([addr(0, 1), addr(0, 6)])
+        );
+        assert_eq!(
+            rows(&index, key(-0.0)).await,
+            RowAddrTreeMap::from_iter([addr(0, 2)])
+        );
+        assert_eq!(
+            rows(&index, key(0.0)).await,
+            RowAddrTreeMap::from_iter([addr(0, 5)])
+        );
+        assert_eq!(*index.null_map, RowAddrTreeMap::from_iter([addr(0, 3)]));
+        assert_eq!(index.index_map.len(), 4);
+    }
+
+    /// Too many keys for a table: the build sorts instead. A source is
+    /// reopened sorted; a stream's replay, from memory or from disk, goes
+    /// through the DataFusion sort.
+    #[rstest]
+    #[case::source(true, usize::MAX, 1)]
+    #[case::stream(false, usize::MAX, 2)]
+    #[case::stream_spilled_to_disk(false, 0, 5)]
+    #[tokio::test]
+    async fn test_bitmap_build_falls_back_to_sorting(
+        #[case] from_source: bool,
+        #[case] replay_memory_limit_bytes: usize,
+        #[case] test_id: u64,
+    ) {
+        let batches: [&[(Option<&str>, u64)]; 2] = [&SMALL_ROWS[..4], &SMALL_ROWS[4..]];
+        let options = BitmapBuildOptions {
+            max_distinct_keys: 2,
+            replay_memory_limit_bytes,
+            sort_mem_pool_bytes: test_pool_bytes(test_id),
+            ..direct_all()
+        };
+        let source = BatchesSource::new(&batches);
+        let input = if from_source {
+            BitmapBuildInput::Source(&source)
+        } else {
+            BitmapBuildInput::Stream(unsorted_value_row_id_stream(&batches))
+        };
+        let (_dir, index, report) = build_with_options(input, Vec::new(), &options).await;
+        assert_eq!(report.strategy, BuildStrategy::Sorted, "{report:?}");
+        assert_eq!(report.replayed_spill, !from_source, "{report:?}");
+        if from_source {
+            assert_eq!(
+                source
+                    .sorted_opens
+                    .load(std::sync::atomic::Ordering::SeqCst),
+                1
+            );
+        }
+        assert_postings(&index, &SMALL_ROWS, "sorted fallback").await;
+        assert!(is_null_entry_first(&index).await);
+    }
+
+    /// The update path: a stored segment with a filter and new data, on
+    /// every strategy, both hold `a` and nulls, and the merge takes each key
+    /// once, nulls first.
+    #[rstest]
+    #[case::direct(usize::MAX, usize::MAX, BuildStrategy::Direct)]
+    #[case::sorted(0, 2, BuildStrategy::Sorted)]
+    #[tokio::test]
+    async fn test_bitmap_build_merges_a_stored_segment(
+        #[case] max_direct_keys: usize,
+        #[case] max_distinct_keys: usize,
+        #[case] expected_strategy: BuildStrategy,
+    ) {
+        let (_old_dir, old) = train_bitmap_segment(&[
+            (Some("a"), addr(0, 0)),
+            (Some("z"), addr(0, 1)),
+            (None, addr(0, 2)),
+            (Some("a"), addr(0, 3)),
+        ])
+        .await;
+        // Row (0, 3) is deleted, so only three old rows survive.
+        let filter = OldIndexDataFilter::RowIds(RowAddrTreeMap::from_iter([
+            addr(0, 0),
+            addr(0, 1),
+            addr(0, 2),
+        ]));
+        let new_rows = [
+            (Some("a"), addr(1, 0)),
+            (None, addr(1, 1)),
+            (Some("m"), addr(1, 2)),
+            (Some("a"), addr(2, 0)),
+            (Some("z"), addr(2, 1)),
+            (None, addr(2, 2)),
+            (Some("b"), addr(2, 3)),
+        ];
+        let options = BitmapBuildOptions {
+            max_direct_keys,
+            max_distinct_keys,
+            sort_mem_pool_bytes: test_pool_bytes(3),
+            ..direct_all()
+        };
+        let (_dir, index, report) = build_with_options(
+            BitmapBuildInput::Stream(unsorted_value_row_id_stream(&[
+                &new_rows[..3],
+                &new_rows[3..],
+            ])),
+            vec![OldSegment {
+                index: &old,
+                filter: Some(&filter),
+            }],
+            &options,
+        )
+        .await;
+        assert_eq!(report.strategy, expected_strategy, "{report:?}");
+
+        let mut expected = vec![
+            (Some("a"), addr(0, 0)),
+            (Some("z"), addr(0, 1)),
+            (None, addr(0, 2)),
+        ];
+        expected.extend(new_rows);
+        assert_postings(&index, &expected, "stored segment").await;
+        assert!(is_null_entry_first(&index).await);
+    }
+
+    /// Old nulls with no new nulls are still written first.
+    #[tokio::test]
+    async fn test_bitmap_build_old_nulls_come_first() {
+        let (_old_dir, old) =
+            train_bitmap_segment(&[(Some("k"), addr(0, 0)), (None, addr(0, 1))]).await;
+        let new_rows = [(Some("a"), addr(1, 0)), (Some("k"), addr(1, 1))];
+        let (_dir, index, _) = build_with_options(
+            BitmapBuildInput::Stream(unsorted_value_row_id_stream(&[&new_rows])),
+            vec![OldSegment {
+                index: &old,
+                filter: None,
+            }],
+            &direct_all(),
+        )
+        .await;
+        let mut expected = vec![(Some("k"), addr(0, 0)), (None, addr(0, 1))];
+        expected.extend(new_rows);
+        assert_postings(&index, &expected, "old nulls").await;
+        assert!(is_null_entry_first(&index).await);
+    }
+
+    /// Whatever the limits, batch boundaries and input kind, the output is the
+    /// union of the filtered stored segment and every input row.
+    #[tokio::test]
+    async fn test_bitmap_build_matches_brute_force_across_limits() {
+        const VOCAB: [&str; 6] = ["a", "b", "c", "d", "e", "f"];
+        const FRAGMENTS: u32 = 3;
+
+        for seed in 0..100u64 {
+            let mut rng = SmallRng::seed_from_u64(seed);
+            let rand_row = |rng: &mut SmallRng| {
+                // A skewed vocabulary so some keys qualify as direct.
+                let value = rng.random_bool(0.85).then(|| {
+                    if rng.random_bool(0.5) {
+                        VOCAB[0]
+                    } else {
+                        VOCAB[rng.random_range(0..VOCAB.len())]
+                    }
+                });
+                (
+                    value,
+                    addr(rng.random_range(0..FRAGMENTS), rng.random_range(0..64u32)),
+                )
+            };
+            let old_rows = (0..rng.random_range(0..=12))
+                .map(|_| rand_row(&mut rng))
+                .collect::<Vec<_>>();
+            let filter = rng.random_bool(0.5).then(|| {
+                OldIndexDataFilter::RowIds(
+                    old_rows
+                        .iter()
+                        .filter(|_| rng.random_bool(0.7))
+                        .map(|(_, row_addr)| *row_addr)
+                        .collect(),
+                )
+            });
+            let new_rows = (0..rng.random_range(1..=48))
+                .map(|_| rand_row(&mut rng))
+                .collect::<Vec<_>>();
+            let batch_rows = rng.random_range(1..=8usize);
+            let batches = new_rows.chunks(batch_rows).collect::<Vec<_>>();
+            let options = BitmapBuildOptions {
+                max_direct_keys: [0, 2, usize::MAX][rng.random_range(0..3)],
+                replay_memory_limit_bytes: [0, usize::MAX][rng.random_range(0..2)],
+                max_distinct_keys: if rng.random_bool(0.2) {
+                    rng.random_range(1..=3)
+                } else {
+                    usize::MAX
+                },
+                sort_mem_pool_bytes: test_pool_bytes(4),
+            };
+            let from_source = rng.random_bool(0.5);
+
+            let mut expected = old_rows
+                .iter()
+                .filter(|(_, row_addr)| oracle_keeps(&filter, *row_addr))
+                .copied()
+                .collect::<Vec<_>>();
+            expected.extend(&new_rows);
+
+            let (_old_dir, old) = train_bitmap_segment(&old_rows).await;
+            let old_segments = (!old_rows.is_empty())
+                .then_some(OldSegment {
+                    index: &old,
+                    filter: filter.as_ref(),
+                })
+                .into_iter()
+                .collect();
+            let source = BatchesSource::new(&batches);
+            let input = if from_source {
+                BitmapBuildInput::Source(&source)
+            } else {
+                BitmapBuildInput::Stream(unsorted_value_row_id_stream(&batches))
+            };
+            let (_dir, index, report) = build_with_options(input, old_segments, &options).await;
+            let context = format!("seed {seed}: {options:?} from_source={from_source} {report:?}");
+            if report.strategy != BuildStrategy::Sorted {
+                assert_eq!(report.rows, new_rows.len() as u64, "{context}");
+            }
+            assert_postings(&index, &expected, &context).await;
+            assert!(
+                is_null_entry_first(&index).await || expected.iter().all(|(v, _)| v.is_some()),
+                "{context}"
+            );
+        }
+    }
+
+    /// Boolean and 8-bit columns are built in one direct pass: no count, no
+    /// spill, no reread, whatever the limits, and `update()` keeps that.
+    ///
+    /// `third` is a value of the type beyond 0 and 1: `true` again for
+    /// Boolean (so two classes), the top byte for UInt8, a negative for Int8.
+    #[rstest]
+    #[case::boolean(DataType::Boolean, 2)]
+    #[case::uint8(DataType::UInt8, 255)]
+    #[case::int8(DataType::Int8, -1)]
+    #[tokio::test]
+    async fn test_bitmap_build_small_domains_take_one_direct_pass(
+        #[case] data_type: DataType,
+        #[case] third: i64,
+    ) {
+        let schema = value_row_id_schema(data_type.clone());
+        let values = |raw: &[Option<i64>]| -> ArrayRef {
+            match data_type {
+                DataType::Boolean => Arc::new(BooleanArray::from(
+                    raw.iter().map(|v| v.map(|v| v != 0)).collect::<Vec<_>>(),
+                )),
+                _ => arrow::compute::cast(&Int64Array::from(raw.to_vec()), &data_type).unwrap(),
+            }
+        };
+        let batch = |raw: &[Option<i64>], first_addr: u64| {
+            RecordBatch::try_new(
+                schema.clone(),
+                vec![
+                    values(raw),
+                    Arc::new(UInt64Array::from(
+                        (0..raw.len() as u64)
+                            .map(|i| first_addr + i)
+                            .collect::<Vec<_>>(),
+                    )),
+                ],
+            )
+            .unwrap()
+        };
+        let batches = vec![
+            batch(&[Some(1), None, Some(0), Some(1), Some(third)], addr(0, 0)),
+            batch(&[Some(0), Some(third), None, Some(1)], addr(1, 0)),
+        ];
+        let stream: SendableRecordBatchStream = Box::pin(RecordBatchStreamAdapter::new(
+            schema.clone(),
+            stream::iter(batches.clone().into_iter().map(Ok)),
+        ));
+        let options = BitmapBuildOptions {
+            max_direct_keys: 0,
+            replay_memory_limit_bytes: 0,
+            max_distinct_keys: 1,
+            ..direct_all()
+        };
+        let (_dir, index, report) =
+            build_with_options(BitmapBuildInput::Stream(stream), Vec::new(), &options).await;
+        assert_eq!(report.strategy, BuildStrategy::Direct, "{report:?}");
+        assert_eq!(report.rows, 9, "{report:?}");
+        // The null run plus two (Boolean) or three (ints) keys.
+        let expected_keys = if data_type == DataType::Boolean { 3 } else { 4 };
+        assert_eq!(report.distinct_keys, expected_keys, "{report:?}");
+        assert!(!report.replayed_spill, "{report:?}");
+        assert!(is_null_entry_first(&index).await);
+
+        // Postings per raw value, read back through the index's own keys.
+        let expect = |raw: i64| match data_type {
+            DataType::Boolean => ScalarValue::Boolean(Some(raw != 0)),
+            DataType::Int8 => ScalarValue::Int8(Some(raw as i8)),
+            _ => ScalarValue::UInt8(Some(raw as u8)),
+        };
+        let raws: Vec<i64> = if data_type == DataType::Boolean {
+            vec![0, 1]
+        } else {
+            vec![third, 0, 1]
+        };
+        let all_rows = [
+            (Some(1), addr(0, 0)),
+            (None, addr(0, 1)),
+            (Some(0), addr(0, 2)),
+            (Some(1), addr(0, 3)),
+            (Some(third), addr(0, 4)),
+            (Some(0), addr(1, 0)),
+            (Some(third), addr(1, 1)),
+            (None, addr(1, 2)),
+            (Some(1), addr(1, 3)),
+        ];
+        let class = |raw: i64| {
+            if data_type == DataType::Boolean {
+                (raw != 0) as i64
+            } else {
+                raw
+            }
+        };
+        for raw in &raws {
+            let key = OrderableScalarValue(expect(*raw));
+            let got = (*index.load_bitmap(&key, None).await.unwrap()).clone();
+            let want = all_rows
+                .iter()
+                .filter(|(v, _)| v.is_some_and(|v| class(v) == *raw))
+                .map(|(_, a)| *a)
+                .collect::<RowAddrTreeMap>();
+            assert_eq!(got, want, "{data_type} key {raw}");
+        }
+        assert_eq!(
+            *index.null_map,
+            RowAddrTreeMap::from_iter([addr(0, 1), addr(1, 2)])
+        );
+        assert_eq!(index.index_map.len(), raws.len());
+    }
+
+    /// A fixed-width binary column goes through the byte-slice key table: a
+    /// fresh build and an `update()` of it, with nulls and a key repeated
+    /// across batches, searched back by value and for null.
+    #[rstest]
+    #[case::direct(direct_all(), BuildStrategy::Direct)]
+    #[tokio::test]
+    async fn test_bitmap_build_fixed_size_binary_keys(
+        #[case] options: BitmapBuildOptions,
+        #[case] expected_strategy: BuildStrategy,
+    ) {
+        const WIDTH: i32 = 32;
+        let key = |byte: u8| [byte; WIDTH as usize];
+        let schema = value_row_id_schema(DataType::FixedSizeBinary(WIDTH));
+        let batch = |rows: &[(Option<u8>, u64)]| {
+            RecordBatch::try_new(
+                schema.clone(),
+                vec![
+                    Arc::new(
+                        FixedSizeBinaryArray::try_from_sparse_iter_with_size(
+                            rows.iter().map(|(value, _)| value.map(key)),
+                            WIDTH,
+                        )
+                        .unwrap(),
+                    ),
+                    Arc::new(UInt64Array::from(
+                        rows.iter().map(|(_, addr)| *addr).collect::<Vec<_>>(),
+                    )),
+                ],
+            )
+            .unwrap()
+        };
+        let stream = |batches: Vec<RecordBatch>| -> SendableRecordBatchStream {
+            Box::pin(RecordBatchStreamAdapter::new(
+                schema.clone(),
+                stream::iter(batches.into_iter().map(Ok)),
+            ))
+        };
+        let old_rows = [
+            (Some(7), addr(0, 0)),
+            (None, addr(0, 1)),
+            (Some(3), addr(0, 2)),
+            (Some(7), addr(1, 0)),
+            (Some(200), addr(1, 1)),
+        ];
+        let new_rows = [
+            (Some(3), addr(2, 0)),
+            (None, addr(2, 1)),
+            (Some(9), addr(2, 2)),
+            (Some(7), addr(3, 0)),
+        ];
+        let search = |index: Arc<BitmapIndex>, value: Option<u8>| async move {
+            let query = match value {
+                Some(byte) => SargableQuery::Equals(ScalarValue::FixedSizeBinary(
+                    WIDTH,
+                    Some(key(byte).to_vec()),
+                )),
+                None => SargableQuery::IsNull(),
+            };
+            search_addrs_for(&index, query).await
+        };
+        let expected = |sides: &[&[(Option<u8>, u64)]], value: Option<u8>| {
+            let mut addrs = sides
+                .iter()
+                .flat_map(|rows| rows.iter())
+                .filter(|(v, _)| *v == value)
+                .map(|(_, a)| *a)
+                .collect::<Vec<_>>();
+            addrs.sort_unstable();
+            addrs
+        };
+
+        let (_old_dir, old, report) = build_with_options(
+            BitmapBuildInput::Stream(stream(vec![batch(&old_rows[..3]), batch(&old_rows[3..])])),
+            Vec::new(),
+            &options,
+        )
+        .await;
+        assert_eq!(report.strategy, expected_strategy, "{report:?}");
+        assert_eq!(report.distinct_keys, 4, "{report:?}");
+        assert_eq!(old.value_type, DataType::FixedSizeBinary(WIDTH));
+        for value in [Some(7), Some(3), Some(200), Some(9), None] {
+            assert_eq!(
+                search(old.clone(), value).await,
+                expected(&[&old_rows], value),
+                "fresh build, key {value:?}"
+            );
+        }
+
+        let dest_dir = TempObjDir::default();
+        let dest_store = Arc::new(LanceIndexStore::new(
+            Arc::new(ObjectStore::local()),
+            dest_dir.clone(),
+            Arc::new(LanceCache::no_cache()),
+        ));
+        old.update(
+            stream(vec![batch(&new_rows[..2]), batch(&new_rows[2..])]),
+            dest_store.as_ref(),
+            None,
+        )
+        .await
+        .unwrap();
+        let updated = BitmapIndex::load(dest_store, None, &LanceCache::no_cache())
+            .await
+            .unwrap();
+        for value in [Some(7), Some(3), Some(200), Some(9), None] {
+            assert_eq!(
+                search(updated.clone(), value).await,
+                expected(&[&old_rows, &new_rows], value),
+                "update, key {value:?}"
+            );
+        }
+        assert!(is_null_entry_first(&updated).await);
+    }
+
+    #[test]
+    fn test_bitmap_build_options_reject_zero_key_cap() {
+        let options = BitmapBuildOptions {
+            max_distinct_keys: 0,
+            ..direct_all()
+        };
+        let err = options.validate().unwrap_err();
+        assert!(
+            matches!(err, Error::InvalidInput { .. }),
+            "expected InvalidInput, got {err:?}"
+        );
+        assert!(err.to_string().contains("max_distinct_keys"), "{err}");
     }
 
     /// A row set too large for an `i32` offset must be reported, not panicked on
