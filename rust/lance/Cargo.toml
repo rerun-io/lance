@@ -325,3 +325,7 @@ harness = false
 
 [lints]
 workspace = true
+
+[[bench]]
+name = "bitmap_scan_probe"
+harness = false
