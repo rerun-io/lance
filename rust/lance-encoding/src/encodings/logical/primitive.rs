@@ -10748,12 +10748,16 @@ mod tests {
             .unwrap();
         assert_eq!(rows, Some(expected));
 
-        // The page metadata is cached under the key a read of the same field looks up.
-        let cache_key = super::FieldDataCacheKey {
-            column_index: column_info.index,
-            view_tag: format!("{:?}", field.data_type()),
-        };
-        assert!(cache.get_with_key(&cache_key).await.is_some());
+        // The page metadata is cached under the keys a read of the same field looks up.
+        for page_index in 0..column_info.page_infos.len() as u32 {
+            let cache_key = PageDataCacheKey {
+                column_index: column_info.index,
+                page_index,
+                view: PageCacheView::Native,
+                target_data_type_tag: format!("{:?}", field.data_type()).into(),
+            };
+            assert!(cache.get_with_key(&cache_key).await.is_some());
+        }
     }
 
     #[rstest::rstest]
