@@ -1383,12 +1383,11 @@ impl CacheKey for BTreePageKey {
 ///
 /// A `BTreeIndex` holds non-serializable infrastructure (an `IndexStore`, a
 /// cache handle, a fragment-reuse index). `BTreeIndexState` captures just the
-/// data needed to rebuild it: the `page_lookup.lance` batch (from which
-/// `BTreeIndex::try_from_serialized` reconstructs the in-memory lookup with
-/// no IO) plus the page batch size and range-partition map.
+/// data needed to rebuild it: the page lookup, built once per load so a cache
+/// hit does not re-scan every page, plus the page batch size and range-partition map.
 #[derive(Debug, Clone)]
 struct BTreeIndexState {
-    lookup_batch: RecordBatch,
+    page_lookup: Arc<BTreeLookup>,
     batch_size: u64,
     ranges_to_files: Option<Arc<RangeInclusiveMap<u32, (String, u32)>>>,
 }
@@ -1397,7 +1396,7 @@ impl DeepSizeOf for BTreeIndexState {
     fn deep_size_of_children(&self, context: &mut lance_core::deepsize::Context) -> usize {
         // `ranges_to_files` is tiny and `RangeInclusiveMap` is not `DeepSizeOf`;
         // the lookup batch dominates, matching how `BTreeIndex` accounts for itself.
-        self.lookup_batch.deep_size_of_children(context)
+        self.page_lookup.deep_size_of_children(context)
     }
 }
 
@@ -1407,7 +1406,7 @@ impl BTreeIndexState {
             Error::internal("BTreeIndexState::from_index called with a non-BTree index")
         })?;
         Ok(Self {
-            lookup_batch: btree.page_lookup.batch.clone(),
+            page_lookup: btree.page_lookup.clone(),
             batch_size: btree.batch_size,
             ranges_to_files: btree.ranges_to_files.clone(),
         })
@@ -1419,14 +1418,16 @@ impl BTreeIndexState {
         index_cache: &LanceCache,
         frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
     ) -> Result<Arc<dyn ScalarIndex>> {
-        let index = BTreeIndex::try_from_serialized(
-            self.lookup_batch.clone(),
+        let data_type = self.page_lookup.batch.column(0).data_type().clone();
+        let index = BTreeIndex::new(
+            self.page_lookup.clone(),
             store,
-            index_cache,
+            data_type,
+            WeakLanceCache::from(index_cache),
             self.batch_size,
             self.ranges_to_files.clone(),
             frag_reuse_index,
-        )?;
+        );
         Ok(Arc::new(index) as Arc<dyn ScalarIndex>)
     }
 }
@@ -1459,7 +1460,7 @@ impl CacheCodecImpl for BTreeIndexState {
             ranges_to_files,
         };
         w.write_header(&header)?;
-        w.write_ipc(&self.lookup_batch)?;
+        w.write_ipc(&self.page_lookup.batch)?;
         Ok(())
     }
 
@@ -1475,9 +1476,9 @@ impl CacheCodecImpl for BTreeIndexState {
         } else {
             None
         };
-        let lookup_batch = r.read_ipc()?;
+        let page_lookup = Arc::new(BTreeLookup::try_new(r.read_ipc()?)?);
         Ok(Self {
-            lookup_batch,
+            page_lookup,
             batch_size: header.batch_size,
             ranges_to_files,
         })
@@ -6950,7 +6951,7 @@ mod tests {
 
     fn assert_state_roundtrips(state: &BTreeIndexState) {
         let restored = deserialize_state(serialize_state(state)).unwrap();
-        assert_eq!(restored.lookup_batch, state.lookup_batch);
+        assert_eq!(restored.page_lookup, state.page_lookup);
         assert_eq!(restored.batch_size, state.batch_size);
         assert_eq!(restored.ranges_to_files, state.ranges_to_files);
     }
@@ -6965,7 +6966,7 @@ mod tests {
     fn test_btree_index_state_roundtrip() {
         // Not range-partitioned.
         assert_state_roundtrips(&BTreeIndexState {
-            lookup_batch: sample_lookup_batch(),
+            page_lookup: Arc::new(BTreeLookup::try_new(sample_lookup_batch()).unwrap()),
             batch_size: DEFAULT_BTREE_BATCH_SIZE,
             ranges_to_files: None,
         });
@@ -6978,14 +6979,16 @@ mod tests {
         .into_iter()
         .collect();
         assert_state_roundtrips(&BTreeIndexState {
-            lookup_batch: sample_lookup_batch(),
+            page_lookup: Arc::new(BTreeLookup::try_new(sample_lookup_batch()).unwrap()),
             batch_size: 8192,
             ranges_to_files: Some(Arc::new(ranges)),
         });
 
         // Empty index.
         assert_state_roundtrips(&BTreeIndexState {
-            lookup_batch: RecordBatch::new_empty(sample_lookup_batch().schema()),
+            page_lookup: Arc::new(
+                BTreeLookup::try_new(RecordBatch::new_empty(sample_lookup_batch().schema())).unwrap(),
+            ),
             batch_size: DEFAULT_BTREE_BATCH_SIZE,
             ranges_to_files: None,
         });
@@ -7014,7 +7017,7 @@ mod tests {
 
         // Round-trip the state through the codec and reconstruct an index from it.
         let state = BTreeIndexState {
-            lookup_batch: index.page_lookup.batch.clone(),
+            page_lookup: index.page_lookup.clone(),
             batch_size: index.batch_size,
             ranges_to_files: index.ranges_to_files.clone(),
         };
@@ -7066,7 +7069,7 @@ mod tests {
                 .into_iter()
                 .collect();
         let state = BTreeIndexState {
-            lookup_batch: sample_lookup_batch(),
+            page_lookup: Arc::new(BTreeLookup::try_new(sample_lookup_batch()).unwrap()),
             batch_size: 8192,
             ranges_to_files: Some(Arc::new(ranges)),
         };
@@ -7086,7 +7089,7 @@ mod tests {
 
         let base = data.as_ptr() as usize;
         let end = base + data.len();
-        for col in restored.lookup_batch.columns() {
+        for col in restored.page_lookup.batch.columns() {
             for buffer in col.to_data().buffers() {
                 let ptr = buffer.as_ptr() as usize;
                 assert!(
@@ -7146,7 +7149,7 @@ mod tests {
             .await
             .unwrap();
         let state = BTreeIndexState {
-            lookup_batch: index.page_lookup.batch.clone(),
+            page_lookup: index.page_lookup.clone(),
             batch_size: index.batch_size,
             ranges_to_files: index.ranges_to_files.clone(),
         };
