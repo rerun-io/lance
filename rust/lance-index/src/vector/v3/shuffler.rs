@@ -691,14 +691,26 @@ impl TwoFileShuffleReader {
     }
 
     async fn partition_ranges(&self, partition_id: usize) -> Result<Vec<Range<u64>>> {
-        let mut positions = Vec::with_capacity(self.num_batches as usize * 2);
+        // The reader requires strictly increasing positions. With a single
+        // partition the offset that ends one batch also starts the next, so
+        // each position is requested once and `bounds` records where each
+        // batch's start and end offsets land in the result.
+        let mut positions: Vec<u32> = Vec::with_capacity(self.num_batches as usize * 2);
+        let mut bounds = Vec::with_capacity(self.num_batches as usize);
         for batch_idx in 0..self.num_batches {
             let end_pos = u32::try_from(batch_idx as usize * self.num_partitions + partition_id)
                 .map_err(|_| Error::invalid_input("There are more than 2^32 partition offsets in the spill file.  Need to support 64-bit take"))?;
-            if end_pos != 0 {
-                positions.push(end_pos - 1);
-            }
+            let start_idx = if end_pos == 0 {
+                // Implicit 0 for start-of-file
+                None
+            } else {
+                if positions.last() != Some(&(end_pos - 1)) {
+                    positions.push(end_pos - 1);
+                }
+                Some(positions.len() - 1)
+            };
             positions.push(end_pos);
+            bounds.push((start_idx, positions.len() - 1));
         }
         let positions = UInt32Array::from(positions);
         let num_positions = positions.len() as u32;
@@ -722,19 +734,20 @@ impl TwoFileShuffleReader {
             concat_batches(&schema, &offsets)?
         };
 
-        let offsets = offsets.column(0).as_primitive::<UInt64Type>();
-        let mut offsets_iter = offsets.values().iter().copied();
-
-        let mut ranges = Vec::with_capacity(self.num_batches as usize);
-        for batch_idx in 0..self.num_batches {
-            if batch_idx == 0 && partition_id == 0 {
-                // Implicit 0 for start-of-file
-                ranges.push(0..offsets_iter.next().unwrap());
-            } else {
-                ranges.push(offsets_iter.next().unwrap()..offsets_iter.next().unwrap());
-            }
+        let offsets = offsets.column(0).as_primitive::<UInt64Type>().values();
+        if offsets.len() != num_positions as usize {
+            return Err(Error::internal(format!(
+                "Expected {} shuffle offsets for partition {} but read {}",
+                num_positions,
+                partition_id,
+                offsets.len()
+            )));
         }
-        Ok(ranges)
+
+        Ok(bounds
+            .into_iter()
+            .map(|(start_idx, end_idx)| start_idx.map_or(0, |idx| offsets[idx])..offsets[end_idx])
+            .collect())
     }
 }
 
@@ -1003,6 +1016,32 @@ mod tests {
         assert_eq!(v, vec![30, 40, 80]);
 
         assert!((reader.total_loss().unwrap() - 6.0).abs() < 1e-10);
+    }
+
+    #[tokio::test]
+    async fn test_two_file_shuffler_single_partition_multiple_batches() {
+        // With one partition, the offset that ends a write batch is also the
+        // offset that starts the next one, so consecutive batches share an
+        // offset row.
+        let dir = TempStrDir::default();
+        let output_dir = Path::from(dir.as_ref());
+
+        let batch1 = make_batch(&[0, 0, 0], &[10, 20, 30], None);
+        let batch2 = make_batch(&[0, 0, 0], &[40, 50, 60], None);
+        let batch3 = make_batch(&[0, 0, 0], &[70, 80, 90], None);
+
+        let shuffler = TwoFileShuffler::new(output_dir, 1)
+            // Set very small batch size to force multiple batches
+            .with_batch_size_bytes(16);
+        let stream = batches_to_stream(vec![batch1, batch2, batch3]);
+        let reader = shuffler.shuffle(stream).await.unwrap();
+
+        assert_eq!(reader.partition_size(0).unwrap(), 9);
+        let p0 = collect_partition(reader.as_ref(), 0).await.unwrap();
+        let vals: &Int32Array = p0.column_by_name("val").unwrap().as_primitive();
+        let mut v: Vec<i32> = vals.iter().map(|x| x.unwrap()).collect();
+        v.sort();
+        assert_eq!(v, vec![10, 20, 30, 40, 50, 60, 70, 80, 90]);
     }
 
     #[tokio::test]
