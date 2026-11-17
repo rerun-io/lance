@@ -42,11 +42,23 @@ impl AccumulationQueue {
         row_number: u64,
         num_rows: u64,
     ) -> Option<(Vec<ArrayRef>, u64, u64)> {
+        self.insert_with_extra_bytes(array, row_number, num_rows, 0)
+    }
+
+    /// Like [`Self::insert`], but also counts `extra_bytes` the caller buffers alongside
+    /// `array` until the flush (e.g. rep/def offsets), so they are bounded by `cache_bytes` too.
+    pub fn insert_with_extra_bytes(
+        &mut self,
+        array: ArrayRef,
+        row_number: u64,
+        num_rows: u64,
+        extra_bytes: u64,
+    ) -> Option<(Vec<ArrayRef>, u64, u64)> {
         if self.row_number == u64::MAX {
             self.row_number = row_number;
         }
         self.num_rows += num_rows;
-        self.current_bytes += array.get_array_memory_size() as u64;
+        self.current_bytes += array.get_array_memory_size() as u64 + extra_bytes;
         if self.current_bytes > self.cache_bytes {
             debug!(
                 "Flushing column {} page of size {} bytes (unencoded)",

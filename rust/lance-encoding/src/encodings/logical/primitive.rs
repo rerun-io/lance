@@ -7791,10 +7791,12 @@ impl FieldEncoder for PrimitiveStructuralEncoder {
         num_rows: u64,
     ) -> Result<Vec<EncodeTask>> {
         let array = Self::extract_validity(array, &mut repdef, self.keep_original_array)?;
+        let repdef_bytes = repdef.memory_size() as u64;
         self.accumulated_repdefs.push(repdef);
 
-        if let Some((arrays, row_number, num_rows)) =
-            self.accumulation_queue.insert(array, row_number, num_rows)
+        if let Some((arrays, row_number, num_rows)) = self
+            .accumulation_queue
+            .insert_with_extra_bytes(array, row_number, num_rows, repdef_bytes)
         {
             let accumulated_repdefs = std::mem::take(&mut self.accumulated_repdefs);
             Ok(self.do_flush(arrays, accumulated_repdefs, row_number, num_rows)?)
@@ -10538,6 +10540,67 @@ mod tests {
             chunk_metadata[0] & 0x0F,
             15,
             "V2.1 metadata should use all 4 bits for log_num_values"
+        );
+    }
+
+    #[test]
+    fn test_sparse_list_offsets_count_toward_flush() {
+        use crate::repdef::RepDefBuilder;
+        use crate::{
+            encoder::{
+                ColumnIndexSequence, EncodingOptions, MIN_PAGE_BUFFER_ALIGNMENT, OutOfLineBuffers,
+            },
+            testing::{create_test_field_encoder, test_encoding_strategy},
+        };
+        use arrow_array::ListArray;
+        use arrow_array::types::Int32Type;
+
+        // Mostly empty lists: the leaf values stay tiny while the offsets grow 8 bytes per row.
+        const ROWS_PER_BATCH: usize = 8192;
+        let batch: ArrayRef = Arc::new(ListArray::from_iter_primitive::<Int32Type, _, _>(
+            (0..ROWS_PER_BATCH).map(|i| Some(if i % 1000 == 0 { vec![Some(1)] } else { vec![] })),
+        ));
+        let field = arrow_schema::Field::new("sparse", batch.data_type().clone(), true);
+        let lance_field = lance_core::datatypes::Field::try_from(&field).unwrap();
+
+        let encoding_strategy = test_encoding_strategy(TestEncoding::StructuralU16);
+        let mut column_index_seq = ColumnIndexSequence::default();
+        let encoding_options = EncodingOptions {
+            // One batch of offsets (~64 KiB) fits, two do not.
+            cache_bytes_per_column: 96 * 1024,
+            max_page_bytes: 32 * 1024 * 1024,
+            keep_original_array: true,
+            buffer_alignment: MIN_PAGE_BUFFER_ALIGNMENT,
+        };
+        let mut encoder = create_test_field_encoder(
+            encoding_strategy.as_ref(),
+            &lance_field,
+            &mut column_index_seq,
+            &encoding_options,
+        )
+        .unwrap();
+
+        let mut external_buffers = OutOfLineBuffers::new(0, MIN_PAGE_BUFFER_ALIGNMENT);
+        let mut first_flush_batch = None;
+        for batch_idx in 0..32u64 {
+            let tasks = encoder
+                .maybe_encode(
+                    batch.clone(),
+                    &mut external_buffers,
+                    RepDefBuilder::default(),
+                    batch_idx * ROWS_PER_BATCH as u64,
+                    ROWS_PER_BATCH as u64,
+                )
+                .unwrap();
+            if !tasks.is_empty() {
+                first_flush_batch = Some(batch_idx);
+                break;
+            }
+        }
+        assert_eq!(
+            first_flush_batch,
+            Some(1),
+            "offsets of a sparse list column must count toward the page threshold"
         );
     }
 
