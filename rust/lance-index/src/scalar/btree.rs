@@ -6987,7 +6987,8 @@ mod tests {
         // Empty index.
         assert_state_roundtrips(&BTreeIndexState {
             page_lookup: Arc::new(
-                BTreeLookup::try_new(RecordBatch::new_empty(sample_lookup_batch().schema())).unwrap(),
+                BTreeLookup::try_new(RecordBatch::new_empty(sample_lookup_batch().schema()))
+                    .unwrap(),
             ),
             batch_size: DEFAULT_BTREE_BATCH_SIZE,
             ranges_to_files: None,
